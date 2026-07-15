@@ -931,7 +931,7 @@ fn announce_rebroadcast_as_header2_when_transport() {
 }
 
 #[test]
-fn announce_rebroadcast_keeps_header1_without_transport() {
+fn announce_not_rebroadcast_without_transport() {
     let mut t = TestTransport::new();
     // No transport mode
     let announcer = Identity::from_seed(b"announcer-rebroadcast-2").unwrap();
@@ -957,16 +957,11 @@ fn announce_rebroadcast_keeps_header1_without_transport() {
         other => panic!("expected AnnounceReceived, got {:?}", other),
     }
 
-    // retransmit_timeout = ingest_time + PATHFINDER_G = 1005
+    assert_eq!(t.path_count(), 1, "endpoint should still learn the path");
     let pending = t.pending_outbound(1006, &mut rng);
-    assert!(!pending.is_empty(), "should have a pending announce");
-
-    let rebroadcast = &pending[0];
-    let rpkt = Packet::parse(rebroadcast).unwrap();
-    assert_eq!(
-        rpkt.header_type,
-        HeaderType::Header1,
-        "without transport mode, rebroadcast should stay HEADER_1"
+    assert!(
+        pending.is_empty(),
+        "an endpoint must not relay a received announce"
     );
 }
 
