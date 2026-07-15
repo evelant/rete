@@ -11,7 +11,13 @@ use rete_core::{
     TRUNCATED_HASH_LEN,
 };
 
-use super::{ChannelReceipt, IngestResult, SendError, Transport};
+use super::{ChannelReceipt, IngestResult, LinkTableKind, SendError, Transport};
+
+enum OwnedLinkAdmission {
+    Inserted,
+    Existing,
+    Full,
+}
 
 impl<S: crate::storage::TransportStorage> Transport<S> {
     /// Look up an active link by link_id.
@@ -38,9 +44,31 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     // Link management
     // -----------------------------------------------------------------------
 
+    fn admit_owned_link(&mut self, link_id: LinkId, link: Link) -> OwnedLinkAdmission {
+        if self.links.contains_key(&link_id) {
+            return OwnedLinkAdmission::Existing;
+        }
+
+        match self.links.insert(link_id, link) {
+            Ok(None) => OwnedLinkAdmission::Inserted,
+            Ok(Some(previous)) => {
+                // A conforming StorageMap cannot reach this branch after the
+                // contains check above. Restore the previous value defensively
+                // so an unusual backend cannot reset an existing Link.
+                let restored = self.links.insert(link_id, previous);
+                debug_assert!(matches!(restored, Ok(Some(_))));
+                OwnedLinkAdmission::Existing
+            }
+            Err(_) => OwnedLinkAdmission::Full,
+        }
+    }
+
     /// Initiate a link to a destination.
     ///
-    /// Returns the raw LINKREQUEST packet and the link_id.
+    /// Returns the raw LINKREQUEST packet and the link_id only after the
+    /// corresponding Link state has been retained. A generated ID collision
+    /// returns [`SendError::LinkAlreadyExists`]; bounded storage exhaustion
+    /// returns [`SendError::LinkTableFull`] without releasing the request.
     pub fn initiate_link<R: RngCore + CryptoRng>(
         &mut self,
         dest_hash: DestHash,
@@ -59,7 +87,6 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         // If we have a transport path (via relay), build HEADER_2 so the relay
         // creates a link_table entry and can route the LRPROOF back.
         let via = self.paths.get(&dest_hash).and_then(|p| p.via);
-        self.touch_path(&dest_hash, now);
         let mut pkt_buf = [0u8; rete_core::MTU];
         let pkt_len = PacketBuilder::new(&mut pkt_buf)
             .packet_type(PacketType::LinkRequest)
@@ -79,7 +106,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         let link_id = compute_link_id(&pkt_buf[..pkt_len]).map_err(SendError::PacketBuild)?;
         link.set_link_id(link_id);
 
-        let _ = self.links.insert(link_id, link);
+        match self.admit_owned_link(link_id, link) {
+            OwnedLinkAdmission::Inserted => {}
+            OwnedLinkAdmission::Existing => return Err(SendError::LinkAlreadyExists),
+            OwnedLinkAdmission::Full => return Err(SendError::LinkTableFull),
+        }
+        self.touch_path(&dest_hash, now);
         Ok((pkt_buf[..pkt_len].to_vec(), link_id))
     }
 
@@ -206,12 +238,34 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         };
         link.destination_hash = *dest_hash;
 
+        match self.admit_owned_link(link_id, link) {
+            OwnedLinkAdmission::Inserted => {}
+            OwnedLinkAdmission::Existing => return IngestResult::Duplicate,
+            OwnedLinkAdmission::Full => {
+                return IngestResult::LinkTableFull {
+                    link_id,
+                    table: LinkTableKind::Owned,
+                };
+            }
+        }
+
         // Build LRPROOF
-        let proof_payload = match link.build_proof(identity) {
-            Ok(p) => p,
-            Err(_) => {
+        let proof_payload = match self.links.get(&link_id) {
+            Some(link) => match link.build_proof(identity) {
+                Ok(proof) => proof,
+                Err(_) => {
+                    self.links.remove(&link_id);
+                    self.stats.links_failed += 1;
+                    self.stats.crypto_failures += 1;
+                    return IngestResult::Invalid;
+                }
+            },
+            None => {
+                // A backend that reports successful insertion must make the
+                // inserted value observable. Fail closed if it violates that
+                // contract instead of emitting a proof without retained state.
+                self.links.remove(&link_id);
                 self.stats.links_failed += 1;
-                self.stats.crypto_failures += 1;
                 return IngestResult::Invalid;
             }
         };
@@ -227,10 +281,11 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             .build()
         {
             Ok(n) => n,
-            Err(_) => return IngestResult::Invalid,
+            Err(_) => {
+                self.links.remove(&link_id);
+                return IngestResult::Invalid;
+            }
         };
-
-        let _ = self.links.insert(link_id, link);
 
         self.stats.link_requests_received += 1;
         IngestResult::LinkRequestReceived {

@@ -759,7 +759,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     Err(_) => IngestOutcome::empty(),
                 }
             }
-            IngestResult::Duplicate | IngestResult::Invalid => {
+            IngestResult::LinkTableFull { .. }
+            | IngestResult::Duplicate
+            | IngestResult::Invalid => {
                 // Drain any resource outbound packets that may have been queued
                 let resource_pkts = self.transport.drain_resource_outbound();
                 if resource_pkts.is_empty() {

@@ -3,12 +3,15 @@
 //! Tests the full link handshake, data exchange, keepalive, close, and
 //! edge cases (stale, invalid proof, duplicate request, etc.).
 
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rete_core::{
-    DestHash, LinkId,
-    DestType, Identity, Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, MTU,
-    TRUNCATED_HASH_LEN,
+    DestHash, DestType, Identity, LinkId, Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE,
+    CONTEXT_LRPROOF, MTU, TRUNCATED_HASH_LEN,
 };
-use rete_transport::{compute_link_id, IngestResult, Link, LinkState, Transport};
+use rete_transport::{
+    compute_link_id, HeaplessStorage, IngestResult, Link, LinkState, LinkTableKind, Path,
+    SendError, Transport,
+};
 
 type TestTransport = Transport<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
 
@@ -37,16 +40,36 @@ fn build_link_request(
 ) -> Vec<u8> {
     let (_, request_payload) = Link::new_initiator(*dest_hash, identity.ed25519_pub(), rng, 100);
 
+    build_link_request_from_payload(dest_hash, &request_payload)
+}
+
+fn build_link_request_from_payload(dest_hash: &DestHash, request_payload: &[u8]) -> Vec<u8> {
     let mut buf = [0u8; MTU];
     let n = PacketBuilder::new(&mut buf)
         .packet_type(PacketType::LinkRequest)
         .dest_type(DestType::Single)
         .destination_hash(dest_hash.as_ref())
         .context(0x00)
-        .payload(&request_payload)
+        .payload(request_payload)
         .build()
         .unwrap();
     buf[..n].to_vec()
+}
+
+fn make_bounded_responder<const L: usize>(
+    seed: &[u8],
+) -> (
+    Transport<HeaplessStorage<64, 16, 128, L>>,
+    Identity,
+    DestHash,
+) {
+    let identity = Identity::from_seed(seed).unwrap();
+    let mut name_buf = [0u8; 128];
+    let expanded = rete_core::expand_name("testapp", &["link"], &mut name_buf).unwrap();
+    let dest_hash = rete_core::destination_hash(expanded, Some(&identity.hash()));
+    let mut transport = Transport::new();
+    transport.add_local_destination(dest_hash);
+    (transport, identity, dest_hash)
 }
 
 /// Full handshake between two transports. Returns (initiator, responder, link_id).
@@ -431,6 +454,9 @@ fn duplicate_link_request() {
         other => panic!("expected Duplicate, got {:?}", other),
     }
     assert_eq!(t.link_count(), 1);
+    assert_eq!(t.stats().packets_received, 2);
+    assert_eq!(t.stats().link_requests_received, 1);
+    assert_eq!(t.stats().packets_dropped_dedup, 1);
 }
 
 #[test]
@@ -491,6 +517,273 @@ fn initiate_link_returns_request() {
     assert_eq!(t.link_count(), 1);
     let link = t.get_link(&link_id).unwrap();
     assert_eq!(link.state, LinkState::Handshake);
+}
+
+#[test]
+fn outbound_link_table_full_releases_no_request() {
+    type TwoLinkTransport = Transport<HeaplessStorage<64, 16, 128, 2>>;
+
+    let identity = Identity::from_seed(b"outbound-capacity").unwrap();
+    let destinations = [
+        DestHash::from([0x11; TRUNCATED_HASH_LEN]),
+        DestHash::from([0x22; TRUNCATED_HASH_LEN]),
+        DestHash::from([0x33; TRUNCATED_HASH_LEN]),
+    ];
+    let mut transport = TwoLinkTransport::new();
+    transport.insert_path(destinations[2], Path::direct(10));
+    let mut rng = StdRng::seed_from_u64(0xCAFE);
+
+    let (_, first_id) = transport
+        .initiate_link(destinations[0], &identity, &mut rng, 100)
+        .unwrap();
+    let (_, second_id) = transport
+        .initiate_link(destinations[1], &identity, &mut rng, 101)
+        .unwrap();
+    let first_activity = {
+        let link = transport.get_link(&first_id).unwrap();
+        (link.last_inbound, link.last_outbound)
+    };
+    let second_activity = {
+        let link = transport.get_link(&second_id).unwrap();
+        (link.last_inbound, link.last_outbound)
+    };
+
+    let mut candidate_rng = rng.clone();
+    let (_, candidate_payload) = Link::new_initiator(
+        destinations[2],
+        identity.ed25519_pub(),
+        &mut candidate_rng,
+        102,
+    );
+    let candidate_packet = build_link_request_from_payload(&destinations[2], &candidate_payload);
+    let candidate_id = compute_link_id(&candidate_packet).unwrap();
+    let packets_sent = transport.stats().packets_sent;
+    let links_failed = transport.stats().links_failed;
+
+    assert_eq!(
+        transport.initiate_link(destinations[2], &identity, &mut rng, 102),
+        Err(SendError::LinkTableFull)
+    );
+    assert_eq!(transport.link_count(), 2);
+    assert!(transport.get_link(&candidate_id).is_none());
+    assert_eq!(
+        {
+            let link = transport.get_link(&first_id).unwrap();
+            (link.last_inbound, link.last_outbound)
+        },
+        first_activity
+    );
+    assert_eq!(
+        {
+            let link = transport.get_link(&second_id).unwrap();
+            (link.last_inbound, link.last_outbound)
+        },
+        second_activity
+    );
+    assert_eq!(
+        transport.get_path(&destinations[2]).unwrap().last_accessed,
+        10
+    );
+    assert_eq!(transport.stats().packets_sent, packets_sent);
+    assert_eq!(transport.stats().links_failed, links_failed);
+}
+
+#[test]
+fn outbound_existing_link_id_is_not_replaced_or_reported_full() {
+    type TwoLinkTransport = Transport<HeaplessStorage<64, 16, 128, 2>>;
+
+    let identity = Identity::from_seed(b"outbound-existing").unwrap();
+    let destination = DestHash::from([0x44; TRUNCATED_HASH_LEN]);
+    let other_destination = DestHash::from([0x45; TRUNCATED_HASH_LEN]);
+    let mut transport = TwoLinkTransport::new();
+    transport.insert_path(destination, Path::direct(10));
+    let mut first_rng = StdRng::seed_from_u64(0xFACE);
+    let mut repeated_rng = first_rng.clone();
+
+    let (_, link_id) = transport
+        .initiate_link(destination, &identity, &mut first_rng, 100)
+        .unwrap();
+    transport
+        .initiate_link(other_destination, &identity, &mut first_rng, 150)
+        .unwrap();
+    let initial_activity = {
+        let link = transport.get_link(&link_id).unwrap();
+        (link.last_inbound, link.last_outbound)
+    };
+
+    assert_eq!(
+        transport.initiate_link(destination, &identity, &mut repeated_rng, 200),
+        Err(SendError::LinkAlreadyExists)
+    );
+    assert_eq!(transport.link_count(), 2);
+    assert_eq!(
+        {
+            let link = transport.get_link(&link_id).unwrap();
+            (link.last_inbound, link.last_outbound)
+        },
+        initial_activity
+    );
+    assert_eq!(transport.get_path(&destination).unwrap().last_accessed, 100);
+}
+
+#[test]
+fn inbound_link_table_full_emits_no_proof() {
+    let (mut transport, responder, destination) = make_bounded_responder::<2>(b"inbound-capacity");
+    let mut rng = StdRng::seed_from_u64(0xBEEF);
+    let mut retained_ids = Vec::new();
+
+    for index in 0..2 {
+        let initiator = Identity::from_seed(&[index + 1; 32]).unwrap();
+        let mut request = build_link_request(&destination, &initiator, &mut rng);
+        match transport.ingest(&mut request, 100 + u64::from(index), &mut rng, &responder) {
+            IngestResult::LinkRequestReceived { link_id, proof_raw } => {
+                assert!(!proof_raw.is_empty());
+                retained_ids.push(link_id);
+            }
+            other => panic!("expected retained LINKREQUEST, got {other:?}"),
+        }
+    }
+
+    let third = Identity::from_seed(&[0x33; 32]).unwrap();
+    let mut request = build_link_request(&destination, &third, &mut rng);
+    let rejected_id = compute_link_id(&request).unwrap();
+    assert!(matches!(
+        transport.ingest(&mut request, 102, &mut rng, &responder),
+        IngestResult::LinkTableFull {
+            link_id,
+            table: LinkTableKind::Owned,
+        } if link_id == rejected_id
+    ));
+
+    assert_eq!(transport.link_count(), 2);
+    assert!(retained_ids
+        .iter()
+        .all(|id| transport.get_link(id).is_some()));
+    assert!(transport.get_link(&rejected_id).is_none());
+    assert_eq!(transport.stats().packets_received, 3);
+    assert_eq!(transport.stats().link_requests_received, 2);
+    assert_eq!(transport.stats().packets_dropped_invalid, 0);
+    assert_eq!(transport.stats().packets_dropped_dedup, 0);
+    assert_eq!(transport.stats().links_failed, 0);
+    assert_eq!(transport.stats().crypto_failures, 0);
+}
+
+#[test]
+fn inbound_existing_link_id_wins_over_full_capacity() {
+    let (mut transport, responder, destination) = make_bounded_responder::<2>(b"inbound-existing");
+    let initiator = Identity::from_seed(b"inbound-existing-initiator").unwrap();
+    let mut rng = StdRng::seed_from_u64(0xABCD);
+    let (_, canonical_payload) =
+        Link::new_initiator(destination, initiator.ed25519_pub(), &mut rng, 100);
+    let mut legacy_request =
+        build_link_request_from_payload(&destination, &canonical_payload[..64]);
+    let mut current_request = build_link_request_from_payload(&destination, &canonical_payload);
+    let legacy_id = compute_link_id(&legacy_request).unwrap();
+    assert_eq!(legacy_id, compute_link_id(&current_request).unwrap());
+
+    assert!(matches!(
+        transport.ingest(&mut legacy_request, 100, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { .. }
+    ));
+    let initial_activity = {
+        let link = transport.get_link(&legacy_id).unwrap();
+        (link.last_inbound, link.last_outbound)
+    };
+
+    let filler = Identity::from_seed(b"inbound-existing-filler").unwrap();
+    let mut filler_request = build_link_request(&destination, &filler, &mut rng);
+    assert!(matches!(
+        transport.ingest(&mut filler_request, 150, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { .. }
+    ));
+    assert!(matches!(
+        transport.ingest(&mut current_request, 200, &mut rng, &responder),
+        IngestResult::Duplicate
+    ));
+
+    assert_eq!(transport.link_count(), 2);
+    assert_eq!(
+        {
+            let link = transport.get_link(&legacy_id).unwrap();
+            (link.last_inbound, link.last_outbound)
+        },
+        initial_activity
+    );
+    assert_eq!(transport.stats().packets_received, 3);
+    assert_eq!(transport.stats().link_requests_received, 2);
+    assert_eq!(transport.stats().packets_dropped_dedup, 0);
+    assert_eq!(transport.stats().packets_dropped_invalid, 0);
+    assert_eq!(transport.stats().links_failed, 0);
+    assert_eq!(transport.stats().crypto_failures, 0);
+}
+
+#[test]
+fn capacity_rejection_is_deduplicated_but_a_fresh_request_can_retry() {
+    let (mut transport, responder, destination) = make_bounded_responder::<2>(b"inbound-retry");
+    let mut rng = StdRng::seed_from_u64(0xD00D);
+
+    let first = Identity::from_seed(b"inbound-retry-first").unwrap();
+    let mut first_request = build_link_request(&destination, &first, &mut rng);
+    let first_id = compute_link_id(&first_request).unwrap();
+    assert!(matches!(
+        transport.ingest(&mut first_request, 100, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { link_id, .. } if link_id == first_id
+    ));
+
+    let second = Identity::from_seed(b"inbound-retry-second").unwrap();
+    let mut second_request = build_link_request(&destination, &second, &mut rng);
+    assert!(matches!(
+        transport.ingest(&mut second_request, 101, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { .. }
+    ));
+
+    let candidate = Identity::from_seed(b"inbound-retry-candidate").unwrap();
+    let rejected_request = build_link_request(&destination, &candidate, &mut rng);
+    let rejected_id = compute_link_id(&rejected_request).unwrap();
+    let mut first_attempt = rejected_request.clone();
+    assert!(matches!(
+        transport.ingest(&mut first_attempt, 102, &mut rng, &responder),
+        IngestResult::LinkTableFull {
+            link_id,
+            table: LinkTableKind::Owned,
+        } if link_id == rejected_id
+    ));
+
+    transport
+        .build_linkclose_packet(&first_id, &mut rng)
+        .unwrap();
+    assert_eq!(transport.link_count(), 1);
+
+    // Reticulum's packet-level deduplication precedes local dispatch. Keep the
+    // rejected packet in that window so an exact replay cannot repeatedly
+    // force handshake work while a node is saturated.
+    let mut exact_replay = rejected_request.clone();
+    let mut expected_rng = rng.clone();
+    assert!(matches!(
+        transport.ingest(&mut exact_replay, 103, &mut rng, &responder),
+        IngestResult::Duplicate
+    ));
+    assert_eq!(rng.next_u64(), expected_rng.next_u64());
+    assert_eq!(transport.link_count(), 1);
+
+    // A real retry creates fresh ephemeral Link material and is admitted once
+    // capacity is available.
+    let mut fresh_request = build_link_request(&destination, &candidate, &mut rng);
+    let fresh_id = compute_link_id(&fresh_request).unwrap();
+    assert_ne!(fresh_id, rejected_id);
+    assert!(matches!(
+        transport.ingest(&mut fresh_request, 104, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { link_id, proof_raw }
+            if link_id == fresh_id && !proof_raw.is_empty()
+    ));
+
+    assert_eq!(transport.link_count(), 2);
+    assert_eq!(transport.stats().packets_received, 5);
+    assert_eq!(transport.stats().link_requests_received, 3);
+    assert_eq!(transport.stats().packets_dropped_dedup, 1);
+    assert_eq!(transport.stats().packets_dropped_invalid, 0);
+    assert_eq!(transport.stats().links_failed, 0);
+    assert_eq!(transport.stats().crypto_failures, 0);
 }
 
 // ---------------------------------------------------------------------------
