@@ -146,29 +146,42 @@ impl Link {
     ///
     /// # Arguments
     /// - `link_id` — computed from the hashable part of the LINKREQUEST
-    /// - `request_payload` — the LINKREQUEST payload (64+ bytes)
-    /// - `our_identity` — our Identity (for signing the proof)
+    /// - `request_payload` — 64 legacy key bytes, optionally followed by exactly
+    ///   3 modern signalling bytes
     /// - `rng` — cryptographic RNG
     /// - `now` — current monotonic time
+    ///
+    /// # Errors
+    ///
+    /// Returns [`rete_core::Error::PacketTooShort`] for payloads shorter than
+    /// 64 bytes, and [`rete_core::Error::InvalidArgument`] for every other
+    /// payload length except 64 or 67 bytes.
     pub fn from_request<R: RngCore + CryptoRng>(
         link_id: LinkId,
         request_payload: &[u8],
         rng: &mut R,
         now: u64,
     ) -> Result<Self, rete_core::Error> {
-        if request_payload.len() < 64 {
+        if request_payload.len() < LINK_REQUEST_KEY_SIZE {
             return Err(rete_core::Error::PacketTooShort);
+        }
+        if !is_valid_link_request_payload_len(request_payload.len()) {
+            return Err(rete_core::Error::InvalidArgument(
+                "LINKREQUEST payload must be exactly 64 or 67 bytes",
+            ));
         }
 
         let mut peer_x25519_pub = [0u8; 32];
         let mut peer_ed25519_pub = [0u8; 32];
         peer_x25519_pub.copy_from_slice(&request_payload[..32]);
-        peer_ed25519_pub.copy_from_slice(&request_payload[32..64]);
+        peer_ed25519_pub.copy_from_slice(&request_payload[32..LINK_REQUEST_KEY_SIZE]);
 
-        // Extract signalling bytes if present (payload >= 67 bytes)
+        // Extract signalling bytes if present (67-byte modern request).
         let mut peer_signalling = [0u8; LINK_MTU_SIZE];
-        if request_payload.len() >= 64 + LINK_MTU_SIZE {
-            peer_signalling.copy_from_slice(&request_payload[64..64 + LINK_MTU_SIZE]);
+        if request_payload.len() == LINK_REQUEST_KEY_SIZE + LINK_MTU_SIZE {
+            peer_signalling.copy_from_slice(
+                &request_payload[LINK_REQUEST_KEY_SIZE..LINK_REQUEST_KEY_SIZE + LINK_MTU_SIZE],
+            );
         }
 
         // Generate our ephemeral X25519 keypair
@@ -587,6 +600,12 @@ pub fn compute_establishment_timeout(hops: u64) -> u64 {
 /// Python: `Link.LINK_MTU_SIZE = 3`.
 pub const LINK_MTU_SIZE: usize = 3;
 
+const LINK_REQUEST_KEY_SIZE: usize = 64;
+
+pub(crate) const fn is_valid_link_request_payload_len(length: usize) -> bool {
+    length == LINK_REQUEST_KEY_SIZE || length == LINK_REQUEST_KEY_SIZE + LINK_MTU_SIZE
+}
+
 /// Encryption mode: AES-256-CBC (Python: `Link.ENCRYPT_AES = 0x01`).
 const MODE_AES_CBC: u8 = 0x01;
 
@@ -693,6 +712,41 @@ mod tests {
         assert_eq!(link.role, LinkRole::Responder);
         assert_eq!(link.peer_x25519_pub, x25519_pub);
         assert_eq!(link.peer_ed25519_pub, ed25519_pub);
+    }
+
+    #[test]
+    fn link_from_request_requires_canonical_payload_length() {
+        let mut rng = rand_core::OsRng;
+        let identity = Identity::from_seed(b"canonical-request-length").unwrap();
+        let dest_hash = DestHash::from([0xBBu8; TRUNCATED_HASH_LEN]);
+        let (_, request_payload) =
+            Link::new_initiator(dest_hash, identity.ed25519_pub(), &mut rng, 100);
+        let link_id = LinkId::from([0xAAu8; TRUNCATED_HASH_LEN]);
+        let mut extended_payload = request_payload.to_vec();
+        extended_payload.resize(100, 0);
+
+        for length in [64, 67] {
+            assert!(Link::from_request(link_id, &request_payload[..length], &mut rng, 100).is_ok());
+        }
+
+        for length in [0, 63] {
+            let error = Link::from_request(link_id, &extended_payload[..length], &mut rng, 100)
+                .err()
+                .expect("short LINKREQUEST payload must be rejected");
+            assert_eq!(error, rete_core::Error::PacketTooShort);
+        }
+
+        for length in [65, 66, 68, 100] {
+            let error = Link::from_request(link_id, &extended_payload[..length], &mut rng, 100)
+                .err()
+                .expect("non-canonical LINKREQUEST payload must be rejected");
+            assert_eq!(
+                error,
+                rete_core::Error::InvalidArgument(
+                    "LINKREQUEST payload must be exactly 64 or 67 bytes"
+                )
+            );
+        }
     }
 
     #[test]
@@ -999,17 +1053,17 @@ mod tests {
 
     #[test]
     fn test_linkrequest_with_oversized_payload() {
-        // LINKREQUEST with payload > 64 bytes (MTU signalling).
-        // compute_link_id should still work — it strips the extra bytes.
+        // Link ID derivation strips arbitrary bytes after the 64 key bytes,
+        // even though transport admission rejects non-canonical lengths.
         let dest_hash = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
         let x25519_pub = [0xBBu8; 32];
         let ed25519_pub = [0xCCu8; 32];
 
-        // 64 bytes standard + 4 bytes MTU signalling
+        // 64 key bytes plus 4 arbitrary trailing bytes.
         let mut payload = [0u8; 68];
         payload[..32].copy_from_slice(&x25519_pub);
         payload[32..64].copy_from_slice(&ed25519_pub);
-        payload[64..68].copy_from_slice(&[0x01, 0xF4, 0x00, 0x00]); // MTU signalling
+        payload[64..68].copy_from_slice(&[0x01, 0xF4, 0x00, 0x00]);
 
         let mut buf = [0u8; MTU];
         let n = PacketBuilder::new(&mut buf)

@@ -27,7 +27,7 @@ pub(self) fn hex_short(h: &[u8]) -> alloc::string::String {
 }
 
 use crate::dedup::DedupWindow;
-use crate::link::compute_link_id;
+use crate::link::{compute_link_id, is_valid_link_request_payload_len};
 use crate::path::Path;
 use crate::receipt::ReceiptTable;
 use crate::resource::Resource;
@@ -35,7 +35,7 @@ use crate::storage::{StorageMap, TransportStorage};
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
     DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketType,
-    CONTEXT_LRPROOF, CONTEXT_RESOURCE_PRF, TRUNCATED_HASH_LEN,
+    CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, TRUNCATED_HASH_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -590,7 +590,7 @@ impl<S: TransportStorage> Transport<S> {
     /// - **ANNOUNCE**: validate signature + dest hash, learn path, queue retransmission
     /// - **DATA**: return for local delivery, handle path requests, link data, or forward
     /// - **PROOF**: route via reverse table, validate LRPROOF, or forward
-    /// - **LINKREQUEST**: create link if local, else forward
+    /// - **LINKREQUEST**: validate and create a canonical local Link, else forward
     ///
     /// `now` is the current monotonic time in seconds.
     pub fn ingest_on<'a, R: RngCore + CryptoRng>(
@@ -1120,6 +1120,16 @@ impl<S: TransportStorage> Transport<S> {
             PacketType::LinkRequest => {
                 let dh = DestHash::from_slice(pkt.destination_hash);
                 if self.is_local_destination(&dh) {
+                    // Python accepts exactly the legacy 64-byte and modern
+                    // 67-byte payloads. SINGLE/context-none additionally
+                    // enforces the canonical form emitted by both stacks.
+                    if pkt.dest_type != DestType::Single
+                        || pkt.context != CONTEXT_NONE
+                        || !is_valid_link_request_payload_len(pkt.payload.len())
+                    {
+                        self.stats.packets_dropped_invalid += 1;
+                        return IngestResult::Invalid;
+                    }
                     self.handle_link_request(raw, &dh, pkt.payload, now, rng, identity)
                 } else {
                     // For HEADER_1 LINKREQUEST forwarding on a transport node:

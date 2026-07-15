@@ -35,18 +35,56 @@ fn build_link_request(
     identity: &Identity,
     rng: &mut impl rand_core::CryptoRngCore,
 ) -> Vec<u8> {
+    build_link_request_with(dest_hash, identity, DestType::Single, 0x00, 67, rng)
+}
+
+fn build_link_request_with(
+    dest_hash: &DestHash,
+    identity: &Identity,
+    dest_type: DestType,
+    context: u8,
+    payload_len: usize,
+    rng: &mut impl rand_core::CryptoRngCore,
+) -> Vec<u8> {
     let (_, request_payload) = Link::new_initiator(*dest_hash, identity.ed25519_pub(), rng, 100);
+    let mut payload = request_payload.to_vec();
+    payload.resize(payload_len, 0);
+    payload.truncate(payload_len);
 
     let mut buf = [0u8; MTU];
     let n = PacketBuilder::new(&mut buf)
         .packet_type(PacketType::LinkRequest)
-        .dest_type(DestType::Single)
+        .dest_type(dest_type)
         .destination_hash(dest_hash.as_ref())
-        .context(0x00)
-        .payload(&request_payload)
+        .context(context)
+        .payload(&payload)
         .build()
         .unwrap();
     buf[..n].to_vec()
+}
+
+fn assert_local_link_request_rejected(dest_type: DestType, context: u8, payload_len: usize) {
+    let mut rng = rand::thread_rng();
+    let (mut transport, identity, dest_hash) = make_responder(b"responder-invalid-request");
+    let initiator = Identity::from_seed(b"initiator-invalid-request").unwrap();
+    let mut raw = build_link_request_with(
+        &dest_hash,
+        &initiator,
+        dest_type,
+        context,
+        payload_len,
+        &mut rng,
+    );
+
+    assert!(matches!(
+        transport.ingest(&mut raw, 100, &mut rng, &identity),
+        IngestResult::Invalid
+    ));
+    assert_eq!(transport.link_count(), 0);
+    assert_eq!(transport.stats().packets_dropped_invalid, 1);
+    assert_eq!(transport.stats().link_requests_received, 0);
+    assert_eq!(transport.stats().links_failed, 0);
+    assert_eq!(transport.stats().crypto_failures, 0);
 }
 
 /// Full handshake between two transports. Returns (initiator, responder, link_id).
@@ -145,6 +183,73 @@ fn link_request_local_creates_link() {
         other => panic!("expected LinkRequestReceived, got {:?}", other),
     }
     assert_eq!(t.link_count(), 1);
+}
+
+#[test]
+fn local_link_request_accepts_only_canonical_payload_lengths() {
+    let mut rng = rand::thread_rng();
+
+    for payload_len in [64, 67] {
+        let (mut transport, identity, dest_hash) = make_responder(b"responder-valid-request");
+        let initiator = Identity::from_seed(b"initiator-valid-request").unwrap();
+        let mut raw = build_link_request_with(
+            &dest_hash,
+            &initiator,
+            DestType::Single,
+            0x00,
+            payload_len,
+            &mut rng,
+        );
+
+        assert!(matches!(
+            transport.ingest(&mut raw, 100, &mut rng, &identity),
+            IngestResult::LinkRequestReceived { .. }
+        ));
+        assert_eq!(transport.link_count(), 1);
+        assert_eq!(transport.stats().link_requests_received, 1);
+    }
+
+    for payload_len in [0, 63, 65, 66, 68] {
+        assert_local_link_request_rejected(DestType::Single, 0x00, payload_len);
+    }
+}
+
+#[test]
+fn local_link_request_requires_single_destination_type() {
+    for dest_type in [DestType::Group, DestType::Plain, DestType::Link] {
+        assert_local_link_request_rejected(dest_type, 0x00, 67);
+    }
+}
+
+#[test]
+fn local_link_request_requires_context_zero() {
+    for context in [0x01, 0xFF] {
+        assert_local_link_request_rejected(DestType::Single, context, 67);
+    }
+}
+
+#[test]
+fn repeated_malformed_local_link_request_is_deduplicated() {
+    let mut rng = rand::thread_rng();
+    let (mut transport, identity, dest_hash) = make_responder(b"responder-malformed-replay");
+    let initiator = Identity::from_seed(b"initiator-malformed-replay").unwrap();
+    let request =
+        build_link_request_with(&dest_hash, &initiator, DestType::Single, 0x00, 65, &mut rng);
+
+    let mut first = request.clone();
+    assert!(matches!(
+        transport.ingest(&mut first, 100, &mut rng, &identity),
+        IngestResult::Invalid
+    ));
+
+    let mut replay = request;
+    assert!(matches!(
+        transport.ingest(&mut replay, 101, &mut rng, &identity),
+        IngestResult::Duplicate
+    ));
+    assert_eq!(transport.link_count(), 0);
+    assert_eq!(transport.stats().packets_dropped_invalid, 1);
+    assert_eq!(transport.stats().packets_dropped_dedup, 1);
 }
 
 #[test]
