@@ -106,6 +106,10 @@ const RESOURCE_OUTBOUND_MAX: usize = 256;
 pub enum SendError {
     /// No known path or cached identity for the destination.
     UnknownDestination,
+    /// A Link with the generated ID already exists.
+    LinkAlreadyExists,
+    /// The bounded owned-Link table has no capacity for another Link.
+    LinkTableFull,
     /// Link not found in the link table.
     LinkNotFound,
     /// Link exists but is not in Active state (still Pending/Handshake/Stale/Closed).
@@ -124,6 +128,8 @@ impl core::fmt::Display for SendError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SendError::UnknownDestination => write!(f, "unknown destination (no cached identity)"),
+            SendError::LinkAlreadyExists => write!(f, "link already exists"),
+            SendError::LinkTableFull => write!(f, "owned link table full"),
             SendError::LinkNotFound => write!(f, "link not found"),
             SendError::LinkNotActive => write!(f, "link not active"),
             SendError::WindowFull => write!(f, "channel window full"),
@@ -198,6 +204,15 @@ pub struct LinkTableEntry {
 // IngestResult — what to do after processing an inbound packet
 // ---------------------------------------------------------------------------
 
+/// Bounded Link table whose admission rejected an inbound LINKREQUEST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkTableKind {
+    /// Links owned by this endpoint.
+    Owned,
+    /// Links forwarded on behalf of other endpoints.
+    Relay,
+}
+
 /// Result of processing an inbound packet via [`Transport::ingest`].
 #[derive(Debug)]
 pub enum IngestResult<'a> {
@@ -236,6 +251,16 @@ pub enum IngestResult<'a> {
         link_id: LinkId,
         /// The LRPROOF response to send back (raw packet bytes, owned).
         proof_raw: alloc::vec::Vec<u8>,
+    },
+    /// A valid LINKREQUEST could not be retained in a bounded Link table.
+    ///
+    /// Its packet hash remains in the normal deduplication window. A later
+    /// attempt must create a fresh LINKREQUEST with new ephemeral material.
+    LinkTableFull {
+        /// The computed Link ID that could not be admitted.
+        link_id: LinkId,
+        /// The bounded table that rejected the Link.
+        table: LinkTableKind,
     },
     /// A link handshake completed (LRPROOF validated or LRRTT processed).
     LinkEstablished {
