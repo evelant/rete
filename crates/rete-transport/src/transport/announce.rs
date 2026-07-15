@@ -183,7 +183,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 pk.copy_from_slice(info.pub_key);
                 self.insert_identity(dh, pk);
 
-                if pkt.hops < PATHFINDER_M {
+                // Released Python Reticulum only schedules received announces
+                // for rebroadcast when transport is enabled (or when bridging
+                // a local shared-instance client, which this core does not yet
+                // model). Endpoint nodes still learn and cache the path, but
+                // must not become announce relays implicitly.
+                if self.local_identity_hash.is_some() && pkt.hops < PATHFINDER_M {
                     let ann_raw = match retransmit_raw {
                         Some(v) => v,
                         None => raw.to_vec(),

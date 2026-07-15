@@ -866,6 +866,32 @@ mod tests {
             outcome.events.first(),
             Some(NodeEvent::AnnounceReceived { .. })
         ));
+        assert!(
+            outcome.packets.is_empty(),
+            "an endpoint must learn an announce without rebroadcasting it"
+        );
+        assert_eq!(core.transport.path_count(), 1);
+        assert_eq!(core.transport.announce_count(), 0);
+    }
+
+    #[test]
+    fn transport_node_rebroadcasts_ingested_announce() {
+        let mut core = make_core(b"transport-announce-node");
+        core.enable_transport();
+        let mut rng = rand::thread_rng();
+
+        let peer_core = make_core(b"transport-announce-peer");
+        let announce = peer_core.build_announce(None, &mut rng, 1000).unwrap();
+
+        let outcome = core.handle_ingest(&announce, 1000, 0, &mut rng);
+        assert!(matches!(
+            outcome.events.first(),
+            Some(NodeEvent::AnnounceReceived { .. })
+        ));
+        assert_eq!(outcome.packets.len(), 1);
+        assert_eq!(outcome.packets[0].routing, PacketRouting::All);
+        assert_eq!(core.transport.path_count(), 1);
+        assert_eq!(core.transport.announce_count(), 1);
     }
 
     #[test]
