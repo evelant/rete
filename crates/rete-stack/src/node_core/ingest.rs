@@ -94,8 +94,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     }
                 }
 
-                // Flush pending announces so received announces are forwarded
-                // immediately (retransmit_timeout=now fires on first flush).
+                // Flush due pending announces. Transport-mode ingress queued
+                // this received announce with retransmit_timeout=now; endpoint
+                // ingress did not queue it for forwarding.
                 let flushed = self.flush_announces(now, rng);
                 packets.extend(flushed);
 
