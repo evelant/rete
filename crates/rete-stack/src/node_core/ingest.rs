@@ -965,12 +965,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         packets
     }
 
-    /// Periodic maintenance with allocation-atomic receipt failures.
+    /// Periodic maintenance with allocation-atomic DATA receipt failures.
     ///
-    /// Receipt failure terminals are committed to `sink`; they are not also
-    /// duplicated as [`NodeEvent::ReceiptFailed`] values. If the sink is full,
-    /// affected receipts remain outstanding and
+    /// DATA receipt failure terminals are committed to `sink`; they are not
+    /// also duplicated as [`NodeEvent::ReceiptFailed`] values. If the sink is
+    /// full, affected DATA receipts remain outstanding and
     /// [`ReceiptSinkTickOutcome::receipt_notifications_deferred`] is set.
+    /// Channel receipt expiry remains internal and emits no failure terminal.
     pub fn handle_tick_with_receipt_sink<R, T>(
         &mut self,
         now: u64,

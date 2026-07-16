@@ -206,12 +206,12 @@ impl<const N: usize> ReceiptTerminalReservation for FixedReceiptTerminalReservat
     }
 }
 
-/// Allocation-free outcome of one receipt timeout scan.
+/// Allocation-free outcome of one DATA-receipt timeout scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptTickSummary {
-    /// Terminal failures committed to the supplied sink.
+    /// DATA terminal failures committed to the supplied sink.
     pub emitted: usize,
-    /// At least one expired receipt remains because the sink was full.
+    /// At least one expired DATA receipt remains because the sink was full.
     pub deferred: bool,
 }
 
@@ -379,7 +379,7 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
         Some(packet_hash)
     }
 
-    /// Expire receipts into a caller-reserved terminal sink.
+    /// Expire DATA receipts into a caller-reserved terminal sink.
     ///
     /// Each sink slot is reserved before its receipt is removed. If the sink is
     /// full, the expired receipt remains `Sent` and can be reported on a later

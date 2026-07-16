@@ -611,6 +611,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 trunc,
                 ChannelReceipt {
                     link_id: *link_id,
+                    packet_hash: pkt_hash,
                     sequence,
                     sent_at: now,
                 },

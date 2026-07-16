@@ -164,6 +164,8 @@ impl core::fmt::Display for SendError {
 pub struct ChannelReceipt {
     /// Link the channel message was sent on.
     pub link_id: LinkId,
+    /// Complete hash of the exact outbound channel packet being proven.
+    pub packet_hash: [u8; 32],
     /// Sequence number in the channel.
     pub sequence: u16,
     /// Monotonic timestamp when sent.
@@ -424,8 +426,9 @@ pub struct TickResult {
 
 /// Allocation-free result of periodic transport maintenance.
 ///
-/// Receipt failures are committed to the caller's reserved sink before their
-/// receipt-table entries are removed.
+/// DATA receipt failures are committed to the caller's reserved sink before
+/// their receipt-table entries are removed. Channel-receipt expiry remains
+/// internal and does not emit a [`ReceiptTerminal::Failed`] notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "timed-out receipt notifications may have been deferred"]
 pub struct TickSummary {
@@ -433,9 +436,9 @@ pub struct TickSummary {
     pub expired_paths: usize,
     /// Number of links that were closed due to staleness.
     pub closed_links: usize,
-    /// Number of receipt-failure notifications committed to the sink.
+    /// Number of DATA receipt-failure notifications committed to the sink.
     pub failed_receipts: usize,
-    /// At least one expired receipt remains because the sink was full.
+    /// At least one expired DATA receipt remains because the sink was full.
     pub receipt_notifications_deferred: bool,
 }
 
@@ -660,6 +663,20 @@ impl<S: TransportStorage> Transport<S> {
             return None;
         }
 
+        // A HEADER_2 packet addressed to this transport identity is handled
+        // exclusively by the forwarding branch in `ingest_on`; it cannot
+        // terminate a local receipt even if its overloaded destination bytes
+        // collide with one of our local receipt keys.
+        if packet.header_type == HeaderType::Header2
+            && self.local_identity_hash.is_some_and(|local_id| {
+                packet
+                    .transport_id
+                    .is_some_and(|transport_id| IdentityHash::from_slice(transport_id) == local_id)
+            })
+        {
+            return None;
+        }
+
         let raw_destination: [u8; TRUNCATED_HASH_LEN] =
             packet.destination_hash.try_into().unwrap();
         let link_id = LinkId::from(raw_destination);
@@ -685,8 +702,10 @@ impl<S: TransportStorage> Transport<S> {
                 [..TRUNCATED_HASH_LEN]
                 .try_into()
                 .unwrap();
-            if self.channel_receipts.contains_key(&receipt_key) {
-                return Some(ReceiptCandidate::channel(packet_hash));
+            if let Some(receipt) = self.channel_receipts.get(&receipt_key) {
+                if receipt.link_id == link_id && receipt.packet_hash == packet_hash {
+                    return Some(ReceiptCandidate::channel(receipt.packet_hash));
+                }
             }
         }
 
@@ -1171,7 +1190,9 @@ impl<S: TransportStorage> Transport<S> {
                     let mut receipt_key = [0u8; TRUNCATED_HASH_LEN];
                     receipt_key.copy_from_slice(&full_hash[..TRUNCATED_HASH_LEN]);
 
-                    if let Some(cr) = self.channel_receipts.get(&receipt_key) {
+                    if let Some(cr) = self.channel_receipts.get(&receipt_key).filter(|receipt| {
+                        receipt.link_id == lid && receipt.packet_hash == full_hash
+                    }) {
                         let link_id = cr.link_id;
                         let sequence = cr.sequence;
                         let sig = &pkt.payload[32..96];
@@ -1375,12 +1396,13 @@ impl<S: TransportStorage> Transport<S> {
         (expired_count, closed_count)
     }
 
-    /// Expire old paths, reverse entries, stale links, and receipts into a
-    /// caller-reserved terminal sink.
+    /// Expire old paths, reverse entries, stale links, and DATA receipts into
+    /// a caller-reserved terminal sink.
     ///
-    /// A receipt remains tracked when the sink cannot reserve its notification
-    /// slot. The caller can drain the sink and retry a later tick without
-    /// losing the terminal delivery state.
+    /// A DATA receipt remains tracked when the sink cannot reserve its
+    /// notification slot. The caller can drain the sink and retry a later tick
+    /// without losing the terminal delivery state. Channel receipt expiry is
+    /// maintained separately and does not produce a failure terminal.
     pub fn tick_with_receipt_sink<T: ReceiptTerminalSink>(
         &mut self,
         now: u64,
@@ -1565,6 +1587,103 @@ mod tests {
         ));
         assert_eq!(transport.receipt_count(), 0);
         assert_eq!(transport.receipt_status(&packet_hash), None);
+    }
+
+    #[test]
+    fn forwarded_header2_proof_does_not_reserve_a_colliding_local_receipt() {
+        let mut transport = TestTransport::new();
+        let relay_hash = IdentityHash::from([0x11; TRUNCATED_HASH_LEN]);
+        let peer = Identity::from_seed(b"forwarded-proof-receipt-peer").unwrap();
+        let packet_hash = [0x5a; 32];
+        let destination = DestHash::from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
+        transport.set_local_identity(relay_hash);
+        assert!(transport.insert_path(destination, Path::direct(0)));
+        transport
+            .register_receipt(packet_hash, peer.public_key(), 100, RECEIPT_TIMEOUT)
+            .unwrap();
+
+        let ordinary_proof = TestTransport::build_proof_packet(&peer, &packet_hash).unwrap();
+        let proof_payload = Packet::parse(&ordinary_proof).unwrap().payload.to_vec();
+        let mut forwarded = [0u8; rete_core::MTU];
+        let forwarded_len = PacketBuilder::new(&mut forwarded)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(PacketType::Proof)
+            .dest_type(DestType::Single)
+            .transport_id(relay_hash.as_ref())
+            .destination_hash(destination.as_ref())
+            .payload(&proof_payload)
+            .build()
+            .unwrap();
+        let mut full_sink = crate::FixedReceiptTerminalSink::<0>::new();
+        let mut rng = rand::thread_rng();
+
+        let result = transport
+            .ingest_on_with_receipt_sink(
+                &mut forwarded[..forwarded_len],
+                101,
+                3,
+                &mut rng,
+                &peer,
+                &mut full_sink,
+            )
+            .expect("a relayed proof must not require local terminal capacity");
+
+        assert!(matches!(result, IngestResult::Forward { source_iface: 3, .. }));
+        assert_eq!(
+            transport.receipt_status(&packet_hash),
+            Some(crate::ReceiptStatus::Sent)
+        );
+        assert!(full_sink.is_empty());
+    }
+
+    #[test]
+    fn channel_candidate_requires_full_hash_and_destination_link_match() {
+        let mut transport = TestTransport::new();
+        let expected_hash = [0x44; 32];
+        let expected_link = LinkId::from([0x77; TRUNCATED_HASH_LEN]);
+        let mut key = [0u8; TRUNCATED_HASH_LEN];
+        key.copy_from_slice(&expected_hash[..TRUNCATED_HASH_LEN]);
+        transport
+            .channel_receipts
+            .insert(
+                key,
+                ChannelReceipt {
+                    link_id: expected_link,
+                    packet_hash: expected_hash,
+                    sequence: 7,
+                    sent_at: 100,
+                },
+            )
+            .unwrap();
+
+        let signer = Identity::from_seed(b"channel-candidate-exactness").unwrap();
+        let mut colliding_hash = expected_hash;
+        colliding_hash[TRUNCATED_HASH_LEN..].fill(0x55);
+        let wrong_hash_proof =
+            TestTransport::build_link_proof_packet(&signer, &colliding_hash, &expected_link)
+                .unwrap();
+        let other_link = LinkId::from([0x88; TRUNCATED_HASH_LEN]);
+        let wrong_link_proof =
+            TestTransport::build_link_proof_packet(&signer, &expected_hash, &other_link).unwrap();
+        let mut full_sink = crate::FixedReceiptTerminalSink::<0>::new();
+        let mut rng = rand::thread_rng();
+
+        for mut proof in [wrong_hash_proof, wrong_link_proof] {
+            let result = transport
+                .ingest_on_with_receipt_sink(
+                    &mut proof,
+                    101,
+                    0,
+                    &mut rng,
+                    &signer,
+                    &mut full_sink,
+                )
+                .expect("a non-matching channel proof must not reserve a terminal slot");
+            assert!(!matches!(result, IngestResult::ProofReceived { .. }));
+            assert_eq!(transport.channel_receipt_count(), 1);
+        }
+        assert!(full_sink.is_empty());
     }
 
     #[test]

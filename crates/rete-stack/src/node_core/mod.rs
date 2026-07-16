@@ -203,16 +203,16 @@ pub struct IngestOutcome {
     pub packets: Vec<OutboundPacket>,
 }
 
-/// Result of periodic maintenance when receipt terminals are written to a
-/// caller-reserved sink.
+/// Result of periodic maintenance when DATA receipt terminals are written to
+/// a caller-reserved sink.
 #[derive(Debug)]
 #[must_use = "receipt failure notifications may have been deferred"]
 pub struct ReceiptSinkTickOutcome {
     /// Ordinary node events and outbound packets produced by the tick.
     pub outcome: IngestOutcome,
-    /// Number of receipt-failure terminals committed to the sink.
+    /// Number of DATA receipt-failure terminals committed to the sink.
     pub failed_receipts: usize,
-    /// At least one expired receipt remains because the sink was full.
+    /// At least one expired DATA receipt remains because the sink was full.
     pub receipt_notifications_deferred: bool,
 }
 
@@ -2230,6 +2230,74 @@ mod tests {
                 .pending_count(),
             0
         );
+    }
+
+    #[test]
+    fn channel_proof_must_match_the_stored_full_hash_and_link_id() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let outbound = init
+            .send_channel_message(&link_id, 0x42, b"exact proof", 200, &mut rng)
+            .unwrap();
+        let packet_hash = Packet::parse(&outbound.data).unwrap().compute_hash();
+        let response = resp.handle_ingest(&outbound.data, 200, 0, &mut rng);
+        let valid_proof = response
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .map(|packet| packet.packet_type == PacketType::Proof)
+                    .unwrap_or(false)
+            })
+            .expect("channel receiver should produce proof")
+            .data
+            .clone();
+
+        // The truncated receipt key alone is insufficient: the signer can
+        // choose any remaining suffix without finding a hash collision.
+        let mut colliding_hash = packet_hash;
+        colliding_hash[rete_core::TRUNCATED_HASH_LEN] ^= 0xff;
+        let mut wrong_hash_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(resp.identity(), &colliding_hash, &link_id)
+        .unwrap();
+        let wrong_link = LinkId::from([0x99; rete_core::TRUNCATED_HASH_LEN]);
+        let mut wrong_link_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(resp.identity(), &packet_hash, &wrong_link)
+        .unwrap();
+        let mut sink = RecordingReceiptSink::default();
+
+        for proof in [&mut wrong_hash_proof, &mut wrong_link_proof] {
+            let outcome = init
+                .handle_ingest_with_receipt_sink(proof, 201, 0, &mut rng, &mut sink)
+                .unwrap();
+            assert!(outcome.events.is_empty());
+            assert_eq!(init.transport.channel_receipt_count(), 1);
+            assert_eq!(
+                init.transport
+                    .get_link(&link_id)
+                    .unwrap()
+                    .channel()
+                    .unwrap()
+                    .pending_count(),
+                1
+            );
+        }
+        assert!(sink.candidates.is_empty());
+        assert!(sink.terminals.is_empty());
+
+        init.handle_ingest_with_receipt_sink(&valid_proof, 202, 0, &mut rng, &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.candidates,
+            vec![rete_transport::ReceiptCandidate::channel(packet_hash)]
+        );
+        assert_eq!(
+            sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Delivered(packet_hash)]
+        );
+        assert_eq!(init.transport.channel_receipt_count(), 0);
     }
 
     #[test]
