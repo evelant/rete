@@ -127,6 +127,9 @@ where
     fn len(&self) -> usize {
         HashMap::len(self)
     }
+    fn is_full(&self) -> bool {
+        false
+    }
     fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a K, &'a V)>
     where
         K: 'a,
@@ -186,4 +189,3 @@ impl<V> StorageDeque<V> for VecDeque<V> {
         VecDeque::clear(self)
     }
 }
-

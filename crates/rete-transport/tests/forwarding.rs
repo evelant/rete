@@ -379,11 +379,11 @@ fn reverse_table_expiry() {
     assert_eq!(t.reverse_count(), 1);
 
     // Tick at a time before expiry — entry should remain
-    t.tick(100 + REVERSE_TIMEOUT - 1);
+    let _ = t.tick(100 + REVERSE_TIMEOUT - 1);
     assert_eq!(t.reverse_count(), 1);
 
     // Tick past expiry — entry should be removed
-    t.tick(100 + REVERSE_TIMEOUT + 1);
+    let _ = t.tick(100 + REVERSE_TIMEOUT + 1);
     assert_eq!(t.reverse_count(), 0);
 }
 

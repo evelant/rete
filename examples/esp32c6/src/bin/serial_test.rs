@@ -370,6 +370,14 @@ fn handle_event(
             );
         }
 
+        NodeEvent::ReceiptFailed { packet_hash } => {
+            let ph = hex4(&packet_hash);
+            println!(
+                "[serial-test] RECEIPT_FAILED: {}",
+                core::str::from_utf8(&ph).unwrap_or("????")
+            );
+        }
+
         NodeEvent::Tick {
             expired_paths,
             closed_links,

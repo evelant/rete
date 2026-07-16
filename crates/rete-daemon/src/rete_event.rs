@@ -25,6 +25,7 @@ pub enum ReteEvent {
     Data { dest: String, payload: String },
     DataSent { dest: String, payload: String },
     ProofReceived { packet_hash: String },
+    ReceiptFailed { packet_hash: String },
 
     // ── Link ────────────────────────────────────────────────────────────
     LinkEstablished { link: String },
@@ -80,6 +81,7 @@ impl ReteEvent {
             Self::Data { .. } => "DATA",
             Self::DataSent { .. } => "DATA_SENT",
             Self::ProofReceived { .. } => "PROOF_RECEIVED",
+            Self::ReceiptFailed { .. } => "RECEIPT_FAILED",
             Self::LinkEstablished { .. } => "LINK_ESTABLISHED",
             Self::LinkClosed { .. } => "LINK_CLOSED",
             Self::LinkData { .. } => "LINK_DATA",
@@ -126,6 +128,7 @@ impl ReteEvent {
             Self::Data { dest, payload } => format!("DATA:{dest}:{payload}"),
             Self::DataSent { dest, payload } => format!("DATA_SENT:{dest}:{payload}"),
             Self::ProofReceived { packet_hash } => format!("PROOF_RECEIVED:{packet_hash}"),
+            Self::ReceiptFailed { packet_hash } => format!("RECEIPT_FAILED:{packet_hash}"),
             Self::LinkEstablished { link } => format!("LINK_ESTABLISHED:{link}"),
             Self::LinkClosed { link } => format!("LINK_CLOSED:{link}"),
             Self::LinkData { link, payload } => format!("LINK_DATA:{link}:{payload}"),
@@ -179,6 +182,7 @@ impl ReteEvent {
             Self::Data { dest, .. } => format!("data received dest={dest}"),
             Self::DataSent { dest, .. } => format!("data sent dest={dest}"),
             Self::ProofReceived { packet_hash } => format!("proof received hash={packet_hash}"),
+            Self::ReceiptFailed { packet_hash } => format!("receipt failed hash={packet_hash}"),
             Self::LinkEstablished { link } => format!("link established link={link}"),
             Self::LinkClosed { link } => format!("link closed link={link}"),
             Self::LinkData { link, .. } => format!("link data link={link}"),

@@ -9,9 +9,151 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use crate::storage::StorageMap;
+use alloc::vec::Vec;
 use rete_core::{Identity, TRUNCATED_HASH_LEN};
+
+/// Terminal state for a DATA delivery receipt or a proven channel delivery.
+///
+/// Channel proof success produces [`Self::Delivered`]. Channel receipt timeout
+/// is currently maintained separately and does not produce [`Self::Failed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptTerminal {
+    /// A valid delivery proof covered this full packet hash.
+    Delivered([u8; 32]),
+    /// A DATA receipt reached its configured timeout without a valid proof.
+    Failed([u8; 32]),
+}
+
+impl ReceiptTerminal {
+    /// Full packet hash used to correlate the terminal state.
+    pub const fn packet_hash(&self) -> &[u8; 32] {
+        match self {
+            Self::Delivered(packet_hash) | Self::Failed(packet_hash) => packet_hash,
+        }
+    }
+}
+
+/// A terminal-event sink cannot reserve another infallible commit slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptSinkFull;
+
+/// One terminal-event slot reserved before receipt state is mutated.
+pub trait ReceiptTerminalReservation {
+    /// Commit the terminal state without allocation or failure.
+    fn commit(self, terminal: ReceiptTerminal);
+}
+
+/// Reservable destination for receipt terminal states.
+///
+/// A successful reservation must make [`ReceiptTerminalReservation::commit`]
+/// infallible. Dropping an unused reservation releases it. Implementations may
+/// use a fixed queue slot, a pre-reserved vector element, or a product-owned
+/// submission record.
+pub trait ReceiptTerminalSink {
+    /// Reservation borrowing this sink until it is committed or dropped.
+    type Reservation<'a>: ReceiptTerminalReservation
+    where
+        Self: 'a;
+
+    /// Reserve one terminal state before the corresponding receipt is removed.
+    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull>;
+}
+
+/// Heapless fixed-capacity sink for receipt terminal states.
+///
+/// Reserving a slot does not change the visible length. The reservation's
+/// exclusive borrow guarantees that its later commit can push without
+/// competing for capacity. Dropping it without committing immediately makes
+/// the capacity available again.
+#[derive(Debug)]
+pub struct FixedReceiptTerminalSink<const N: usize> {
+    terminals: heapless::Vec<ReceiptTerminal, N>,
+}
+
+impl<const N: usize> FixedReceiptTerminalSink<N> {
+    /// Construct an empty sink.
+    pub const fn new() -> Self {
+        Self {
+            terminals: heapless::Vec::new(),
+        }
+    }
+
+    /// Number of committed terminal states.
+    pub fn len(&self) -> usize {
+        self.terminals.len()
+    }
+
+    /// Whether no terminal states are committed.
+    pub fn is_empty(&self) -> bool {
+        self.terminals.is_empty()
+    }
+
+    /// Whether another terminal state cannot currently be reserved.
+    pub fn is_full(&self) -> bool {
+        self.terminals.is_full()
+    }
+
+    /// View committed terminal states in commit order.
+    pub fn as_slice(&self) -> &[ReceiptTerminal] {
+        self.terminals.as_slice()
+    }
+
+    /// Remove and return the most recently committed terminal state.
+    pub fn pop(&mut self) -> Option<ReceiptTerminal> {
+        self.terminals.pop()
+    }
+
+    /// Remove all committed terminal states.
+    pub fn clear(&mut self) {
+        self.terminals.clear();
+    }
+}
+
+impl<const N: usize> Default for FixedReceiptTerminalSink<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reserved slot in a [`FixedReceiptTerminalSink`].
+pub struct FixedReceiptTerminalReservation<'a, const N: usize> {
+    terminals: &'a mut heapless::Vec<ReceiptTerminal, N>,
+}
+
+impl<const N: usize> ReceiptTerminalSink for FixedReceiptTerminalSink<N> {
+    type Reservation<'a>
+        = FixedReceiptTerminalReservation<'a, N>
+    where
+        Self: 'a;
+
+    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
+        if self.terminals.is_full() {
+            Err(ReceiptSinkFull)
+        } else {
+            Ok(FixedReceiptTerminalReservation {
+                terminals: &mut self.terminals,
+            })
+        }
+    }
+}
+
+impl<const N: usize> ReceiptTerminalReservation for FixedReceiptTerminalReservation<'_, N> {
+    fn commit(self, terminal: ReceiptTerminal) {
+        self.terminals
+            .push(terminal)
+            .expect("reserved fixed receipt slot must accept commit");
+    }
+}
+
+/// Allocation-free outcome of one receipt timeout scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptTickSummary {
+    /// Terminal failures committed to the supplied sink.
+    pub emitted: usize,
+    /// At least one expired receipt remains because the sink was full.
+    pub deferred: bool,
+}
 
 /// Status of a packet receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +164,16 @@ pub enum ReceiptStatus {
     Delivered,
     /// Timed out without proof.
     Failed,
+}
+
+/// Why a delivery receipt could not be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptRegistrationError {
+    /// Another outstanding receipt already uses the same truncated packet
+    /// hash. Replacing it would make one of the proofs ambiguous.
+    HashAlreadyTracked,
+    /// The bounded receipt table has no free entry.
+    TableFull,
 }
 
 /// A receipt for a sent packet, awaiting delivery proof.
@@ -55,18 +207,35 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> Default for Receipt
 }
 
 impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
+    fn key(packet_hash: &[u8; 32]) -> [u8; TRUNCATED_HASH_LEN] {
+        let mut truncated = [0u8; TRUNCATED_HASH_LEN];
+        truncated.copy_from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
+        truncated
+    }
+
+    /// Whether the backing map cannot admit another receipt.
+    pub fn is_full(&self) -> bool {
+        self.entries.is_full()
+    }
+
     /// Register a receipt for a sent packet.
     ///
-    /// Returns `false` if the table is full.
+    /// Registration never replaces an existing truncated hash. Doing so would
+    /// orphan the previous packet and make an eventual proof ambiguous.
     pub fn register(
         &mut self,
         packet_hash: [u8; 32],
         dest_pub_key: [u8; 64],
         now: u64,
         timeout: u64,
-    ) -> bool {
-        let mut truncated = [0u8; TRUNCATED_HASH_LEN];
-        truncated.copy_from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
+    ) -> Result<(), ReceiptRegistrationError> {
+        let truncated = Self::key(&packet_hash);
+        if self.entries.contains_key(&truncated) {
+            return Err(ReceiptRegistrationError::HashAlreadyTracked);
+        }
+        if self.entries.is_full() {
+            return Err(ReceiptRegistrationError::TableFull);
+        }
         let receipt = PacketReceipt {
             packet_hash,
             dest_pub_key,
@@ -74,12 +243,32 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
             sent_at: now,
             timeout,
         };
-        self.entries.insert(truncated, receipt).is_ok()
+        self.entries
+            .insert(truncated, receipt)
+            .map(|_| ())
+            .map_err(|_| ReceiptRegistrationError::TableFull)
     }
 
     /// Look up a receipt by truncated hash.
     pub fn get(&self, truncated_hash: &[u8; TRUNCATED_HASH_LEN]) -> Option<&PacketReceipt> {
         self.entries.get(truncated_hash)
+    }
+
+    /// Look up a receipt status by its full packet hash.
+    pub fn status(&self, packet_hash: &[u8; 32]) -> Option<ReceiptStatus> {
+        let receipt = self.entries.get(&Self::key(packet_hash))?;
+        (receipt.packet_hash == *packet_hash).then_some(receipt.status)
+    }
+
+    /// Cancel an outstanding receipt by its complete packet hash.
+    ///
+    /// A truncated-hash collision never removes the tracked sibling.
+    pub fn remove_full(&mut self, packet_hash: &[u8; 32]) -> bool {
+        let key = Self::key(packet_hash);
+        if !matches!(self.entries.get(&key), Some(receipt) if receipt.packet_hash == *packet_hash) {
+            return false;
+        }
+        self.entries.remove(&key).is_some()
     }
 
     /// Validate a proof against a registered receipt.
@@ -89,6 +278,7 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
     /// - **Implicit proof** (64 bytes): `signature[64]` (packet_hash recalled from receipt)
     ///
     /// Returns the full packet hash on success, or `None` if validation fails.
+    /// A successfully validated receipt is removed before this method returns.
     pub fn validate_proof(
         &mut self,
         truncated_hash: &[u8; TRUNCATED_HASH_LEN],
@@ -119,34 +309,107 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
         let identity = Identity::from_public_key(&receipt.dest_pub_key).ok()?;
         identity.verify(&packet_hash, signature).ok()?;
 
-        // Mark as delivered
-        if let Some(r) = self.entries.get_mut(truncated_hash) {
-            r.status = ReceiptStatus::Delivered;
-        }
+        // A validated proof is itself the complete terminal notification.
+        // Reclaim the entry before returning so low-level Transport callers
+        // cannot accidentally leak delivered receipts by omitting a separate
+        // drain operation.
+        let removed = self.entries.remove(truncated_hash);
+        debug_assert!(matches!(removed, Some(receipt) if receipt.packet_hash == packet_hash));
 
         Some(packet_hash)
     }
 
-    /// Expire receipts that have timed out.
-    pub fn tick(&mut self, now: u64) {
-        let mut to_expire: Vec<[u8; TRUNCATED_HASH_LEN]> = Vec::new();
-
-        for (key, receipt) in self.entries.iter() {
-            if receipt.status == ReceiptStatus::Sent
-                && receipt.timeout > 0
-                && now.saturating_sub(receipt.sent_at) > receipt.timeout
-            {
-                to_expire.push(*key);
-            }
-        }
-
-        for key in &to_expire {
-            if let Some(r) = self.entries.get_mut(key) {
-                r.status = ReceiptStatus::Failed;
-            }
+    /// Expire receipts into a caller-reserved terminal sink.
+    ///
+    /// Each sink slot is reserved before its receipt is removed. If the sink is
+    /// full, the expired receipt remains `Sent` and can be reported on a later
+    /// call; a valid proof received before that retry may still complete it as
+    /// delivered. The bounded implementation rescans after each removal,
+    /// making a full expiry pass O(P²) in the number of outstanding receipts.
+    pub fn tick_into<T: ReceiptTerminalSink>(
+        &mut self,
+        now: u64,
+        sink: &mut T,
+    ) -> ReceiptTickSummary {
+        let mut emitted = 0;
+        loop {
+            let expired = self.entries.iter().find_map(|(key, receipt)| {
+                (receipt.status == ReceiptStatus::Sent
+                    && receipt.timeout > 0
+                    && now.saturating_sub(receipt.sent_at) > receipt.timeout)
+                    .then_some((*key, receipt.packet_hash))
+            });
+            let Some((key, packet_hash)) = expired else {
+                return ReceiptTickSummary {
+                    emitted,
+                    deferred: false,
+                };
+            };
+            let reservation = match sink.try_reserve() {
+                Ok(reservation) => reservation,
+                Err(ReceiptSinkFull) => {
+                    return ReceiptTickSummary {
+                        emitted,
+                        deferred: true,
+                    };
+                }
+            };
+            let removed = self.entries.remove(&key);
+            debug_assert!(matches!(removed, Some(receipt) if receipt.packet_hash == packet_hash));
+            reservation.commit(ReceiptTerminal::Failed(packet_hash));
+            emitted += 1;
         }
     }
 
+    /// Expire and remove receipts that have timed out.
+    ///
+    /// Returned hashes are the complete failure notification: expired entries
+    /// no longer consume table capacity when this method returns. The complete
+    /// output capacity is reserved before any receipt is removed.
+    pub fn tick(&mut self, now: u64) -> Vec<[u8; 32]> {
+        let mut failed = Vec::new();
+        failed.reserve_exact(self.entries.len());
+        let mut sink = FailedHashVecSink {
+            hashes: &mut failed,
+        };
+        let summary = self.tick_into(now, &mut sink);
+        debug_assert!(!summary.deferred);
+        failed
+    }
+}
+
+struct FailedHashVecSink<'a> {
+    hashes: &'a mut Vec<[u8; 32]>,
+}
+
+struct FailedHashVecReservation<'a> {
+    hashes: &'a mut Vec<[u8; 32]>,
+}
+
+impl ReceiptTerminalSink for FailedHashVecSink<'_> {
+    type Reservation<'a>
+        = FailedHashVecReservation<'a>
+    where
+        Self: 'a;
+
+    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
+        debug_assert!(self.hashes.len() < self.hashes.capacity());
+        Ok(FailedHashVecReservation {
+            hashes: self.hashes,
+        })
+    }
+}
+
+impl ReceiptTerminalReservation for FailedHashVecReservation<'_> {
+    fn commit(self, terminal: ReceiptTerminal) {
+        let ReceiptTerminal::Failed(packet_hash) = terminal else {
+            unreachable!("timeout scan cannot deliver a receipt")
+        };
+        self.hashes.push(packet_hash);
+    }
+}
+
+impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
     /// Number of tracked receipts.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -169,6 +432,7 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use heapless::FnvIndexMap;
 
     type TestTable = ReceiptTable<FnvIndexMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt, 16>>;
@@ -184,7 +448,10 @@ mod tests {
         let identity = make_test_identity();
         let packet_hash = [0xABu8; 32];
 
-        assert!(table.register(packet_hash, identity.public_key(), 100, 30));
+        assert_eq!(
+            table.register(packet_hash, identity.public_key(), 100, 30),
+            Ok(())
+        );
         assert_eq!(table.len(), 1);
 
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
@@ -199,7 +466,9 @@ mod tests {
         let identity = make_test_identity();
         let packet_hash = [0x42u8; 32];
 
-        table.register(packet_hash, identity.public_key(), 100, 30);
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
         // Build explicit proof: packet_hash[32] || signature[64]
@@ -210,7 +479,8 @@ mod tests {
 
         let result = table.validate_proof(&trunc, &proof);
         assert_eq!(result, Some(packet_hash));
-        assert_eq!(table.get(&trunc).unwrap().status, ReceiptStatus::Delivered);
+        assert!(table.get(&trunc).is_none());
+        assert!(table.is_empty());
     }
 
     #[test]
@@ -219,7 +489,9 @@ mod tests {
         let identity = make_test_identity();
         let packet_hash = [0x42u8; 32];
 
-        table.register(packet_hash, identity.public_key(), 100, 30);
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
         // Build implicit proof: signature[64] only
@@ -227,6 +499,7 @@ mod tests {
 
         let result = table.validate_proof(&trunc, &sig);
         assert_eq!(result, Some(packet_hash));
+        assert!(table.is_empty());
     }
 
     #[test]
@@ -235,7 +508,9 @@ mod tests {
         let identity = make_test_identity();
         let packet_hash = [0x42u8; 32];
 
-        table.register(packet_hash, identity.public_key(), 100, 30);
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
         // Corrupt signature
@@ -254,16 +529,113 @@ mod tests {
         let identity = make_test_identity();
         let packet_hash = [0x42u8; 32];
 
-        table.register(packet_hash, identity.public_key(), 100, 30);
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
         // Before timeout
-        table.tick(129);
+        assert!(table.tick(129).is_empty());
         assert_eq!(table.get(&trunc).unwrap().status, ReceiptStatus::Sent);
 
         // After timeout
-        table.tick(131);
-        assert_eq!(table.get(&trunc).unwrap().status, ReceiptStatus::Failed);
+        assert_eq!(table.tick(131), vec![packet_hash]);
+        assert!(table.get(&trunc).is_none());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn full_terminal_sink_defers_timeout_without_removing_receipt() {
+        let mut table = TestTable::default();
+        let identity = make_test_identity();
+        let packet_hash = [0x42u8; 32];
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
+        let mut sink = FixedReceiptTerminalSink::<0>::default();
+
+        assert_eq!(
+            table.tick_into(131, &mut sink),
+            ReceiptTickSummary {
+                emitted: 0,
+                deferred: true,
+            }
+        );
+        assert_eq!(table.status(&packet_hash), Some(ReceiptStatus::Sent));
+    }
+
+    #[test]
+    fn valid_proof_can_win_while_expired_timeout_is_deferred() {
+        let mut table = TestTable::default();
+        let identity = make_test_identity();
+        let packet_hash = [0x43u8; 32];
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
+        let mut full_sink = FixedReceiptTerminalSink::<0>::new();
+        assert!(table.tick_into(131, &mut full_sink).deferred);
+
+        let key = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+        let signature = identity.sign(&packet_hash).unwrap();
+        assert_eq!(table.validate_proof(&key, &signature), Some(packet_hash));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn dropped_fixed_sink_reservation_restores_capacity() {
+        let mut sink = FixedReceiptTerminalSink::<1>::new();
+        let reservation = sink.try_reserve().unwrap();
+        drop(reservation);
+
+        assert!(sink.is_empty());
+        assert!(!sink.is_full());
+        sink.try_reserve()
+            .unwrap()
+            .commit(ReceiptTerminal::Failed([0x44; 32]));
+        assert_eq!(sink.len(), 1);
+        assert!(sink.is_full());
+    }
+
+    #[test]
+    fn timeout_scan_commits_only_reserved_slots_and_retries_remainder() {
+        let mut table = TestTable::default();
+        let identity = make_test_identity();
+        let first = [0x41u8; 32];
+        let second = [0x42u8; 32];
+        table
+            .register(first, identity.public_key(), 100, 30)
+            .unwrap();
+        table
+            .register(second, identity.public_key(), 100, 30)
+            .unwrap();
+
+        let mut first_sink = FixedReceiptTerminalSink::<1>::default();
+        assert_eq!(
+            table.tick_into(131, &mut first_sink),
+            ReceiptTickSummary {
+                emitted: 1,
+                deferred: true,
+            }
+        );
+        assert_eq!(table.len(), 1);
+
+        let mut second_sink = FixedReceiptTerminalSink::<1>::default();
+        assert_eq!(
+            table.tick_into(131, &mut second_sink),
+            ReceiptTickSummary {
+                emitted: 1,
+                deferred: false,
+            }
+        );
+        assert!(table.is_empty());
+
+        let delivered: alloc::vec::Vec<_> = first_sink
+            .terminals
+            .into_iter()
+            .chain(second_sink.terminals)
+            .collect();
+        assert!(delivered.contains(&ReceiptTerminal::Failed(first)));
+        assert!(delivered.contains(&ReceiptTerminal::Failed(second)));
     }
 
     #[test]
@@ -274,44 +646,97 @@ mod tests {
         for i in 0u8..4 {
             let mut hash = [0u8; 32];
             hash[0] = i;
-            assert!(
+            assert_eq!(
                 table.register(hash, identity.public_key(), 100, 30),
+                Ok(()),
                 "slot {} should succeed",
                 i
             );
         }
         assert_eq!(table.len(), 4);
 
-        // 5th registration should fail (returns false, no panic)
+        // 5th registration should fail without replacing an entry.
         let mut overflow_hash = [0u8; 32];
         overflow_hash[0] = 0xFF;
-        assert!(
-            !table.register(overflow_hash, identity.public_key(), 100, 30),
-            "table full — register should return false"
+        assert_eq!(
+            table.register(overflow_hash, identity.public_key(), 100, 30),
+            Err(ReceiptRegistrationError::TableFull),
+            "table full should be explicit"
         );
         assert_eq!(table.len(), 4);
     }
 
     #[test]
-    fn test_validate_proof_already_delivered() {
+    fn validated_proof_is_reclaimed_and_duplicate_ignored() {
         let mut table = TestTable::default();
         let identity = make_test_identity();
         let packet_hash = [0x42u8; 32];
 
-        table.register(packet_hash, identity.public_key(), 100, 30);
+        table
+            .register(packet_hash, identity.public_key(), 100, 30)
+            .unwrap();
         let trunc: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
         // First proof — should succeed
         let sig = identity.sign(&packet_hash).unwrap();
         let result = table.validate_proof(&trunc, &sig);
         assert_eq!(result, Some(packet_hash));
-        assert_eq!(table.get(&trunc).unwrap().status, ReceiptStatus::Delivered);
+        assert!(table.get(&trunc).is_none());
 
-        // Second proof on the same receipt — should return None
+        // Second proof on the reclaimed receipt should return None.
         let result2 = table.validate_proof(&trunc, &sig);
         assert_eq!(
             result2, None,
             "already-delivered receipt should reject proof"
         );
+    }
+
+    #[test]
+    fn duplicate_truncated_hash_never_replaces_outstanding_receipt() {
+        let mut table = TestTable::default();
+        let identity = make_test_identity();
+        let first = [0x42u8; 32];
+        let mut colliding = first;
+        colliding[31] ^= 0xff;
+
+        table
+            .register(first, identity.public_key(), 100, 30)
+            .unwrap();
+        assert_eq!(
+            table.register(colliding, identity.public_key(), 101, 30),
+            Err(ReceiptRegistrationError::HashAlreadyTracked)
+        );
+        assert_eq!(table.status(&first), Some(ReceiptStatus::Sent));
+        assert_eq!(table.status(&colliding), None);
+        assert!(!table.remove_full(&colliding));
+        assert_eq!(table.status(&first), Some(ReceiptStatus::Sent));
+        assert!(table.remove_full(&first));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn delivered_and_timed_out_receipts_are_removed_atomically() {
+        let mut table = TestTable::default();
+        let identity = make_test_identity();
+        let delivered_hash = [0x42u8; 32];
+        table
+            .register(delivered_hash, identity.public_key(), 100, 30)
+            .unwrap();
+
+        let trunc = delivered_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+        let signature = identity.sign(&delivered_hash).unwrap();
+        assert_eq!(
+            table.validate_proof(&trunc, &signature),
+            Some(delivered_hash)
+        );
+        assert_eq!(table.status(&delivered_hash), None);
+
+        let timed_out_hash = [0x43u8; 32];
+        table
+            .register(timed_out_hash, identity.public_key(), 100, 30)
+            .unwrap();
+        assert_eq!(table.tick(131), vec![timed_out_hash]);
+        assert_eq!(table.status(&timed_out_hash), None);
+        assert!(table.is_empty());
     }
 }

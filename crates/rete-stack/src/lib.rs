@@ -148,6 +148,11 @@ pub enum NodeEvent {
         /// The full 32-byte packet hash the proof covers.
         packet_hash: [u8; 32],
     },
+    /// A delivery receipt timed out without a valid proof.
+    ReceiptFailed {
+        /// The full 32-byte packet hash whose receipt expired.
+        packet_hash: [u8; 32],
+    },
     /// A link was established.
     LinkEstablished {
         /// The link_id.
@@ -296,22 +301,25 @@ pub mod node_core;
 #[cfg(feature = "alloc")]
 pub use destination::{Destination, DestinationType, Direction};
 
-#[cfg(feature = "alloc")]
-pub use node_core::{
-    EmbeddedNodeCore, IngestOutcome, NodeCore, NodeHooks, NodeStats, OutboundPacket,
-    PacketRouting, RequestCallback, RequestContext, RequestHandler, RequestPolicy,
-    ResponseCompressionPolicy, handler_fn,
-};
-#[cfg(feature = "alloc")]
-pub use node_core::request_receipt::{PendingRequest, RequestStatus};
 #[cfg(all(feature = "alloc", feature = "hosted"))]
 pub use node_core::HostedNodeCore;
 #[cfg(feature = "alloc")]
 pub use node_core::ratchet::{InMemoryRatchetStore, RatchetStore};
-
+#[cfg(feature = "alloc")]
+pub use node_core::request_receipt::{PendingRequest, RequestStatus};
+#[cfg(feature = "alloc")]
+pub use node_core::{
+    EmbeddedNodeCore, IngestOutcome, NodeCore, NodeHooks, NodeStats, OutboundPacket, PacketRouting,
+    PreparedDataPacket, PreparedDataPacketRef, ReceiptSinkTickOutcome, ReceiptToken,
+    RequestCallback, RequestContext, RequestHandler, RequestPolicy, ResponseCompressionPolicy,
+    handler_fn,
+};
 
 #[cfg(feature = "alloc")]
-pub use rete_transport::SendError;
+pub use rete_transport::{
+    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, ReceiptSinkFull, ReceiptTerminal,
+    ReceiptTerminalReservation, ReceiptTerminalSink, SendError,
+};
 
 /// Dispatch outbound packets to a single interface.
 ///

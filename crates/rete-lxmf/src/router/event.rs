@@ -1,7 +1,7 @@
 //! Event dispatch — handle_event and handle_event_mut.
 
 use rete_core::{DestHash, TRUNCATED_HASH_LEN};
-use rete_stack::NodeEvent;
+use rete_stack::{NodeCore, NodeEvent};
 
 use crate::peer::{LxmPeer, SyncStrategy};
 use crate::propagation::MessageStore;
@@ -15,14 +15,21 @@ impl<S: MessageStore> LxmfRouter<S> {
     // Event handling
     // -----------------------------------------------------------------------
 
-    /// Dispatch a NodeEvent through LXMF parsing.
+    /// Parse a `NodeEvent` without mutating router state.
     ///
     /// Returns an LxmfEvent — either a parsed LXMF message, a peer announce,
     /// a propagation event, or the original event wrapped as Other.
     ///
-    /// Note: for propagation deposit handling, call `handle_event_mut` instead
-    /// so that ResourceComplete events on the propagation link can be deposited
-    /// into the store.
+    /// # Stateless inspection only
+    ///
+    /// This method must not be used as an application's run-loop dispatcher.
+    /// It cannot correlate `ProofReceived` or `ReceiptFailed` events with the
+    /// outbound queue, advance retries, update tickets, or deposit propagation
+    /// resources. Applications that enqueue outbound messages must pass every
+    /// `NodeEvent` to [`Self::handle_event_mut`], even when propagation is
+    /// disabled. This immutable method is retained only for callers that need
+    /// stateless parsing and deliberately do not use router-managed lifecycle
+    /// state.
     pub fn handle_event(&self, event: NodeEvent) -> LxmfEvent {
         match event {
             NodeEvent::DataReceived {
@@ -75,17 +82,35 @@ impl<S: MessageStore> LxmfRouter<S> {
         }
     }
 
-    /// Dispatch a NodeEvent through LXMF parsing, with mutable access for
-    /// propagation deposit handling.
+    /// Dispatch a `NodeEvent` through stateful LXMF parsing.
     ///
-    /// This is the preferred method when propagation is enabled. When a
-    /// ResourceComplete event is received and propagation is active, the
-    /// resource data is deposited into the propagation store.
-    ///
-    /// Also handles `RequestReceived` events for propagation retrieval:
-    /// if the path matches `/lxmf/propagation/retrieve`, returns
-    /// `LxmfEvent::PropagationRetrievalRequest`.
+    /// This preserves the original event-only API. It correlates receipt
+    /// events, but cannot cancel sibling attempt receipts in Transport. New
+    /// callers that own a node core should use
+    /// [`Self::handle_event_mut_with_core`].
     pub fn handle_event_mut(&mut self, event: NodeEvent, now: u64) -> LxmfEvent {
+        self.handle_event_mut_inner(event, now, |_| {})
+    }
+
+    /// Dispatch a `NodeEvent` and synchronously cancel obsolete sibling
+    /// transport receipts when one LXMF attempt is proven.
+    pub fn handle_event_mut_with_core<TS: rete_transport::TransportStorage>(
+        &mut self,
+        event: NodeEvent,
+        now: u64,
+        core: &mut NodeCore<TS>,
+    ) -> LxmfEvent {
+        self.handle_event_mut_inner(event, now, |sibling_hash| {
+            core.transport.cancel_receipt(sibling_hash);
+        })
+    }
+
+    fn handle_event_mut_inner(
+        &mut self,
+        event: NodeEvent,
+        now: u64,
+        mut cancel_sibling: impl FnMut(&[u8; 32]),
+    ) -> LxmfEvent {
         // For ResourceComplete: try propagation deposit first if enabled
         if self.propagation.is_some() {
             if let NodeEvent::ResourceComplete { ref data, .. } = event {
@@ -164,7 +189,17 @@ impl<S: MessageStore> LxmfRouter<S> {
 
         // Check ProofReceived for delivery receipt correlation
         if let NodeEvent::ProofReceived { packet_hash } = &event {
-            if let Some(receipt_event) = self.check_delivery_receipt(packet_hash) {
+            if let Some(receipt_event) =
+                self.check_delivery_receipt_with(packet_hash, &mut cancel_sibling)
+            {
+                return receipt_event;
+            }
+        }
+
+        // Retire individual opportunistic-send attempts as their receipts
+        // time out. The raw NodeEvent still falls through for observability.
+        if let NodeEvent::ReceiptFailed { packet_hash } = &event {
+            if let Some(receipt_event) = self.handle_delivery_failure_terminal(packet_hash) {
                 return receipt_event;
             }
         }

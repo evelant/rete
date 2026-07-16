@@ -5,15 +5,19 @@ use alloc::vec::Vec;
 
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    DestType, Identity, LinkId, PacketBuilder, PacketType, PathHash, RequestId, MTU,
+    DestType, Identity, LinkId, MTU, PacketBuilder, PacketType, PathHash, RequestId,
     TRUNCATED_HASH_LEN,
 };
-use rete_transport::{IngestResult, PATH_REQUEST_DEST};
+use rete_transport::{
+    IngestResult, PATH_REQUEST_DEST, ReceiptSinkFull, ReceiptTerminalSink,
+};
 
 use crate::destination::DestinationType;
 use crate::{NodeEvent, ProofStrategy, RequestFailReason, ResourceStrategy};
 
-use super::{IngestOutcome, NodeCore, OutboundPacket, PacketRouting, SplitRecvEntry};
+use super::{
+    IngestOutcome, NodeCore, OutboundPacket, PacketRouting, ReceiptSinkTickOutcome, SplitRecvEntry,
+};
 
 impl<S: rete_transport::TransportStorage> NodeCore<S> {
     /// Process an inbound raw packet and return the outcome.
@@ -54,6 +58,54 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         }
     }
 
+    /// Process one radio-sized inbound packet with allocation-atomic receipt
+    /// terminal notifications.
+    ///
+    /// A PROOF targeting an outstanding DATA or channel receipt reserves a
+    /// terminal sink slot before transport ingestion and commits it after
+    /// validation. Other proof traffic does not consume application-terminal
+    /// capacity. When reservation fails, no transport or deduplication state is
+    /// changed; the caller must retain and retry that packet.
+    pub fn handle_ingest_with_receipt_sink<R, T>(
+        &mut self,
+        raw: &[u8],
+        now: u64,
+        iface: u8,
+        rng: &mut R,
+        sink: &mut T,
+    ) -> Result<IngestOutcome, ReceiptSinkFull>
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
+        let len = raw.len();
+        if len > MTU {
+            return Ok(IngestOutcome::empty());
+        }
+
+        if let Some(hooks) = &self.hooks {
+            hooks.log_packet(raw, "IN", iface);
+        }
+
+        let mut pkt_buf = [0u8; MTU];
+        pkt_buf[..len].copy_from_slice(raw);
+        let result = self
+            .transport
+            .ingest_on_with_receipt_sink(
+                &mut pkt_buf[..len],
+                now,
+                iface,
+                rng,
+                &self.identity,
+                sink,
+            )?;
+
+        match result {
+            IngestResult::ProofReceived { .. } => Ok(IngestOutcome::empty()),
+            result => Ok(self.dispatch_ingest_result(result, now, rng)),
+        }
+    }
+
     /// Dispatch a parsed packet buffer to the transport layer.
     fn dispatch_ingest<R: RngCore + CryptoRng>(
         &mut self,
@@ -62,10 +114,19 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         iface: u8,
         rng: &mut R,
     ) -> IngestOutcome {
-        match self
+        let result = self
             .transport
-            .ingest_on(pkt_buf, now, iface, rng, &self.identity)
-        {
+            .ingest_on(pkt_buf, now, iface, rng, &self.identity);
+        self.dispatch_ingest_result(result, now, rng)
+    }
+
+    fn dispatch_ingest_result<R: RngCore + CryptoRng>(
+        &mut self,
+        result: IngestResult<'_>,
+        now: u64,
+        rng: &mut R,
+    ) -> IngestOutcome {
+        match result {
             IngestResult::AnnounceReceived {
                 dest_hash,
                 identity_hash,
@@ -74,9 +135,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 ratchet,
             } => {
                 // Store ratchet public key from announcing peer
-                if let (Some(store), Some(ratchet_pub)) =
-                    (&mut self.ratchet_store, ratchet)
-                {
+                if let (Some(store), Some(ratchet_pub)) = (&mut self.ratchet_store, ratchet) {
                     store.store_peer_ratchet(&identity_hash, ratchet_pub);
                 }
 
@@ -272,7 +331,12 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 requested_at,
             } => {
                 let response_packets = self.dispatch_request_handler(
-                    &link_id, &request_id, &path_hash, &data, requested_at, rng,
+                    &link_id,
+                    &request_id,
+                    &path_hash,
+                    &data,
+                    requested_at,
+                    rng,
                 );
                 IngestOutcome {
                     events: vec![NodeEvent::RequestReceived {
@@ -290,8 +354,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 data,
             } => {
                 // Clear matching pending request
-                self.pending_requests
-                    .retain(|r| r.request_id != request_id);
+                self.pending_requests.retain(|r| r.request_id != request_id);
                 IngestOutcome {
                     events: vec![NodeEvent::ResponseReceived {
                         link_id,
@@ -353,18 +416,15 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 // interop with peers that send nil.
                 if is_response {
                     let matched = if let Some(rid) = request_id {
-                        self.pending_requests.iter_mut().find(|r| {
-                            r.link_id == link_id && r.request_id == rid
-                        })
+                        self.pending_requests
+                            .iter_mut()
+                            .find(|r| r.link_id == link_id && r.request_id == rid)
                     } else {
                         // FIFO fallback: first Sent request without a resource yet
                         self.pending_requests.iter_mut().find(|r| {
                             r.link_id == link_id
                                 && r.response_resource_hash.is_none()
-                                && matches!(
-                                    r.status,
-                                    super::request_receipt::RequestStatus::Sent
-                                )
+                                && matches!(r.status, super::request_receipt::RequestStatus::Sent)
                         })
                     };
                     if let Some(req) = matched {
@@ -382,7 +442,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 match effective {
                     ResourceStrategy::AcceptAll => {
                         if let Some(pkt) =
-                            self.transport.accept_resource(&link_id, &resource_hash, rng)
+                            self.transport
+                                .accept_resource(&link_id, &resource_hash, rng)
                         {
                             packets.push(OutboundPacket::broadcast(pkt));
                         }
@@ -392,7 +453,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     }
                     ResourceStrategy::AcceptNone => {
                         if let Some(pkt) =
-                            self.transport.reject_resource(&link_id, &resource_hash, rng)
+                            self.transport
+                                .reject_resource(&link_id, &resource_hash, rng)
                         {
                             packets.push(OutboundPacket::broadcast(pkt));
                         }
@@ -422,7 +484,15 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 // If all parts received, concat → decrypt → decompress → verify → proof
                 if current == total && total > 0 {
                     // Step 1: Concatenate encrypted parts, get flags and split metadata
-                    let (concat_result, is_compressed, is_response, is_request, split_index, split_total, original_hash) = {
+                    let (
+                        concat_result,
+                        is_compressed,
+                        is_response,
+                        is_request,
+                        split_index,
+                        split_total,
+                        original_hash,
+                    ) = {
                         if let Some(res) = self.transport.get_resource_mut(&link_id, &resource_hash)
                         {
                             let compressed = res.flags.compressed;
@@ -497,9 +567,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     };
 
                     // Step 4: Verify hash — stores plaintext in resource on success
-                    if let Some(res) =
-                        self.transport.get_resource_mut(&link_id, &resource_hash)
-                    {
+                    if let Some(res) = self.transport.get_resource_mut(&link_id, &resource_hash) {
                         if res.verify_hash(plaintext).is_err() {
                             resource_failed!(packets);
                         }
@@ -528,8 +596,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             .payload(&proof)
                             .build()
                         {
-                            packets
-                                .push(OutboundPacket::broadcast(pkt_buf[..pkt_len].to_vec()));
+                            packets.push(OutboundPacket::broadcast(pkt_buf[..pkt_len].to_vec()));
                         }
                     }
 
@@ -571,9 +638,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     } else if split_total > 1 && split_index == split_total {
                         // Final split segment: concatenate all buffered data
                         let mut full_data = Vec::new();
-                        if let Some(idx) = self.split_recv_buf.iter().position(|e| {
-                            e.link_id == link_id && e.original_hash == original_hash
-                        }) {
+                        if let Some(idx) = self
+                            .split_recv_buf
+                            .iter()
+                            .position(|e| e.link_id == link_id && e.original_hash == original_hash)
+                        {
                             let entry = self.split_recv_buf.swap_remove(idx);
                             full_data = entry.data;
                         }
@@ -591,7 +660,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     // Non-split resource: deliver directly
                     // If this is a response-as-resource, parse and emit ResponseReceived
                     if is_response {
-                        if let Ok((req_id, resp_data)) = rete_transport::parse_response(&plaintext) {
+                        if let Ok((req_id, resp_data)) = rete_transport::parse_response(&plaintext)
+                        {
                             self.pending_requests.retain(|r| r.request_id != req_id);
                             return IngestOutcome {
                                 events: vec![NodeEvent::ResponseReceived {
@@ -609,8 +679,14 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             rete_transport::parse_request(&plaintext)
                         {
                             let request_id = rete_transport::request_id(&plaintext);
-                            let mut handler_packets =
-                                self.dispatch_request_handler(&link_id, &request_id, &path_hash, &req_data, requested_at, rng);
+                            let mut handler_packets = self.dispatch_request_handler(
+                                &link_id,
+                                &request_id,
+                                &path_hash,
+                                &req_data,
+                                requested_at,
+                                rng,
+                            );
                             packets.append(&mut handler_packets);
                             return IngestOutcome {
                                 events: vec![NodeEvent::RequestReceived {
@@ -857,8 +933,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         response_packets
     }
 
-    /// Periodic maintenance: expire paths, collect pending announces, send keepalives.
-    pub fn handle_tick<R: RngCore + CryptoRng>(&mut self, now: u64, rng: &mut R) -> IngestOutcome {
+    fn prepare_tick<R: RngCore + CryptoRng>(
+        &mut self,
+        now: u64,
+        rng: &mut R,
+    ) -> Vec<OutboundPacket> {
         let mut packets = self.flush_announces(now, rng);
 
         // Resource maintenance: send HMU for sender resources with unsent hashes
@@ -883,11 +962,53 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             packets.push(OutboundPacket::broadcast(retx));
         }
 
+        packets
+    }
+
+    /// Periodic maintenance with allocation-atomic receipt failures.
+    ///
+    /// Receipt failure terminals are committed to `sink`; they are not also
+    /// duplicated as [`NodeEvent::ReceiptFailed`] values. If the sink is full,
+    /// affected receipts remain outstanding and
+    /// [`ReceiptSinkTickOutcome::receipt_notifications_deferred`] is set.
+    pub fn handle_tick_with_receipt_sink<R, T>(
+        &mut self,
+        now: u64,
+        rng: &mut R,
+        sink: &mut T,
+    ) -> ReceiptSinkTickOutcome
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
+        let packets = self.prepare_tick(now, rng);
+        let result = self.transport.tick_with_receipt_sink(now, sink);
+        let mut events = self.check_request_timeouts(now);
+        events.push(NodeEvent::Tick {
+            expired_paths: result.expired_paths,
+            closed_links: result.closed_links,
+        });
+
+        ReceiptSinkTickOutcome {
+            outcome: IngestOutcome { events, packets },
+            failed_receipts: result.failed_receipts,
+            receipt_notifications_deferred: result.receipt_notifications_deferred,
+        }
+    }
+
+    /// Periodic maintenance: expire paths, collect pending announces, send keepalives.
+    pub fn handle_tick<R: RngCore + CryptoRng>(&mut self, now: u64, rng: &mut R) -> IngestOutcome {
+        let packets = self.prepare_tick(now, rng);
+
         // Now run tick: expire paths, check stale links, etc.
         let result = self.transport.tick(now);
 
         // Check request timeouts
         let mut events = self.check_request_timeouts(now);
+
+        for packet_hash in result.failed_receipts {
+            events.push(NodeEvent::ReceiptFailed { packet_hash });
+        }
 
         events.push(NodeEvent::Tick {
             expired_paths: result.expired_paths,

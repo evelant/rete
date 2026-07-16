@@ -94,7 +94,7 @@ impl TicketCache {
     ) -> TicketEntry {
         let mut ticket = [0u8; STAMP_SIZE];
         rng.fill_bytes(&mut ticket);
-        let expires = now + TICKET_EXPIRY;
+        let expires = now.saturating_add(TICKET_EXPIRY);
         let entry = TicketEntry { ticket, expires };
         self.store_inbound(dest_hash, ticket, expires);
         entry

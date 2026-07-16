@@ -15,6 +15,34 @@ use crate::rete_event::ReteEvent;
 /// Maximum age of propagation messages before pruning. Matches Python RNS default (30 days).
 const PROPAGATION_TTL_SECS: u64 = 2_592_000;
 
+fn emit_outbound_events(events: &[LxmfEvent], mut emit: impl FnMut(ReteEvent)) {
+    for event in events {
+        let observable = match event {
+            LxmfEvent::MessageDelivered {
+                message_hash,
+                dest_hash,
+            } => Some(ReteEvent::LxmfDelivered {
+                msg_hash: hex::encode(&message_hash[..8]),
+                dest: hex::encode(dest_hash),
+            }),
+            LxmfEvent::MessageFailed {
+                message_hash,
+                dest_hash,
+            } => Some(ReteEvent::LxmfFailed {
+                msg_hash: hex::encode(&message_hash[..8]),
+                dest: hex::encode(dest_hash),
+            }),
+            _ => None,
+        };
+
+        if let Some(observable) = observable {
+            emit(observable);
+        } else {
+            tracing::warn!(?event, "unhandled outbound LXMF event");
+        }
+    }
+}
+
 pub fn on_event(
     event: NodeEvent,
     lxmf_router: &RefCell<LxmfRouter<AnyMessageStore>>,
@@ -57,7 +85,8 @@ pub fn on_event(
         }
 
         // Process outbound message queue
-        let (out_pkts, _out_events) = lxmf_router.borrow_mut().process_outbound(core, rng, now);
+        let (out_pkts, out_events) = lxmf_router.borrow_mut().process_outbound(core, rng, now);
+        emit_outbound_events(&out_events, ReteEvent::emit);
         if !out_pkts.is_empty() {
             return out_pkts;
         }
@@ -70,10 +99,12 @@ pub fn on_event(
         }
     }
 
-    // Use mutable handler — handles propagation deposit when enabled,
-    // falls through to immutable handler otherwise.
+    // Mutable dispatch is required for outbound receipt lifecycle as well as
+    // propagation deposits and other router-managed state.
     let now = rete_tokio::current_time_secs();
-    let lxmf_event = lxmf_router.borrow_mut().handle_event_mut(event, now);
+    let lxmf_event = lxmf_router
+        .borrow_mut()
+        .handle_event_mut_with_core(event, now, core);
     match lxmf_event {
         LxmfEvent::MessageReceived { message, .. } => {
             ReteEvent::LxmfReceived {
@@ -318,6 +349,11 @@ pub fn on_node_event(event: NodeEvent) {
                 packet_hash: hex::encode(packet_hash),
             }.emit();
         }
+        NodeEvent::ReceiptFailed { packet_hash } => {
+            ReteEvent::ReceiptFailed {
+                packet_hash: hex::encode(packet_hash),
+            }.emit();
+        }
         NodeEvent::LinkEstablished { link_id } => {
             ReteEvent::LinkEstablished {
                 link: hex::encode(link_id),
@@ -500,5 +536,56 @@ pub fn handle_lxmf_command(
             tracing::warn!(%name, "unknown app command");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use rete_core::{DestHash, Identity};
+
+    #[test]
+    fn outbound_failure_is_mapped_to_observable_daemon_event() {
+        let identity = Identity::from_seed(b"daemon-outbound-failure").unwrap();
+        let mut core = HostedNodeCore::new(identity, "testapp", &["aspect"]).unwrap();
+        let mut router = LxmfRouter::<AnyMessageStore>::register_with_store(&mut core);
+        let destination = DestHash::from([0x22; 16]);
+        let message = LXMessage::new(
+            destination,
+            *router.delivery_dest_hash(),
+            core.identity(),
+            b"",
+            b"will fail",
+            BTreeMap::new(),
+            1_000.0,
+        )
+        .unwrap();
+        let mut rng = rand::thread_rng();
+        let message_hash = router.handle_outbound(message, 1_000, &mut rng);
+
+        let mut terminal_events = Vec::new();
+        for step in 0..16 {
+            let (_, events) =
+                router.process_outbound(&mut core, &mut rng, 1_000 + step * 100);
+            if !events.is_empty() {
+                terminal_events = events;
+                break;
+            }
+        }
+        assert_eq!(terminal_events.len(), 1);
+        assert!(matches!(terminal_events[0], LxmfEvent::MessageFailed { .. }));
+
+        let mut observable = Vec::new();
+        emit_outbound_events(&terminal_events, |event| observable.push(event.test_line()));
+        assert_eq!(
+            observable,
+            vec![format!(
+                "LXMF_FAILED:{}:{}",
+                hex::encode(&message_hash[..8]),
+                hex::encode(destination)
+            )]
+        );
     }
 }

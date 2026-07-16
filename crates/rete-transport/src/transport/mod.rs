@@ -7,6 +7,8 @@ mod receipt;
 mod resource;
 pub use resource::ResourceOptions;
 
+use alloc::vec::Vec;
+
 /// Relay debug logging — only available when the `relay-debug` feature is enabled.
 macro_rules! relay_log {
     ($($arg:tt)*) => {
@@ -29,13 +31,16 @@ pub(self) fn hex_short(h: &[u8]) -> alloc::string::String {
 use crate::dedup::DedupWindow;
 use crate::link::{compute_link_id, is_valid_link_request_payload_len};
 use crate::path::Path;
-use crate::receipt::ReceiptTable;
+use crate::receipt::{
+    ReceiptSinkFull, ReceiptTable, ReceiptTerminal, ReceiptTerminalReservation,
+    ReceiptTerminalSink,
+};
 use crate::resource::Resource;
 use crate::storage::{StorageMap, TransportStorage};
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketType,
-    CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, TRUNCATED_HASH_LEN,
+    CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, DestHash, DestType, HeaderType, Identity,
+    IdentityHash, LinkId, Packet, PacketType, TRUNCATED_HASH_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +121,13 @@ pub enum SendError {
     LinkNotActive,
     /// Channel send window is full (back-pressure).
     WindowFull,
+    /// The bounded DATA receipt table has no free entry.
+    ReceiptTableFull,
+    /// Another outstanding receipt already uses this packet's truncated hash.
+    ReceiptHashAlreadyTracked,
+    /// A compatibility API could not reserve owned packet output before
+    /// mutating protocol state.
+    OutputAllocationFailed,
     /// Cryptographic operation failed (encrypt, sign, ECDH).
     Crypto(rete_core::Error),
     /// Packet building failed (buffer too small, invalid fields).
@@ -133,6 +145,13 @@ impl core::fmt::Display for SendError {
             SendError::LinkNotFound => write!(f, "link not found"),
             SendError::LinkNotActive => write!(f, "link not active"),
             SendError::WindowFull => write!(f, "channel window full"),
+            SendError::ReceiptTableFull => write!(f, "packet receipt table full"),
+            SendError::ReceiptHashAlreadyTracked => {
+                write!(f, "packet receipt hash already tracked")
+            }
+            SendError::OutputAllocationFailed => {
+                write!(f, "could not reserve outbound packet storage")
+            }
             SendError::Crypto(e) => write!(f, "crypto error: {e}"),
             SendError::PacketBuild(e) => write!(f, "packet build error: {e}"),
             SendError::ResourceLimit => write!(f, "resource table full"),
@@ -215,6 +234,7 @@ pub enum LinkTableKind {
 
 /// Result of processing an inbound packet via [`Transport::ingest`].
 #[derive(Debug)]
+#[must_use = "ingest results can contain forwarding actions or terminal receipt notifications"]
 pub enum IngestResult<'a> {
     /// Data packet addressed to one of our destinations.
     LocalData {
@@ -291,6 +311,9 @@ pub enum IngestResult<'a> {
         link_id: LinkId,
     },
     /// A proof was received for a packet we sent.
+    ///
+    /// The corresponding receipt has already been reclaimed when this result
+    /// is returned.
     ProofReceived {
         /// The full 32-byte packet hash the proof covers.
         packet_hash: [u8; 32],
@@ -389,11 +412,31 @@ pub enum IngestResult<'a> {
 // ---------------------------------------------------------------------------
 
 /// Result of periodic transport maintenance via [`Transport::tick`].
+#[must_use = "timed-out receipt hashes must be observed by the application"]
 pub struct TickResult {
     /// Number of paths that were expired and removed.
     pub expired_paths: usize,
     /// Number of links that were closed due to staleness.
     pub closed_links: usize,
+    /// Full hashes of receipts that newly timed out during this tick.
+    pub failed_receipts: Vec<[u8; 32]>,
+}
+
+/// Allocation-free result of periodic transport maintenance.
+///
+/// Receipt failures are committed to the caller's reserved sink before their
+/// receipt-table entries are removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "timed-out receipt notifications may have been deferred"]
+pub struct TickSummary {
+    /// Number of paths that were expired and removed.
+    pub expired_paths: usize,
+    /// Number of links that were closed due to staleness.
+    pub closed_links: usize,
+    /// Number of receipt-failure notifications committed to the sink.
+    pub failed_receipts: usize,
+    /// At least one expired receipt remains because the sink was full.
+    pub receipt_notifications_deferred: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +652,84 @@ impl<S: TransportStorage> Transport<S> {
         self.ingest_on(raw, now, 0, rng, identity)
     }
 
+    fn proof_has_terminal_candidate(&self, raw: &[u8]) -> bool {
+        let Ok(packet) = Packet::parse(raw) else {
+            return false;
+        };
+        if packet.packet_type != PacketType::Proof {
+            return false;
+        }
+
+        let raw_destination: [u8; TRUNCATED_HASH_LEN] =
+            packet.destination_hash.try_into().unwrap();
+        let link_id = LinkId::from(raw_destination);
+
+        // These locally handled proof contexts terminate link or resource
+        // state, not application-visible DATA/channel receipts.
+        if packet.dest_type == DestType::Link
+            && self.links.contains_key(&link_id)
+            && matches!(packet.context, CONTEXT_LRPROOF | CONTEXT_RESOURCE_PRF)
+        {
+            return false;
+        }
+
+        if self.receipts.get(&raw_destination).is_some() {
+            return true;
+        }
+
+        if packet.payload.len() >= 96 {
+            let receipt_key: [u8; TRUNCATED_HASH_LEN] = packet.payload
+                [..TRUNCATED_HASH_LEN]
+                .try_into()
+                .unwrap();
+            return self.channel_receipts.contains_key(&receipt_key);
+        }
+
+        false
+    }
+
+    /// Process an inbound packet while committing DATA/channel receipt proofs
+    /// to a caller-reserved terminal sink.
+    ///
+    /// A sink slot is reserved only when a PROOF addresses a currently
+    /// outstanding DATA or channel receipt. Reservation happens before normal
+    /// ingestion changes statistics, deduplication, or receipt state. Link,
+    /// resource, relayed, and unrelated proofs therefore continue to flow even
+    /// when the application terminal sink is full. On [`ReceiptSinkFull`], the
+    /// caller must retain and retry the candidate proof packet.
+    pub fn ingest_on_with_receipt_sink<'a, R, T>(
+        &mut self,
+        raw: &'a mut [u8],
+        now: u64,
+        iface: u8,
+        rng: &mut R,
+        identity: &Identity,
+        sink: &mut T,
+    ) -> Result<IngestResult<'a>, ReceiptSinkFull>
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
+        let reservation = if self.proof_has_terminal_candidate(raw) {
+            Some(sink.try_reserve()?)
+        } else {
+            None
+        };
+        let result = self.ingest_on(raw, now, iface, rng, identity);
+
+        match (&result, reservation) {
+            (IngestResult::ProofReceived { packet_hash }, Some(reservation)) => {
+                reservation.commit(ReceiptTerminal::Delivered(*packet_hash));
+            }
+            (IngestResult::ProofReceived { .. }, None) => {
+                debug_assert!(false, "receipt proof bypassed terminal sink preflight");
+            }
+            (_, _) => {}
+        }
+
+        Ok(result)
+    }
+
     /// Process an inbound raw packet received on interface `iface`.
     ///
     /// Parses the packet, checks for duplicates, and dispatches by type:
@@ -662,7 +783,9 @@ impl<S: TransportStorage> Transport<S> {
         // permanently flagged, causing remote link endpoints to time out.
         let is_foreign_link_transit = pkt.dest_type == DestType::Link
             && self.local_identity_hash.is_some()
-            && !self.links.contains_key(&LinkId::from_slice(pkt.destination_hash));
+            && !self
+                .links
+                .contains_key(&LinkId::from_slice(pkt.destination_hash));
         if !is_foreign_link_transit && self.is_duplicate(&pkt_hash) {
             relay_log!(
                 "[relay] DEDUP pkt_hash={} type={:?} dest_type={:?}",
@@ -1201,8 +1324,7 @@ impl<S: TransportStorage> Transport<S> {
     // Periodic maintenance
     // -----------------------------------------------------------------------
 
-    /// Expire old paths, reverse entries, and stale links.
-    pub fn tick(&mut self, now: u64) -> TickResult {
+    fn tick_non_receipts(&mut self, now: u64) -> (usize, usize) {
         // Lazy-init started_at on first tick
         if self.stats.started_at == 0 {
             self.stats.started_at = now;
@@ -1210,11 +1332,13 @@ impl<S: TransportStorage> Transport<S> {
 
         // Expire old paths
         let prev_paths = self.paths.len();
-        self.paths.retain(|_, path| now.saturating_sub(path.learned_at) <= path.expiry_time());
+        self.paths
+            .retain(|_, path| now.saturating_sub(path.learned_at) <= path.expiry_time());
         let expired_count = prev_paths - self.paths.len();
 
         // Expire old reverse table entries
-        self.reverse_table.retain(|_, entry| now.saturating_sub(entry.timestamp) <= REVERSE_TIMEOUT);
+        self.reverse_table
+            .retain(|_, entry| now.saturating_sub(entry.timestamp) <= REVERSE_TIMEOUT);
 
         // Expire old link table entries (stale relayed links)
         self.link_table.retain(|_, entry| {
@@ -1226,18 +1350,52 @@ impl<S: TransportStorage> Transport<S> {
         self.links.retain(|_, link| !link.check_stale(now));
         let closed_count = prev_links - self.links.len();
 
-        // Expire timed-out receipts
-        self.receipts.tick(now);
-
         // Expire stale channel receipts
-        self.channel_receipts.retain(|_, cr| now.saturating_sub(cr.sent_at) <= RECEIPT_TIMEOUT);
+        self.channel_receipts
+            .retain(|_, cr| now.saturating_sub(cr.sent_at) <= RECEIPT_TIMEOUT);
 
         self.stats.paths_expired += expired_count as u64;
         self.stats.links_closed += closed_count as u64;
 
+        (expired_count, closed_count)
+    }
+
+    /// Expire old paths, reverse entries, stale links, and receipts into a
+    /// caller-reserved terminal sink.
+    ///
+    /// A receipt remains tracked when the sink cannot reserve its notification
+    /// slot. The caller can drain the sink and retry a later tick without
+    /// losing the terminal delivery state.
+    pub fn tick_with_receipt_sink<T: ReceiptTerminalSink>(
+        &mut self,
+        now: u64,
+        sink: &mut T,
+    ) -> TickSummary {
+        let receipts = self.receipts.tick_into(now, sink);
+        let (expired_paths, closed_links) = self.tick_non_receipts(now);
+
+        TickSummary {
+            expired_paths,
+            closed_links,
+            failed_receipts: receipts.emitted,
+            receipt_notifications_deferred: receipts.deferred,
+        }
+    }
+
+    /// Expire old paths, reverse entries, stale links, and receipts.
+    ///
+    /// Timed-out receipts are removed atomically and reported in
+    /// [`TickResult::failed_receipts`]; callers should consume those hashes as
+    /// delivery-failure notifications. The output vector reserves enough
+    /// capacity before any receipt entry is removed.
+    pub fn tick(&mut self, now: u64) -> TickResult {
+        let failed_receipts = self.receipts.tick(now);
+        let (expired_paths, closed_links) = self.tick_non_receipts(now);
+
         TickResult {
-            expired_paths: expired_count,
-            closed_links: closed_count,
+            expired_paths,
+            closed_links,
+            failed_receipts,
         }
     }
 }
@@ -1249,11 +1407,11 @@ impl<S: TransportStorage> Transport<S> {
 mod tests {
     use super::*;
     use crate::announce::PendingAnnounce;
-    use crate::link::{compute_link_id, Link};
+    use crate::link::{Link, compute_link_id};
     use crate::path::Path;
     use rete_core::{
-        DestType, HeaderType, Identity, PacketBuilder, PacketType, CONTEXT_CHANNEL,
-        CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
+        CONTEXT_CHANNEL, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, DestType, HeaderType, Identity,
+        PacketBuilder, PacketType, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
     };
 
     type TestTransport = Transport<crate::HeaplessStorage<64, 16, 128, 4>>;
@@ -1372,6 +1530,29 @@ mod tests {
     }
 
     #[test]
+    fn validated_data_proof_reclaims_receipt_for_direct_transport_caller() {
+        let mut transport = TestTransport::new();
+        let peer = Identity::from_seed(b"direct-transport-receipt-peer").unwrap();
+        let packet_hash = [0x5au8; 32];
+        transport
+            .register_receipt(packet_hash, peer.public_key(), 100, RECEIPT_TIMEOUT)
+            .unwrap();
+        assert_eq!(transport.receipt_count(), 1);
+
+        let mut proof = TestTransport::build_proof_packet(&peer, &packet_hash)
+            .expect("proof packet should build");
+        let mut rng = rand::thread_rng();
+        let result = transport.ingest(&mut proof, 101, &mut rng, &peer);
+
+        assert!(matches!(
+            result,
+            IngestResult::ProofReceived { packet_hash: hash } if hash == packet_hash
+        ));
+        assert_eq!(transport.receipt_count(), 0);
+        assert_eq!(transport.receipt_status(&packet_hash), None);
+    }
+
+    #[test]
     fn test_link_proof_vs_single_proof_differ() {
         // Link proof and single proof for the same packet_hash should differ
         // in dest_type and destination_hash
@@ -1425,10 +1606,7 @@ mod tests {
     }
 
     /// Helper: set up a transport relay with a learned path for the destination.
-    fn make_relay_transport(
-        relay_hash: IdentityHash,
-        dest_hash: DestHash,
-    ) -> TestTransport {
+    fn make_relay_transport(relay_hash: IdentityHash, dest_hash: DestHash) -> TestTransport {
         let mut t = TestTransport::new();
         t.set_local_identity(relay_hash);
         t.insert_path(dest_hash, Path::direct(0));
@@ -1479,7 +1657,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         assert_eq!(transport.link_table.len(), 1);
 
@@ -1516,7 +1694,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         // Step 2: Build a PROOF packet (HEADER_1, dest_type=Link, dest_hash=link_id)
         // This simulates the LRPROOF coming back from the responder.
@@ -1580,7 +1758,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         assert_eq!(transport.link_table.get(&link_id).unwrap().timestamp, 100);
 
@@ -1595,7 +1773,7 @@ mod tests {
             .build()
             .unwrap();
 
-        transport.ingest_on(&mut data_buf[..data_len], 500, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut data_buf[..data_len], 500, 0, &mut rng, &identity);
 
         assert_eq!(
             transport.link_table.get(&link_id).unwrap().timestamp,
@@ -1616,16 +1794,16 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let _link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         assert_eq!(transport.link_table.len(), 1);
 
         // tick() before stale timeout — entry should remain
-        transport.tick(100 + crate::link::STALE_TIMEOUT_SECS);
+        let _ = transport.tick(100 + crate::link::STALE_TIMEOUT_SECS);
         assert_eq!(transport.link_table.len(), 1, "should not expire yet");
 
         // tick() after stale timeout — entry should be removed
-        transport.tick(100 + crate::link::STALE_TIMEOUT_SECS + 1);
+        let _ = transport.tick(100 + crate::link::STALE_TIMEOUT_SECS + 1);
         assert_eq!(
             transport.link_table.len(),
             0,
@@ -1646,7 +1824,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         // Forward 5 DATA packets — all should succeed
         for i in 0u8..5 {
@@ -1700,7 +1878,7 @@ mod tests {
         assert_eq!(buf[1], 0, "initial hops should be 0");
 
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         // After processing, the relay incremented hops (0 -> 1).
         // The stored inbound_hops must be the POST-increment value (1),
@@ -1729,7 +1907,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         let entry = transport.link_table.get(&link_id).expect("entry exists");
         let expected_inbound = entry.inbound_hops;
@@ -1793,7 +1971,7 @@ mod tests {
         let lr_payload = [0xBBu8; 64];
         let (mut buf, n) = build_h2_linkrequest(&relay_hash, &dest_hash, &lr_payload);
         let link_id = compute_link_id(&buf[..n]).unwrap();
-        transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
+        let _ = transport.ingest_on(&mut buf[..n], 100, 0, &mut rng, &identity);
 
         let entry = transport.link_table.get(&link_id).expect("entry exists");
 
@@ -1818,9 +1996,7 @@ mod tests {
 
     /// Helper: create a transport with one active link via the handshake flow.
     /// Returns (transport, link_id, responder_identity).
-    fn make_transport_with_active_link(
-        now: u64,
-    ) -> (TestTransport, LinkId, Identity) {
+    fn make_transport_with_active_link(now: u64) -> (TestTransport, LinkId, Identity) {
         let mut transport = TestTransport::new();
         let mut rng = rand_core::OsRng;
 
@@ -1955,8 +2131,8 @@ mod tests {
 
     #[test]
     fn test_transport_stats_announce_ingest() {
-        use rand::rngs::StdRng;
         use rand::SeedableRng;
+        use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(42);
 
@@ -2034,8 +2210,8 @@ mod tests {
 
     #[test]
     fn test_create_announce_with_ratchet() {
-        use rand::rngs::StdRng;
         use rand::SeedableRng;
+        use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(99);
         let sender = Identity::from_seed(b"ratchet-announce-sender").unwrap();
@@ -2056,24 +2232,24 @@ mod tests {
 
         // Parse and verify context_flag is set
         let pkt = rete_core::Packet::parse(&buf[..n]).expect("should parse");
-        assert!(pkt.context_flag, "context_flag should be set for ratchet announce");
+        assert!(
+            pkt.context_flag,
+            "context_flag should be set for ratchet announce"
+        );
         assert_eq!(pkt.packet_type, rete_core::PacketType::Announce);
 
         // Validate the announce and check ratchet is extracted
-        let info = crate::announce::validate_announce(
-            pkt.destination_hash,
-            pkt.payload,
-            pkt.context_flag,
-        )
-        .expect("should validate");
+        let info =
+            crate::announce::validate_announce(pkt.destination_hash, pkt.payload, pkt.context_flag)
+                .expect("should validate");
         assert!(info.ratchet.is_some(), "ratchet should be present");
         assert_eq!(info.ratchet.unwrap(), &ratchet_pub[..]);
     }
 
     #[test]
     fn test_announce_without_ratchet_has_none() {
-        use rand::rngs::StdRng;
         use rand::SeedableRng;
+        use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(100);
         let sender = Identity::from_seed(b"no-ratchet-sender").unwrap();
@@ -2094,19 +2270,16 @@ mod tests {
         let pkt = rete_core::Packet::parse(&buf[..n]).expect("should parse");
         assert!(!pkt.context_flag, "context_flag should NOT be set");
 
-        let info = crate::announce::validate_announce(
-            pkt.destination_hash,
-            pkt.payload,
-            pkt.context_flag,
-        )
-        .expect("should validate");
+        let info =
+            crate::announce::validate_announce(pkt.destination_hash, pkt.payload, pkt.context_flag)
+                .expect("should validate");
         assert!(info.ratchet.is_none(), "ratchet should be None");
     }
 
     #[test]
     fn test_ingest_ratchet_announce_returns_ratchet() {
-        use rand::rngs::StdRng;
         use rand::SeedableRng;
+        use rand::rngs::StdRng;
 
         let mut rng = StdRng::seed_from_u64(101);
         let sender = Identity::from_seed(b"ratchet-ingest-sender").unwrap();
@@ -2131,7 +2304,11 @@ mod tests {
 
         match result {
             IngestResult::AnnounceReceived { ratchet, .. } => {
-                assert_eq!(ratchet, Some(ratchet_pub), "ratchet should be passed through");
+                assert_eq!(
+                    ratchet,
+                    Some(ratchet_pub),
+                    "ratchet should be passed through"
+                );
             }
             other => panic!("expected AnnounceReceived, got {:?}", other),
         }

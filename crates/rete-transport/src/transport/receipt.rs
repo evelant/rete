@@ -2,6 +2,8 @@
 
 use rete_core::{DestType, Identity, LinkId, PacketBuilder, PacketType, TRUNCATED_HASH_LEN};
 
+use crate::{ReceiptRegistrationError, ReceiptStatus};
+
 use super::Transport;
 
 impl<S: crate::storage::TransportStorage> Transport<S> {
@@ -12,14 +14,35 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         dest_pub_key: [u8; 64],
         now: u64,
         timeout: u64,
-    ) -> bool {
+    ) -> Result<(), ReceiptRegistrationError> {
         self.receipts
             .register(packet_hash, dest_pub_key, now, timeout)
+    }
+
+    /// Whether the receipt table cannot admit another packet.
+    pub fn receipt_table_is_full(&self) -> bool {
+        self.receipts.is_full()
     }
 
     /// Number of tracked receipts.
     pub fn receipt_count(&self) -> usize {
         self.receipts.len()
+    }
+
+    /// Current status for an outstanding receipt with this full packet hash.
+    /// Delivered and timed-out receipts are reclaimed atomically and return
+    /// `None`; their terminal outcome is reported by `IngestResult` or
+    /// `TickResult`, respectively.
+    pub fn receipt_status(&self, packet_hash: &[u8; 32]) -> Option<ReceiptStatus> {
+        self.receipts.status(packet_hash)
+    }
+
+    /// Cancel an outstanding receipt using its complete packet hash.
+    ///
+    /// This is used when a higher-level transaction has multiple in-flight
+    /// attempts and one sibling proof makes the remaining attempts obsolete.
+    pub fn cancel_receipt(&mut self, packet_hash: &[u8; 32]) -> bool {
+        self.receipts.remove_full(packet_hash)
     }
 
     // -----------------------------------------------------------------------
@@ -33,7 +56,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         identity: &Identity,
         packet_hash: &[u8; 32],
         dest_type: DestType,
-        destination_hash: &[u8; TRUNCATED_HASH_LEN],  // truncated packet hash, NOT DestHash
+        destination_hash: &[u8; TRUNCATED_HASH_LEN], // truncated packet hash, NOT DestHash
     ) -> Option<alloc::vec::Vec<u8>> {
         let signature = identity.sign(packet_hash).ok()?;
         let mut payload = [0u8; 96];

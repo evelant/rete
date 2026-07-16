@@ -19,15 +19,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use rand_core::{CryptoRng, RngCore};
-use rete_core::{DestHash, DestType, IdentityHash, Identity, LinkId, Packet, PacketBuilder, PacketType, PathHash, RequestId, MTU, TRUNCATED_HASH_LEN};
-use rete_transport::{SendError, Transport, RECEIPT_TIMEOUT};
+use rete_core::{
+    DestHash, DestType, Identity, IdentityHash, LinkId, MTU, Packet, PacketBuilder, PacketType,
+    PathHash, RequestId, TRUNCATED_HASH_LEN,
+};
+use rete_transport::{RECEIPT_TIMEOUT, ReceiptRegistrationError, SendError, Transport};
 
 use alloc::boxed::Box;
 
 use crate::destination::{Destination, DestinationType, Direction};
 use crate::{NodeEvent, ProofStrategy, ResourceStrategy};
 
-pub use hooks::{handler_fn, NodeHooks, RequestCallback};
+pub use hooks::{NodeHooks, RequestCallback, handler_fn};
 pub use ratchet::{InMemoryRatchetStore, RatchetStore};
 
 /// Metadata passed to request handlers about the incoming request.
@@ -152,6 +155,41 @@ impl OutboundPacket {
     }
 }
 
+/// Stable correlation token for an outbound DATA delivery receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReceiptToken {
+    packet_hash: [u8; 32],
+}
+
+impl ReceiptToken {
+    /// The complete packet hash covered by a delivery proof.
+    pub const fn packet_hash(&self) -> &[u8; 32] {
+        &self.packet_hash
+    }
+}
+
+/// Encrypted DATA bytes and the receipt token registered for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedDataPacket {
+    /// Complete Reticulum packet bytes.
+    pub data: Vec<u8>,
+    /// Token used to correlate proof delivery or timeout failure.
+    pub receipt: ReceiptToken,
+}
+
+/// Caller-owned encrypted DATA bytes and their registered receipt token.
+///
+/// The packet borrows a buffer reserved by the caller before protocol state is
+/// touched. Embedded callers can therefore move the packet into a previously
+/// reserved outbox without any fallible allocation after receipt commit.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreparedDataPacketRef<'a> {
+    /// Complete Reticulum packet bytes in caller-owned storage.
+    pub data: &'a [u8],
+    /// Token used to correlate proof delivery or timeout failure.
+    pub receipt: ReceiptToken,
+}
+
 // ---------------------------------------------------------------------------
 // IngestOutcome
 // ---------------------------------------------------------------------------
@@ -163,6 +201,19 @@ pub struct IngestOutcome {
     pub events: Vec<NodeEvent>,
     /// Packets to send out.
     pub packets: Vec<OutboundPacket>,
+}
+
+/// Result of periodic maintenance when receipt terminals are written to a
+/// caller-reserved sink.
+#[derive(Debug)]
+#[must_use = "receipt failure notifications may have been deferred"]
+pub struct ReceiptSinkTickOutcome {
+    /// Ordinary node events and outbound packets produced by the tick.
+    pub outcome: IngestOutcome,
+    /// Number of receipt-failure terminals committed to the sink.
+    pub failed_receipts: usize,
+    /// At least one expired receipt remains because the sink was full.
+    pub receipt_notifications_deferred: bool,
 }
 
 impl IngestOutcome {
@@ -426,21 +477,35 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.primary_dest.set_default_app_data(data);
     }
 
-    /// Build an encrypted DATA packet addressed to a known destination.
+    /// Prepare encrypted DATA into caller-owned storage and transactionally
+    /// register its delivery receipt.
     ///
-    /// Also registers a receipt for proof tracking. The `now` timestamp is
-    /// used for receipt timeout calculation.
-    pub fn build_data_packet<R: RngCore + CryptoRng>(
+    /// The output buffer must be at least [`MTU`] bytes and is rejected before
+    /// identity lookup, entropy use, receipt registration or path mutation.
+    /// A full bounded receipt table is likewise rejected before encryption.
+    /// Once this returns, the packet and receipt are committed together. The
+    /// method performs no packet-output allocation; with a bounded transport
+    /// backend such as [`rete_transport::HeaplessStorage`], the entire path is
+    /// allocation-free. Growable hosted storage may allocate while registering
+    /// the receipt.
+    pub fn prepare_data_packet_into<'packet, R: RngCore + CryptoRng>(
         &mut self,
         dest_hash: &DestHash,
         plaintext: &[u8],
         rng: &mut R,
         now: u64,
-    ) -> Result<Vec<u8>, SendError> {
+        output: &'packet mut [u8],
+    ) -> Result<PreparedDataPacketRef<'packet>, SendError> {
+        if output.len() < MTU {
+            return Err(SendError::PacketBuild(rete_core::Error::BufferTooSmall));
+        }
         let pub_key = *self
             .transport
             .recall_identity(dest_hash)
             .ok_or(SendError::UnknownDestination)?;
+        if self.transport.receipt_table_is_full() {
+            return Err(SendError::ReceiptTableFull);
+        }
         let recipient = Identity::from_public_key(&pub_key).map_err(SendError::Crypto)?;
         let mut ct_buf = [0u8; MTU];
         let ct_len = if let Some(ratchet_pub) = self
@@ -457,9 +522,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 .map_err(SendError::Crypto)?
         };
         let via = self.transport.get_path(dest_hash).and_then(|p| p.via);
-        self.transport.touch_path(dest_hash, now);
-        let mut pkt_buf = [0u8; MTU];
-        let pkt_len = PacketBuilder::new(&mut pkt_buf)
+        let pkt_len = PacketBuilder::new(&mut output[..MTU])
             .packet_type(PacketType::Data)
             .dest_type(DestType::Single)
             .destination_hash(dest_hash.as_ref())
@@ -469,14 +532,61 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             .build()
             .map_err(SendError::PacketBuild)?;
 
-        // Register receipt for proof tracking
-        if let Ok(parsed) = Packet::parse(&pkt_buf[..pkt_len]) {
-            let pkt_hash = parsed.compute_hash();
-            self.transport
-                .register_receipt(pkt_hash, pub_key, now, RECEIPT_TIMEOUT);
-        }
+        let parsed = Packet::parse(&output[..pkt_len]).map_err(SendError::PacketBuild)?;
+        let packet_hash = parsed.compute_hash();
+        self.transport
+            .register_receipt(packet_hash, pub_key, now, RECEIPT_TIMEOUT)
+            .map_err(|error| match error {
+                ReceiptRegistrationError::TableFull => SendError::ReceiptTableFull,
+                ReceiptRegistrationError::HashAlreadyTracked => {
+                    SendError::ReceiptHashAlreadyTracked
+                }
+            })?;
+        self.transport.touch_path(dest_hash, now);
 
-        Ok(pkt_buf[..pkt_len].to_vec())
+        Ok(PreparedDataPacketRef {
+            data: &output[..pkt_len],
+            receipt: ReceiptToken { packet_hash },
+        })
+    }
+
+    /// Prepare encrypted DATA and transactionally register its delivery receipt.
+    ///
+    /// This owned compatibility API reserves the complete packet allocation
+    /// before invoking [`Self::prepare_data_packet_into`]. New embedded callers
+    /// should reserve an outbox slot and use the caller-owned API directly.
+    pub fn prepare_data_packet<R: RngCore + CryptoRng>(
+        &mut self,
+        dest_hash: &DestHash,
+        plaintext: &[u8],
+        rng: &mut R,
+        now: u64,
+    ) -> Result<PreparedDataPacket, SendError> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(MTU)
+            .map_err(|_| SendError::OutputAllocationFailed)?;
+        data.resize(MTU, 0);
+        let prepared = self.prepare_data_packet_into(dest_hash, plaintext, rng, now, &mut data)?;
+        let packet_len = prepared.data.len();
+        let receipt = prepared.receipt;
+        data.truncate(packet_len);
+        Ok(PreparedDataPacket { data, receipt })
+    }
+
+    /// Build encrypted DATA addressed to a known destination.
+    ///
+    /// This compatibility wrapper retains the original byte-vector result.
+    /// New stateful callers should use [`Self::prepare_data_packet`] so they
+    /// keep the receipt token needed for delivery-status correlation.
+    pub fn build_data_packet<R: RngCore + CryptoRng>(
+        &mut self,
+        dest_hash: &DestHash,
+        plaintext: &[u8],
+        rng: &mut R,
+        now: u64,
+    ) -> Result<Vec<u8>, SendError> {
+        self.prepare_data_packet(dest_hash, plaintext, rng, now)
+            .map(|prepared| prepared.data)
     }
 
     /// Build a path request packet for a destination.
@@ -489,11 +599,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
     ///
     /// Uses `dest_type=Single` — for non-link (DATA) proofs only.
     pub(super) fn proof_outbound(&self, packet_hash: &[u8; 32]) -> Option<OutboundPacket> {
-        Transport::<S>::build_proof_packet(&self.identity, packet_hash).map(|data| {
-            OutboundPacket {
-                data,
-                routing: PacketRouting::SourceInterface,
-            }
+        Transport::<S>::build_proof_packet(&self.identity, packet_hash).map(|data| OutboundPacket {
+            data,
+            routing: PacketRouting::SourceInterface,
         })
     }
 
@@ -506,12 +614,12 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         packet_hash: &[u8; 32],
         link_id: &LinkId,
     ) -> Option<OutboundPacket> {
-        Transport::<S>::build_link_proof_packet(&self.identity, packet_hash, link_id).map(
-            |data| OutboundPacket {
+        Transport::<S>::build_link_proof_packet(&self.identity, packet_hash, link_id).map(|data| {
+            OutboundPacket {
                 data,
                 routing: PacketRouting::SourceInterface,
-            },
-        )
+            }
+        })
     }
 
     /// Send plain data over an established link.
@@ -578,8 +686,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let (pkt, resource_hash) = self
             .transport
             .prepare_and_advertise_segment(
-                link_id, packed, packed,
-                rete_transport::ResourceOptions { is_request: true, ..Default::default() },
+                link_id,
+                packed,
+                packed,
+                rete_transport::ResourceOptions {
+                    is_request: true,
+                    ..Default::default()
+                },
                 rng,
             )
             .ok_or(SendError::ResourceLimit)?;
@@ -679,7 +792,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let (pkt, _resource_hash) = self
             .transport
             .prepare_and_advertise_segment(
-                link_id, &packed, &packed,
+                link_id,
+                &packed,
+                &packed,
                 rete_transport::ResourceOptions {
                     is_response: true,
                     request_id: Some(*request_id),
@@ -792,11 +907,39 @@ mod tests {
     use rete_core::{HeaderType, Packet, PacketType, TRANSPORT_TYPE_TRANSPORT};
 
     type TestNodeCore = NodeCore<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
+    type SmallReceiptNodeCore = NodeCore<rete_transport::HeaplessStorage<4, 4, 8, 2>>;
 
     fn make_core(seed: &[u8]) -> TestNodeCore {
         let identity = Identity::from_seed(seed).unwrap();
         TestNodeCore::new(identity, "testapp", &["aspect1"]).unwrap()
     }
+
+    fn make_small_receipt_core(seed: &[u8]) -> SmallReceiptNodeCore {
+        let identity = Identity::from_seed(seed).unwrap();
+        SmallReceiptNodeCore::new(identity, "testapp", &["aspect1"]).unwrap()
+    }
+
+    struct PanicRng;
+
+    impl RngCore for PanicRng {
+        fn next_u32(&mut self) -> u32 {
+            panic!("receipt-capacity rejection consumed entropy")
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            panic!("receipt-capacity rejection consumed entropy")
+        }
+
+        fn fill_bytes(&mut self, _dest: &mut [u8]) {
+            panic!("receipt-capacity rejection consumed entropy")
+        }
+
+        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            panic!("receipt-capacity rejection consumed entropy")
+        }
+    }
+
+    impl CryptoRng for PanicRng {}
 
     #[test]
     fn node_core_new_oversized_name_returns_error() {
@@ -833,7 +976,9 @@ mod tests {
 
         // Register receiver's identity with sender
         let receiver_id = Identity::from_seed(b"receiver-node").unwrap();
-        sender.register_peer(&receiver_id, "testapp", &["aspect1"], 100).unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         let pkt = sender
             .build_data_packet(receiver.dest_hash(), b"hello", &mut rng, 100)
@@ -849,6 +994,122 @@ mod tests {
             .decrypt(parsed.payload, &mut dec_buf)
             .unwrap();
         assert_eq!(&dec_buf[..n], b"hello");
+    }
+
+    #[test]
+    fn prepared_data_returns_registered_receipt_token() {
+        let mut sender = make_core(b"prepared-token-sender");
+        let receiver = make_core(b"prepared-token-receiver");
+        let mut rng = rand::thread_rng();
+        let receiver_id = Identity::from_seed(b"prepared-token-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+
+        let prepared = sender
+            .prepare_data_packet(receiver.dest_hash(), b"hello", &mut rng, 101)
+            .unwrap();
+        let packet_hash = Packet::parse(&prepared.data).unwrap().compute_hash();
+
+        assert_eq!(prepared.receipt.packet_hash(), &packet_hash);
+        assert_eq!(
+            sender.transport.receipt_status(&packet_hash),
+            Some(rete_transport::ReceiptStatus::Sent)
+        );
+        assert_eq!(sender.transport.receipt_count(), 1);
+    }
+
+    #[test]
+    fn caller_owned_data_preparation_registers_receipt_without_owned_packet() {
+        let mut sender = make_core(b"prepared-into-sender");
+        let receiver = make_core(b"prepared-into-receiver");
+        let mut rng = rand::thread_rng();
+        let receiver_id = Identity::from_seed(b"prepared-into-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+
+        let mut output = [0u8; MTU];
+        let prepared = sender
+            .prepare_data_packet_into(
+                receiver.dest_hash(),
+                b"caller-owned",
+                &mut rng,
+                101,
+                &mut output,
+            )
+            .unwrap();
+        let parsed = Packet::parse(prepared.data).unwrap();
+        let packet_hash = parsed.compute_hash();
+
+        assert_eq!(parsed.packet_type, PacketType::Data);
+        assert_eq!(prepared.receipt.packet_hash(), &packet_hash);
+        assert_eq!(
+            sender.transport.receipt_status(&packet_hash),
+            Some(rete_transport::ReceiptStatus::Sent)
+        );
+        assert_eq!(sender.transport.receipt_count(), 1);
+    }
+
+    #[test]
+    fn caller_owned_output_capacity_rejects_before_entropy_or_state() {
+        let mut sender = make_core(b"prepared-into-short-sender");
+        let receiver = make_core(b"prepared-into-short-receiver");
+        let receiver_id = Identity::from_seed(b"prepared-into-short-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let last_accessed = sender
+            .transport
+            .get_path(receiver.dest_hash())
+            .unwrap()
+            .last_accessed;
+        let mut output = [0u8; MTU - 1];
+
+        assert_eq!(
+            sender.prepare_data_packet_into(
+                receiver.dest_hash(),
+                b"must reject",
+                &mut PanicRng,
+                999,
+                &mut output,
+            ),
+            Err(SendError::PacketBuild(rete_core::Error::BufferTooSmall))
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
+        assert_eq!(
+            sender
+                .transport
+                .get_path(receiver.dest_hash())
+                .unwrap()
+                .last_accessed,
+            last_accessed
+        );
+    }
+
+    #[test]
+    fn caller_owned_oversized_buffer_cannot_expand_protocol_mtu() {
+        let mut sender = make_core(b"prepared-into-large-buffer-sender");
+        let receiver = make_core(b"prepared-into-large-buffer-receiver");
+        let receiver_id = Identity::from_seed(b"prepared-into-large-buffer-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+        let mut output = [0u8; MTU + 32];
+        let plaintext = [0x55; 400];
+
+        assert_eq!(
+            sender.prepare_data_packet_into(
+                receiver.dest_hash(),
+                &plaintext,
+                &mut rng,
+                101,
+                &mut output,
+            ),
+            Err(SendError::PacketBuild(rete_core::Error::BufferTooSmall))
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
     }
 
     #[test]
@@ -1023,7 +1284,8 @@ mod tests {
         let expanded = rete_core::expand_name("testapp", &["aspect1"], &mut name_buf).unwrap();
         let peer_dest = rete_core::destination_hash(expanded, Some(&peer.hash()));
 
-        core.register_peer(&peer, "testapp", &["aspect1"], 100).unwrap();
+        core.register_peer(&peer, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // Should be able to build data packet to registered peer
         let pkt = core.build_data_packet(&peer_dest, b"hello peer", &mut rng, 100);
@@ -1045,7 +1307,8 @@ mod tests {
         // Initiator — register responder's identity so proof can be verified
         let mut init = make_core(b"init-core");
         let resp_id = Identity::from_seed(b"resp-core").unwrap();
-        init.register_peer(&resp_id, "testapp", &["aspect1"], 100).unwrap();
+        init.register_peer(&resp_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // Initiator sends LINKREQUEST
         let (outbound, link_id) = init
@@ -1055,7 +1318,10 @@ mod tests {
         // Responder ingests LINKREQUEST → emits LinkEstablished + proof
         let resp_outcome = resp.handle_ingest(&outbound.data, 100, 0, &mut rng);
         assert!(
-            matches!(resp_outcome.events.first(), Some(NodeEvent::LinkEstablished { .. })),
+            matches!(
+                resp_outcome.events.first(),
+                Some(NodeEvent::LinkEstablished { .. })
+            ),
             "responder should emit LinkEstablished"
         );
         assert!(
@@ -1067,7 +1333,10 @@ mod tests {
         // Initiator ingests LRPROOF → emits LinkEstablished + auto-sends LRRTT
         let init_outcome = init.handle_ingest(&proof_pkt.data, 101, 0, &mut rng);
         assert!(
-            matches!(init_outcome.events.first(), Some(NodeEvent::LinkEstablished { .. })),
+            matches!(
+                init_outcome.events.first(),
+                Some(NodeEvent::LinkEstablished { .. })
+            ),
             "initiator should emit LinkEstablished"
         );
 
@@ -1085,7 +1354,10 @@ mod tests {
         // Responder ingests LRRTT → activates
         let resp_outcome2 = resp.handle_ingest(&lrrtt_pkt.data, 102, 0, &mut rng);
         assert!(
-            matches!(resp_outcome2.events.first(), Some(NodeEvent::LinkEstablished { .. })),
+            matches!(
+                resp_outcome2.events.first(),
+                Some(NodeEvent::LinkEstablished { .. })
+            ),
             "responder should emit LinkEstablished on LRRTT"
         );
 
@@ -1103,7 +1375,8 @@ mod tests {
         let mut resp = make_core(b"lrrtt-resp");
         let mut init = make_core(b"lrrtt-init");
         let resp_id = Identity::from_seed(b"lrrtt-resp").unwrap();
-        init.register_peer(&resp_id, "testapp", &["aspect1"], 100).unwrap();
+        init.register_peer(&resp_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         let (outbound, _link_id) = init
             .initiate_link(*resp.dest_hash(), 100, &mut rng)
@@ -1306,7 +1579,9 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let receiver_id = Identity::from_seed(b"receipt-receiver").unwrap();
-        sender.register_peer(&receiver_id, "testapp", &["aspect1"], 100).unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         assert_eq!(sender.transport.receipt_count(), 0);
         let _pkt = sender
@@ -1324,7 +1599,9 @@ mod tests {
 
         // Register each other
         let receiver_id = Identity::from_seed(b"proof-fire-receiver").unwrap();
-        sender.register_peer(&receiver_id, "testapp", &["aspect1"], 100).unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // Sender builds data → receipt auto-registered
         let pkt = sender
@@ -1347,10 +1624,143 @@ mod tests {
         // Sender ingests proof → should fire ProofReceived
         let outcome = sender.handle_ingest(&proof_pkt.data, 101, 0, &mut rng);
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::ProofReceived { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::ProofReceived { .. })
+            ),
             "expected ProofReceived, got {:?}",
             outcome.events
         );
+        assert_eq!(sender.transport.receipt_count(), 0);
+    }
+
+    #[test]
+    fn full_terminal_sink_rejects_proof_before_receipt_or_dedup_mutation() {
+        let mut sender = make_core(b"proof-sink-sender");
+        let mut receiver = make_core(b"proof-sink-receiver");
+        receiver.set_proof_strategy(ProofStrategy::ProveAll);
+        let receiver_id = Identity::from_seed(b"proof-sink-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+
+        let prepared = sender
+            .prepare_data_packet(receiver.dest_hash(), b"prove atomically", &mut rng, 100)
+            .unwrap();
+        let receiver_outcome = receiver.handle_ingest(&prepared.data, 100, 0, &mut rng);
+        let proof = receiver_outcome
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .map(|packet| packet.packet_type == PacketType::Proof)
+                    .unwrap_or(false)
+            })
+            .expect("receiver should produce a proof");
+
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::default();
+        assert!(matches!(
+            sender.handle_ingest_with_receipt_sink(
+                &proof.data,
+                101,
+                0,
+                &mut rng,
+                &mut full_sink,
+            ),
+            Err(rete_transport::ReceiptSinkFull)
+        ));
+        assert_eq!(sender.transport.receipt_count(), 1);
+
+        let mut available_sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+        let outcome = sender
+            .handle_ingest_with_receipt_sink(
+                &proof.data,
+                101,
+                0,
+                &mut rng,
+                &mut available_sink,
+            )
+            .unwrap();
+        assert!(outcome.events.is_empty());
+        assert!(outcome.packets.is_empty());
+        assert_eq!(
+            available_sink.as_slice(),
+            &[rete_transport::ReceiptTerminal::Delivered(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
+    }
+
+    #[test]
+    fn full_terminal_sink_does_not_block_unrelated_proof() {
+        let mut core = make_core(b"unrelated-proof-core");
+        let proof_identity = Identity::from_seed(b"unrelated-proof-identity").unwrap();
+        let proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_proof_packet(&proof_identity, &[0x55; 32])
+        .unwrap();
+        let mut rng = rand::thread_rng();
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::default();
+
+        let outcome = core
+            .handle_ingest_with_receipt_sink(&proof, 100, 0, &mut rng, &mut full_sink)
+            .expect("unrelated proof must not require an application terminal slot");
+        assert!(outcome.events.is_empty());
+        assert_eq!(outcome.packets.len(), 1);
+        assert!(full_sink.is_empty());
+    }
+
+    #[test]
+    fn invalid_candidate_proof_releases_reservation_and_valid_retry_emits_once() {
+        let mut sender = make_core(b"invalid-proof-sender");
+        let mut receiver = make_core(b"invalid-proof-receiver");
+        receiver.set_proof_strategy(ProofStrategy::ProveAll);
+        let receiver_id = Identity::from_seed(b"invalid-proof-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+
+        let prepared = sender
+            .prepare_data_packet(receiver.dest_hash(), b"validate proof", &mut rng, 100)
+            .unwrap();
+        let receiver_outcome = receiver.handle_ingest(&prepared.data, 100, 0, &mut rng);
+        let proof = receiver_outcome
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .map(|packet| packet.packet_type == PacketType::Proof)
+                    .unwrap_or(false)
+            })
+            .expect("receiver should produce a proof");
+        let mut invalid_proof = proof.data.clone();
+        *invalid_proof.last_mut().unwrap() ^= 0xff;
+        let mut sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+
+        sender
+            .handle_ingest_with_receipt_sink(&invalid_proof, 101, 0, &mut rng, &mut sink)
+            .unwrap();
+        assert!(sink.is_empty());
+        assert_eq!(sender.transport.receipt_count(), 1);
+
+        sender
+            .handle_ingest_with_receipt_sink(&proof.data, 102, 0, &mut rng, &mut sink)
+            .unwrap();
+        assert_eq!(
+            sink.as_slice(),
+            &[rete_transport::ReceiptTerminal::Delivered(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
+
+        sender
+            .handle_ingest_with_receipt_sink(&proof.data, 103, 0, &mut rng, &mut sink)
+            .expect("duplicate proof no longer targets an outstanding receipt");
+        assert_eq!(sink.len(), 1);
     }
 
     #[test]
@@ -1360,7 +1770,9 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let receiver_id = Identity::from_seed(b"receipt-expire-recv").unwrap();
-        sender.register_peer(&receiver_id, "testapp", &["aspect1"], 100).unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         let _pkt = sender
             .build_data_packet(receiver.dest_hash(), b"hello", &mut rng, 100)
@@ -1371,10 +1783,139 @@ mod tests {
         sender.handle_tick(120, &mut rng);
         assert_eq!(sender.transport.receipt_count(), 1);
 
-        // Tick after timeout (30s) — receipt should be failed
-        sender.handle_tick(131, &mut rng);
-        // Receipt is still in the table but marked Failed
+        // Tick after timeout (30s) — failure is emitted and reclaimed.
+        let outcome = sender.handle_tick(131, &mut rng);
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, NodeEvent::ReceiptFailed { .. }))
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
+    }
+
+    #[test]
+    fn full_terminal_sink_defers_node_receipt_timeout_until_retry() {
+        let mut sender = make_core(b"timeout-sink-sender");
+        let receiver = make_core(b"timeout-sink-receiver");
+        let receiver_id = Identity::from_seed(b"timeout-sink-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+        let prepared = sender
+            .prepare_data_packet(receiver.dest_hash(), b"timeout atomically", &mut rng, 100)
+            .unwrap();
+
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::default();
+        let deferred = sender.handle_tick_with_receipt_sink(131, &mut rng, &mut full_sink);
+        assert_eq!(deferred.failed_receipts, 0);
+        assert!(deferred.receipt_notifications_deferred);
         assert_eq!(sender.transport.receipt_count(), 1);
+
+        let mut available_sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+        let completed =
+            sender.handle_tick_with_receipt_sink(132, &mut rng, &mut available_sink);
+        assert_eq!(completed.failed_receipts, 1);
+        assert!(!completed.receipt_notifications_deferred);
+        assert_eq!(
+            available_sink.as_slice(),
+            &[rete_transport::ReceiptTerminal::Failed(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert_eq!(sender.transport.receipt_count(), 0);
+    }
+
+    #[test]
+    fn proof_and_timeout_cycles_reuse_receipts_beyond_capacity() {
+        const CYCLES: usize = 12;
+        let mut sender = make_small_receipt_core(b"receipt-cycle-sender");
+        let mut receiver = make_small_receipt_core(b"receipt-cycle-receiver");
+        receiver.set_proof_strategy(ProofStrategy::ProveAll);
+        let receiver_id = Identity::from_seed(b"receipt-cycle-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+
+        for cycle in 0..CYCLES {
+            let now = 100 + cycle as u64;
+            let prepared = sender
+                .prepare_data_packet(receiver.dest_hash(), &[cycle as u8], &mut rng, now)
+                .unwrap();
+            let receiver_outcome = receiver.handle_ingest(&prepared.data, now, 0, &mut rng);
+            let proof = receiver_outcome
+                .packets
+                .iter()
+                .find(|packet| {
+                    Packet::parse(&packet.data)
+                        .map(|packet| packet.packet_type == PacketType::Proof)
+                        .unwrap_or(false)
+                })
+                .expect("receiver should prove each DATA packet");
+            let sender_outcome = sender.handle_ingest(&proof.data, now + 1, 0, &mut rng);
+            assert!(sender_outcome.events.iter().any(|event| {
+                matches!(event, NodeEvent::ProofReceived { packet_hash }
+                    if packet_hash == prepared.receipt.packet_hash())
+            }));
+            assert_eq!(sender.transport.receipt_count(), 0);
+        }
+
+        for cycle in 0..CYCLES {
+            let now = 1_000 + cycle as u64 * 100;
+            let prepared = sender
+                .prepare_data_packet(receiver.dest_hash(), &[cycle as u8], &mut rng, now)
+                .unwrap();
+            let outcome = sender.handle_tick(now + RECEIPT_TIMEOUT + 1, &mut rng);
+            assert!(outcome.events.iter().any(|event| {
+                matches!(event, NodeEvent::ReceiptFailed { packet_hash }
+                    if packet_hash == prepared.receipt.packet_hash())
+            }));
+            assert_eq!(sender.transport.receipt_count(), 0);
+        }
+    }
+
+    #[test]
+    fn full_receipt_table_rejects_before_entropy_or_path_touch() {
+        let mut sender = make_small_receipt_core(b"receipt-full-sender");
+        let receiver = make_small_receipt_core(b"receipt-full-receiver");
+        let receiver_id = Identity::from_seed(b"receipt-full-receiver").unwrap();
+        sender
+            .register_peer(&receiver_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut rng = rand::thread_rng();
+
+        for index in 0..4u64 {
+            sender
+                .prepare_data_packet(receiver.dest_hash(), &[index as u8], &mut rng, 101 + index)
+                .unwrap();
+        }
+        assert_eq!(sender.transport.receipt_count(), 4);
+        let last_accessed = sender
+            .transport
+            .get_path(receiver.dest_hash())
+            .unwrap()
+            .last_accessed;
+
+        let unknown = DestHash::from([0xfe; TRUNCATED_HASH_LEN]);
+        assert_eq!(
+            sender.prepare_data_packet(&unknown, b"unknown", &mut PanicRng, 998),
+            Err(SendError::UnknownDestination)
+        );
+
+        let result =
+            sender.prepare_data_packet(receiver.dest_hash(), b"must reject", &mut PanicRng, 999);
+        assert_eq!(result, Err(SendError::ReceiptTableFull));
+        assert_eq!(sender.transport.receipt_count(), 4);
+        assert_eq!(
+            sender
+                .transport
+                .get_path(receiver.dest_hash())
+                .unwrap()
+                .last_accessed,
+            last_accessed
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1389,7 +1930,10 @@ mod tests {
         let parsed = Packet::parse(&outbound.data).unwrap();
         assert_eq!(parsed.packet_type, PacketType::Data);
         assert_eq!(parsed.dest_type, rete_core::DestType::Plain);
-        assert_eq!(parsed.destination_hash, rete_transport::PATH_REQUEST_DEST.as_ref());
+        assert_eq!(
+            parsed.destination_hash,
+            rete_transport::PATH_REQUEST_DEST.as_ref()
+        );
         assert_eq!(parsed.payload, dest.as_ref());
     }
 
@@ -1465,7 +2009,10 @@ mod tests {
         // Responder ingests — should generate a proof in the packets
         let outcome = resp.handle_ingest(&outbound.data, 200, 0, &mut rng);
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::ChannelMessages { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::ChannelMessages { .. })
+            ),
             "expected ChannelMessages, got {:?}",
             outcome.events
         );
@@ -1521,7 +2068,10 @@ mod tests {
         // Initiator ingests the proof → should fire ProofReceived + mark_delivered
         let init_outcome = init.handle_ingest(&proof_pkt.data, 201, 0, &mut rng);
         assert!(
-            matches!(init_outcome.events.first(), Some(NodeEvent::ProofReceived { .. })),
+            matches!(
+                init_outcome.events.first(),
+                Some(NodeEvent::ProofReceived { .. })
+            ),
             "expected ProofReceived, got {:?}",
             init_outcome.events
         );
@@ -1532,6 +2082,69 @@ mod tests {
             init_link.channel().unwrap().pending_count(),
             0,
             "proof should clear pending channel message"
+        );
+    }
+
+    #[test]
+    fn channel_proof_waits_for_reserved_terminal_slot() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let outbound = init
+            .send_channel_message(&link_id, 0x42, b"bounded ack", 200, &mut rng)
+            .unwrap();
+        let packet_hash = Packet::parse(&outbound.data).unwrap().compute_hash();
+        let response = resp.handle_ingest(&outbound.data, 200, 0, &mut rng);
+        let proof = response
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .map(|packet| packet.packet_type == PacketType::Proof)
+                    .unwrap_or(false)
+            })
+            .expect("channel receiver should produce proof");
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::new();
+
+        assert!(matches!(
+            init.handle_ingest_with_receipt_sink(
+                &proof.data,
+                201,
+                0,
+                &mut rng,
+                &mut full_sink,
+            ),
+            Err(rete_transport::ReceiptSinkFull)
+        ));
+        assert_eq!(init.transport.channel_receipt_count(), 1);
+        assert_eq!(
+            init.transport
+                .get_link(&link_id)
+                .unwrap()
+                .channel()
+                .unwrap()
+                .pending_count(),
+            1
+        );
+
+        let mut sink = rete_transport::FixedReceiptTerminalSink::<1>::new();
+        let outcome = init
+            .handle_ingest_with_receipt_sink(&proof.data, 202, 0, &mut rng, &mut sink)
+            .unwrap();
+        assert!(outcome.events.is_empty());
+        assert!(outcome.packets.is_empty());
+        assert_eq!(
+            sink.as_slice(),
+            &[rete_transport::ReceiptTerminal::Delivered(packet_hash)]
+        );
+        assert_eq!(init.transport.channel_receipt_count(), 0);
+        assert_eq!(
+            init.transport
+                .get_link(&link_id)
+                .unwrap()
+                .channel()
+                .unwrap()
+                .pending_count(),
+            0
         );
     }
 
@@ -1838,7 +2451,9 @@ mod tests {
         // Step 3: A knows C's identity (register_peer)
         // -----------------------------------------------------------------
         let id_c = Identity::from_seed(b"relay-node-c").unwrap();
-        node_a.register_peer(&id_c, "testapp", &["aspect1"], 100).unwrap();
+        node_a
+            .register_peer(&id_c, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // Override A's direct path to C with a path via B's identity hash.
         // This causes initiate_link to build a HEADER_2 LINKREQUEST with
@@ -1855,7 +2470,9 @@ mod tests {
         // This lets B forward the LINKREQUEST and strip the HEADER_2
         // transport header (converting back to HEADER_1 for C).
         // -----------------------------------------------------------------
-        node_b.register_peer(&id_c, "testapp", &["aspect1"], 100).unwrap();
+        node_b
+            .register_peer(&id_c, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // -----------------------------------------------------------------
         // Step 5: Link handshake: A → B → C → B → A
@@ -1896,7 +2513,10 @@ mod tests {
         // C is the local destination, so it accepts the link and produces LRPROOF.
         let c_outcome = node_c.handle_ingest(forwarded_lr, 101, 1, &mut rng);
         assert!(
-            matches!(c_outcome.events.first(), Some(NodeEvent::LinkEstablished { .. })),
+            matches!(
+                c_outcome.events.first(),
+                Some(NodeEvent::LinkEstablished { .. })
+            ),
             "C should emit LinkEstablished on receiving LINKREQUEST"
         );
         assert!(!c_outcome.packets.is_empty(), "C should produce LRPROOF");
@@ -1955,7 +2575,10 @@ mod tests {
         // 5g. Feed LRRTT to C → C emits LinkEstablished (link activated).
         let c_rtt_outcome = node_c.handle_ingest(forwarded_rtt, 105, 1, &mut rng);
         assert!(
-            matches!(c_rtt_outcome.events.first(), Some(NodeEvent::LinkEstablished { .. })),
+            matches!(
+                c_rtt_outcome.events.first(),
+                Some(NodeEvent::LinkEstablished { .. })
+            ),
             "C should emit LinkEstablished on receiving LRRTT (link activated)"
         );
 
@@ -2068,7 +2691,9 @@ mod tests {
         // C knows A's identity and has a path via B
         let id_a = Identity::from_seed(b"rev-relay-a").unwrap();
         let id_b = Identity::from_seed(b"rev-relay-b").unwrap();
-        node_c.register_peer(&id_a, "testapp", &["aspect1"], 100).unwrap();
+        node_c
+            .register_peer(&id_a, "testapp", &["aspect1"], 100)
+            .unwrap();
         let a_dest = *node_a.dest_hash();
         node_c.transport.insert_path(
             a_dest,
@@ -2076,7 +2701,9 @@ mod tests {
         );
 
         // B knows A's identity (for LINKREQUEST forwarding)
-        node_b.register_peer(&id_a, "testapp", &["aspect1"], 100).unwrap();
+        node_b
+            .register_peer(&id_a, "testapp", &["aspect1"], 100)
+            .unwrap();
 
         // --- Handshake: C → B → A → B → C ---
 
@@ -2208,13 +2835,14 @@ mod tests {
         let mut core = make_core(b"plain-pass-test");
         let mut rng = rand::thread_rng();
 
-        let plain_hash = core.register_destination_typed(
-            "plainapp",
-            &["test"],
-            DestinationType::Plain,
-            Direction::In,
-        )
-        .unwrap();
+        let plain_hash = core
+            .register_destination_typed(
+                "plainapp",
+                &["test"],
+                DestinationType::Plain,
+                Direction::In,
+            )
+            .unwrap();
 
         let raw_payload = b"unencrypted broadcast data";
         let mut pkt_buf = [0u8; MTU];
@@ -2242,13 +2870,14 @@ mod tests {
         let mut core = make_core(b"group-dec-test");
         let mut rng = rand::thread_rng();
 
-        let group_hash = core.register_destination_typed(
-            "groupapp",
-            &["test"],
-            DestinationType::Group,
-            Direction::In,
-        )
-        .unwrap();
+        let group_hash = core
+            .register_destination_typed(
+                "groupapp",
+                &["test"],
+                DestinationType::Group,
+                Direction::In,
+            )
+            .unwrap();
         core.get_destination_mut(&group_hash)
             .unwrap()
             .create_group_keys(&mut rng)
@@ -2289,13 +2918,14 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         // Register Group destination but do NOT set up group keys
-        let group_hash = core.register_destination_typed(
-            "groupapp",
-            &["nokeys"],
-            DestinationType::Group,
-            Direction::In,
-        )
-        .unwrap();
+        let group_hash = core
+            .register_destination_typed(
+                "groupapp",
+                &["nokeys"],
+                DestinationType::Group,
+                Direction::In,
+            )
+            .unwrap();
 
         let garbage = [0xAB; 128];
         let mut pkt_buf = [0u8; MTU];
@@ -2343,7 +2973,10 @@ mod tests {
         // Responder ingests LINKIDENTIFY
         let outcome = resp.handle_ingest(&identify_pkt.data, 200, 0, &mut rng);
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::LinkIdentified { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::LinkIdentified { .. })
+            ),
             "responder should emit LinkIdentified"
         );
 
@@ -2391,7 +3024,10 @@ mod tests {
         // Responder ingests → should auto-dispatch and produce response
         let outcome = resp.handle_ingest(&req_pkt.data, 201, 0, &mut rng);
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::RequestReceived { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::RequestReceived { .. })
+            ),
             "responder should emit RequestReceived"
         );
         assert!(
@@ -2447,7 +3083,10 @@ mod tests {
         let mut init_outcome = init.handle_ingest(&resp_pkt.data, 202, 0, &mut rng);
         match init_outcome.event() {
             Some(NodeEvent::ResponseReceived { data, .. }) => {
-                assert_eq!(data, b"primary", "should dispatch to primary dest's handler, not extra");
+                assert_eq!(
+                    data, b"primary",
+                    "should dispatch to primary dest's handler, not extra"
+                );
             }
             other => panic!("expected ResponseReceived, got {:?}", other),
         }
@@ -2478,7 +3117,10 @@ mod tests {
         // Responder ingests → no auto-response (handler is on wrong dest)
         let outcome = resp.handle_ingest(&req_pkt.data, 201, 0, &mut rng);
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::RequestReceived { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::RequestReceived { .. })
+            ),
             "event should still be emitted"
         );
         assert!(
@@ -2592,10 +3234,7 @@ mod tests {
 
         // Verify the identity hash matches
         let resp_link = resp.transport.get_link(&link_id).unwrap();
-        assert_eq!(
-            resp_link.identified_identity_hash(),
-            Some(&expected_hash),
-        );
+        assert_eq!(resp_link.identified_identity_hash(), Some(&expected_hash),);
     }
 
     // -----------------------------------------------------------------------
@@ -2740,10 +3379,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: initiator sends a resource advertisement, returns the raw adv packet.
-    fn send_resource_adv(
-        init: &mut TestNodeCore,
-        link_id: &LinkId,
-    ) -> Vec<u8> {
+    fn send_resource_adv(init: &mut TestNodeCore, link_id: &LinkId) -> Vec<u8> {
         let mut rng = rand::thread_rng();
         let adv = init
             .start_resource(link_id, b"test-resource-data", &mut rng)
@@ -2764,7 +3400,10 @@ mod tests {
 
         // Should emit ResourceOffered event
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::ResourceOffered { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::ResourceOffered { .. })
+            ),
             "should emit ResourceOffered, got {:?}",
             outcome.events
         );
@@ -2786,7 +3425,10 @@ mod tests {
 
         // Should still emit ResourceOffered so app knows about the offer
         assert!(
-            matches!(outcome.events.first(), Some(NodeEvent::ResourceOffered { .. })),
+            matches!(
+                outcome.events.first(),
+                Some(NodeEvent::ResourceOffered { .. })
+            ),
             "AcceptNone should still emit ResourceOffered, got {:?}",
             outcome.events
         );
@@ -2948,7 +3590,13 @@ mod tests {
         // Tick before deadline — no timeout
         let outcome = init.handle_tick(100 + timeout - 1, &mut rng);
         assert!(
-            !outcome.events.iter().any(|e| matches!(e, NodeEvent::RequestFailed { reason: crate::RequestFailReason::Timeout, .. })),
+            !outcome.events.iter().any(|e| matches!(
+                e,
+                NodeEvent::RequestFailed {
+                    reason: crate::RequestFailReason::Timeout,
+                    ..
+                }
+            )),
             "should not time out before deadline"
         );
         assert_eq!(init.pending_requests.len(), 1);
@@ -2959,7 +3607,10 @@ mod tests {
             outcome.events.iter().any(|e| matches!(e, NodeEvent::RequestFailed { request_id, reason: crate::RequestFailReason::Timeout, .. } if *request_id == req_id)),
             "should emit RequestFailed with Timeout reason"
         );
-        assert!(init.pending_requests.is_empty(), "should remove timed-out request");
+        assert!(
+            init.pending_requests.is_empty(),
+            "should remove timed-out request"
+        );
     }
 
     #[test]
@@ -3085,7 +3736,11 @@ mod tests {
             .unwrap();
         let outcome = resp.handle_ingest(&req_pkt.data, 201, 0, &mut rng);
         // Should produce exactly 1 response packet (single-packet response)
-        assert_eq!(outcome.packets.len(), 1, "small response should be a single packet");
+        assert_eq!(
+            outcome.packets.len(),
+            1,
+            "small response should be a single packet"
+        );
     }
 
     #[test]
@@ -3120,7 +3775,10 @@ mod tests {
         // Feeding the response back to the initiator should produce a ResourceOffered event.
         let init_outcome = init.handle_ingest(&outcome.packets[0].data, 202, 0, &mut rng);
         assert!(
-            init_outcome.events.iter().any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
+            init_outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
             "initiator should receive ResourceOffered for large response, got {:?}",
             init_outcome.events
         );
@@ -3139,7 +3797,10 @@ mod tests {
             .send_request(&link_id, "/test", b"tiny", 200, &mut rng)
             .unwrap();
         // Small request should be a single packet
-        assert!(pkt.data.len() <= 500, "small request should fit in one packet");
+        assert!(
+            pkt.data.len() <= 500,
+            "small request should fit in one packet"
+        );
     }
 
     #[test]
@@ -3159,7 +3820,10 @@ mod tests {
         // Feed the resource advertisement to the responder → should auto-accept
         let resp_outcome = resp.handle_ingest(&pkt.data, 201, 0, &mut rng);
         assert!(
-            resp_outcome.events.iter().any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
+            resp_outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
             "responder should receive ResourceOffered for large request, got {:?}",
             resp_outcome.events
         );
@@ -3200,27 +3864,47 @@ mod tests {
         // Responder handles both requests — each produces a resource advertisement
         let resp_out1 = resp.handle_ingest(&req1.data, 202, 0, &mut rng);
         let resp_out2 = resp.handle_ingest(&req2.data, 203, 0, &mut rng);
-        assert!(!resp_out1.packets.is_empty(), "resp1 should produce packets");
-        assert!(!resp_out2.packets.is_empty(), "resp2 should produce packets");
+        assert!(
+            !resp_out1.packets.is_empty(),
+            "resp1 should produce packets"
+        );
+        assert!(
+            !resp_out2.packets.is_empty(),
+            "resp2 should produce packets"
+        );
 
         // Feed response-resource advertisements back to initiator.
         // With request_id correlation via "q" field, each should associate
         // with the correct PendingRequest regardless of order.
         let init_out1 = init.handle_ingest(&resp_out1.packets[0].data, 204, 0, &mut rng);
         assert!(
-            init_out1.events.iter().any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
+            init_out1
+                .events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
             "first response should be ResourceOffered"
         );
 
         let init_out2 = init.handle_ingest(&resp_out2.packets[0].data, 205, 0, &mut rng);
         assert!(
-            init_out2.events.iter().any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
+            init_out2
+                .events
+                .iter()
+                .any(|e| matches!(e, NodeEvent::ResourceOffered { .. })),
             "second response should be ResourceOffered"
         );
 
         // Both pending requests should now have response_resource_hash set
-        let pr1 = init.pending_requests.iter().find(|r| r.request_id == id1).unwrap();
-        let pr2 = init.pending_requests.iter().find(|r| r.request_id == id2).unwrap();
+        let pr1 = init
+            .pending_requests
+            .iter()
+            .find(|r| r.request_id == id1)
+            .unwrap();
+        let pr2 = init
+            .pending_requests
+            .iter()
+            .find(|r| r.request_id == id2)
+            .unwrap();
         assert!(
             pr1.response_resource_hash.is_some(),
             "request 1 should have response resource associated"

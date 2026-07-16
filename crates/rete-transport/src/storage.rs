@@ -32,6 +32,12 @@ pub trait StorageMap<K, V>: Default {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Returns `true` if a new key cannot be inserted without removing one.
+    ///
+    /// Growable maps return `false`. Bounded maps must report their actual
+    /// capacity so stateful operations can reject before consuming entropy or
+    /// mutating related state.
+    fn is_full(&self) -> bool;
     fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a K, &'a V)>
     where
         K: 'a,
@@ -170,6 +176,9 @@ where
     fn len(&self) -> usize {
         FnvIndexMap::len(self)
     }
+    fn is_full(&self) -> bool {
+        self.len() == N
+    }
     fn iter<'a>(&'a self) -> impl Iterator<Item = (&'a K, &'a V)>
     where
         K: 'a,
@@ -228,4 +237,3 @@ impl<V, const N: usize> StorageDeque<V> for heapless::Deque<V, N> {
         heapless::Deque::clear(self)
     }
 }
-

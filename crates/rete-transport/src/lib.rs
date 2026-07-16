@@ -41,7 +41,11 @@ pub use link::{
     TeardownReason, LINK_MDU, LINK_MTU_SIZE,
 };
 pub use path::{InterfaceMode, Path, PATH_EXPIRES_AP, PATH_EXPIRES_ROAMING};
-pub use receipt::{PacketReceipt, ReceiptStatus, ReceiptTable};
+pub use receipt::{
+    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, PacketReceipt,
+    ReceiptRegistrationError, ReceiptSinkFull, ReceiptStatus, ReceiptTable, ReceiptTerminal,
+    ReceiptTerminalReservation, ReceiptTerminalSink, ReceiptTickSummary,
+};
 pub use request::{
     build_request, build_response, parse_request, parse_response, path_hash, request_id,
     RequestError, PATH_HASH_LEN, REQUEST_ID_LEN,
@@ -58,7 +62,8 @@ pub use storage::{
 pub use storage_std::StdStorage;
 pub use transport::{
     AnnounceRateEntry, IngestResult, LinkTableKind, ResourceOptions, ReverseEntry, SendError,
-    TickResult, Transport, TransportStats, PATH_REQUEST_DEST, RECEIPT_TIMEOUT, REVERSE_TIMEOUT,
+    TickResult, TickSummary, Transport, TransportStats, PATH_REQUEST_DEST, RECEIPT_TIMEOUT,
+    REVERSE_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
