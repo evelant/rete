@@ -909,6 +909,42 @@ mod tests {
     type TestNodeCore = NodeCore<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
     type SmallReceiptNodeCore = NodeCore<rete_transport::HeaplessStorage<4, 4, 8, 2>>;
 
+    #[derive(Default)]
+    struct RecordingReceiptSink {
+        candidates: Vec<rete_transport::ReceiptCandidate>,
+        terminals: Vec<rete_transport::ReceiptTerminal>,
+    }
+
+    struct RecordingReceiptReservation<'a> {
+        candidate: rete_transport::ReceiptCandidate,
+        terminals: &'a mut Vec<rete_transport::ReceiptTerminal>,
+    }
+
+    impl rete_transport::ReceiptTerminalSink for RecordingReceiptSink {
+        type Reservation<'a>
+            = RecordingReceiptReservation<'a>
+        where
+            Self: 'a;
+
+        fn try_reserve(
+            &mut self,
+            candidate: rete_transport::ReceiptCandidate,
+        ) -> Result<Self::Reservation<'_>, rete_transport::ReceiptSinkFull> {
+            self.candidates.push(candidate);
+            Ok(RecordingReceiptReservation {
+                candidate,
+                terminals: &mut self.terminals,
+            })
+        }
+    }
+
+    impl rete_transport::ReceiptTerminalReservation for RecordingReceiptReservation<'_> {
+        fn commit(self, terminal: rete_transport::ReceiptTerminal) {
+            assert_eq!(terminal.packet_hash(), &self.candidate.packet_hash);
+            self.terminals.push(terminal);
+        }
+    }
+
     fn make_core(seed: &[u8]) -> TestNodeCore {
         let identity = Identity::from_seed(seed).unwrap();
         TestNodeCore::new(identity, "testapp", &["aspect1"]).unwrap()
@@ -1672,7 +1708,7 @@ mod tests {
         ));
         assert_eq!(sender.transport.receipt_count(), 1);
 
-        let mut available_sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+        let mut available_sink = RecordingReceiptSink::default();
         let outcome = sender
             .handle_ingest_with_receipt_sink(
                 &proof.data,
@@ -1685,7 +1721,13 @@ mod tests {
         assert!(outcome.events.is_empty());
         assert!(outcome.packets.is_empty());
         assert_eq!(
-            available_sink.as_slice(),
+            available_sink.candidates,
+            vec![rete_transport::ReceiptCandidate::data(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert_eq!(
+            available_sink.terminals,
             &[rete_transport::ReceiptTerminal::Delivered(
                 *prepared.receipt.packet_hash()
             )]
@@ -1738,19 +1780,32 @@ mod tests {
             .expect("receiver should produce a proof");
         let mut invalid_proof = proof.data.clone();
         *invalid_proof.last_mut().unwrap() ^= 0xff;
-        let mut sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+        let mut sink = RecordingReceiptSink::default();
 
         sender
             .handle_ingest_with_receipt_sink(&invalid_proof, 101, 0, &mut rng, &mut sink)
             .unwrap();
-        assert!(sink.is_empty());
+        assert_eq!(
+            sink.candidates,
+            vec![rete_transport::ReceiptCandidate::data(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert!(sink.terminals.is_empty());
         assert_eq!(sender.transport.receipt_count(), 1);
 
         sender
             .handle_ingest_with_receipt_sink(&proof.data, 102, 0, &mut rng, &mut sink)
             .unwrap();
         assert_eq!(
-            sink.as_slice(),
+            sink.candidates,
+            vec![
+                rete_transport::ReceiptCandidate::data(*prepared.receipt.packet_hash()),
+                rete_transport::ReceiptCandidate::data(*prepared.receipt.packet_hash()),
+            ]
+        );
+        assert_eq!(
+            sink.terminals,
             &[rete_transport::ReceiptTerminal::Delivered(
                 *prepared.receipt.packet_hash()
             )]
@@ -1760,7 +1815,7 @@ mod tests {
         sender
             .handle_ingest_with_receipt_sink(&proof.data, 103, 0, &mut rng, &mut sink)
             .expect("duplicate proof no longer targets an outstanding receipt");
-        assert_eq!(sink.len(), 1);
+        assert_eq!(sink.terminals.len(), 1);
     }
 
     #[test]
@@ -1813,13 +1868,19 @@ mod tests {
         assert!(deferred.receipt_notifications_deferred);
         assert_eq!(sender.transport.receipt_count(), 1);
 
-        let mut available_sink = rete_transport::FixedReceiptTerminalSink::<1>::default();
+        let mut available_sink = RecordingReceiptSink::default();
         let completed =
             sender.handle_tick_with_receipt_sink(132, &mut rng, &mut available_sink);
         assert_eq!(completed.failed_receipts, 1);
         assert!(!completed.receipt_notifications_deferred);
         assert_eq!(
-            available_sink.as_slice(),
+            available_sink.candidates,
+            vec![rete_transport::ReceiptCandidate::data(
+                *prepared.receipt.packet_hash()
+            )]
+        );
+        assert_eq!(
+            available_sink.terminals,
             &[rete_transport::ReceiptTerminal::Failed(
                 *prepared.receipt.packet_hash()
             )]
@@ -2103,6 +2164,21 @@ mod tests {
                     .unwrap_or(false)
             })
             .expect("channel receiver should produce proof");
+
+        // A DATA receipt key can theoretically equal the overloaded Link ID
+        // carried by a channel proof. Candidate preflight and normal ingest
+        // must still agree that this Link-typed proof belongs to the channel
+        // receipt, leaving the unrelated DATA receipt untouched.
+        let mut colliding_data_hash = [0xa5; 32];
+        colliding_data_hash[..16].copy_from_slice(link_id.as_ref());
+        init.transport
+            .register_receipt(
+                colliding_data_hash,
+                resp.identity().public_key(),
+                200,
+                rete_transport::RECEIPT_TIMEOUT,
+            )
+            .unwrap();
         let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::new();
 
         assert!(matches!(
@@ -2126,17 +2202,25 @@ mod tests {
             1
         );
 
-        let mut sink = rete_transport::FixedReceiptTerminalSink::<1>::new();
+        let mut sink = RecordingReceiptSink::default();
         let outcome = init
             .handle_ingest_with_receipt_sink(&proof.data, 202, 0, &mut rng, &mut sink)
             .unwrap();
         assert!(outcome.events.is_empty());
         assert!(outcome.packets.is_empty());
         assert_eq!(
-            sink.as_slice(),
+            sink.candidates,
+            vec![rete_transport::ReceiptCandidate::channel(packet_hash)]
+        );
+        assert_eq!(
+            sink.terminals,
             &[rete_transport::ReceiptTerminal::Delivered(packet_hash)]
         );
         assert_eq!(init.transport.channel_receipt_count(), 0);
+        assert_eq!(
+            init.transport.receipt_status(&colliding_data_hash),
+            Some(rete_transport::ReceiptStatus::Sent)
+        );
         assert_eq!(
             init.transport
                 .get_link(&link_id)

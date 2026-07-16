@@ -317,8 +317,8 @@ pub use node_core::{
 
 #[cfg(feature = "alloc")]
 pub use rete_transport::{
-    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, ReceiptSinkFull, ReceiptTerminal,
-    ReceiptTerminalReservation, ReceiptTerminalSink, SendError,
+    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, ReceiptCandidate, ReceiptKind,
+    ReceiptSinkFull, ReceiptTerminal, ReceiptTerminalReservation, ReceiptTerminalSink, SendError,
 };
 
 /// Dispatch outbound packets to a single interface.

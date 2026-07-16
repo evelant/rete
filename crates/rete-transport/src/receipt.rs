@@ -34,6 +34,50 @@ impl ReceiptTerminal {
     }
 }
 
+/// Receipt class whose terminal notification is about to be produced.
+///
+/// This distinction lets product-owned sinks route DATA and channel delivery
+/// state to different bounded records before transport mutates either receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptKind {
+    /// A receipt registered for an outbound Reticulum DATA packet.
+    Data,
+    /// A receipt registered for an outbound channel message.
+    Channel,
+}
+
+/// Exact receipt terminal candidate presented before receipt state is mutated.
+///
+/// The full packet hash avoids forcing a sink to reconstruct identity from the
+/// truncated receipt-table key. A reservation is bound to both this hash and
+/// [`ReceiptKind`], even if later proof validation rejects the packet and the
+/// reservation is dropped unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptCandidate {
+    /// Class of receipt that may reach a terminal state.
+    pub kind: ReceiptKind,
+    /// Full packet hash used to correlate the terminal state.
+    pub packet_hash: [u8; 32],
+}
+
+impl ReceiptCandidate {
+    /// Construct a candidate for an outbound DATA receipt.
+    pub const fn data(packet_hash: [u8; 32]) -> Self {
+        Self {
+            kind: ReceiptKind::Data,
+            packet_hash,
+        }
+    }
+
+    /// Construct a candidate for an outbound channel receipt.
+    pub const fn channel(packet_hash: [u8; 32]) -> Self {
+        Self {
+            kind: ReceiptKind::Channel,
+            packet_hash,
+        }
+    }
+}
+
 /// A terminal-event sink cannot reserve another infallible commit slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptSinkFull;
@@ -41,6 +85,9 @@ pub struct ReceiptSinkFull;
 /// One terminal-event slot reserved before receipt state is mutated.
 pub trait ReceiptTerminalReservation {
     /// Commit the terminal state without allocation or failure.
+    ///
+    /// The terminal packet hash must equal the full hash supplied to
+    /// [`ReceiptTerminalSink::try_reserve`] for this reservation.
     fn commit(self, terminal: ReceiptTerminal);
 }
 
@@ -56,8 +103,11 @@ pub trait ReceiptTerminalSink {
     where
         Self: 'a;
 
-    /// Reserve one terminal state before the corresponding receipt is removed.
-    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull>;
+    /// Reserve one exact terminal candidate before its receipt is removed.
+    fn try_reserve(
+        &mut self,
+        candidate: ReceiptCandidate,
+    ) -> Result<Self::Reservation<'_>, ReceiptSinkFull>;
 }
 
 /// Heapless fixed-capacity sink for receipt terminal states.
@@ -119,6 +169,7 @@ impl<const N: usize> Default for FixedReceiptTerminalSink<N> {
 /// Reserved slot in a [`FixedReceiptTerminalSink`].
 pub struct FixedReceiptTerminalReservation<'a, const N: usize> {
     terminals: &'a mut heapless::Vec<ReceiptTerminal, N>,
+    candidate: ReceiptCandidate,
 }
 
 impl<const N: usize> ReceiptTerminalSink for FixedReceiptTerminalSink<N> {
@@ -127,12 +178,16 @@ impl<const N: usize> ReceiptTerminalSink for FixedReceiptTerminalSink<N> {
     where
         Self: 'a;
 
-    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
+    fn try_reserve(
+        &mut self,
+        candidate: ReceiptCandidate,
+    ) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
         if self.terminals.is_full() {
             Err(ReceiptSinkFull)
         } else {
             Ok(FixedReceiptTerminalReservation {
                 terminals: &mut self.terminals,
+                candidate,
             })
         }
     }
@@ -140,6 +195,11 @@ impl<const N: usize> ReceiptTerminalSink for FixedReceiptTerminalSink<N> {
 
 impl<const N: usize> ReceiptTerminalReservation for FixedReceiptTerminalReservation<'_, N> {
     fn commit(self, terminal: ReceiptTerminal) {
+        assert_eq!(
+            terminal.packet_hash(),
+            &self.candidate.packet_hash,
+            "receipt terminal must match its reserved candidate"
+        );
         self.terminals
             .push(terminal)
             .expect("reserved fixed receipt slot must accept commit");
@@ -345,7 +405,8 @@ impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>> ReceiptTable<M> {
                     deferred: false,
                 };
             };
-            let reservation = match sink.try_reserve() {
+            let candidate = ReceiptCandidate::data(packet_hash);
+            let reservation = match sink.try_reserve(candidate) {
                 Ok(reservation) => reservation,
                 Err(ReceiptSinkFull) => {
                     return ReceiptTickSummary {
@@ -384,6 +445,7 @@ struct FailedHashVecSink<'a> {
 
 struct FailedHashVecReservation<'a> {
     hashes: &'a mut Vec<[u8; 32]>,
+    candidate: ReceiptCandidate,
 }
 
 impl ReceiptTerminalSink for FailedHashVecSink<'_> {
@@ -392,10 +454,15 @@ impl ReceiptTerminalSink for FailedHashVecSink<'_> {
     where
         Self: 'a;
 
-    fn try_reserve(&mut self) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
+    fn try_reserve(
+        &mut self,
+        candidate: ReceiptCandidate,
+    ) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
         debug_assert!(self.hashes.len() < self.hashes.capacity());
+        debug_assert_eq!(candidate.kind, ReceiptKind::Data);
         Ok(FailedHashVecReservation {
             hashes: self.hashes,
+            candidate,
         })
     }
 }
@@ -405,6 +472,10 @@ impl ReceiptTerminalReservation for FailedHashVecReservation<'_> {
         let ReceiptTerminal::Failed(packet_hash) = terminal else {
             unreachable!("timeout scan cannot deliver a receipt")
         };
+        assert_eq!(
+            packet_hash, self.candidate.packet_hash,
+            "receipt timeout must match its reserved candidate"
+        );
         self.hashes.push(packet_hash);
     }
 }
@@ -584,12 +655,13 @@ mod tests {
     #[test]
     fn dropped_fixed_sink_reservation_restores_capacity() {
         let mut sink = FixedReceiptTerminalSink::<1>::new();
-        let reservation = sink.try_reserve().unwrap();
+        let candidate = ReceiptCandidate::data([0x44; 32]);
+        let reservation = sink.try_reserve(candidate).unwrap();
         drop(reservation);
 
         assert!(sink.is_empty());
         assert!(!sink.is_full());
-        sink.try_reserve()
+        sink.try_reserve(candidate)
             .unwrap()
             .commit(ReceiptTerminal::Failed([0x44; 32]));
         assert_eq!(sink.len(), 1);

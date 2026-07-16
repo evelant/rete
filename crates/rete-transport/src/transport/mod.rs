@@ -32,7 +32,7 @@ use crate::dedup::DedupWindow;
 use crate::link::{compute_link_id, is_valid_link_request_payload_len};
 use crate::path::Path;
 use crate::receipt::{
-    ReceiptSinkFull, ReceiptTable, ReceiptTerminal, ReceiptTerminalReservation,
+    ReceiptCandidate, ReceiptSinkFull, ReceiptTable, ReceiptTerminal, ReceiptTerminalReservation,
     ReceiptTerminalSink,
 };
 use crate::resource::Resource;
@@ -652,12 +652,12 @@ impl<S: TransportStorage> Transport<S> {
         self.ingest_on(raw, now, 0, rng, identity)
     }
 
-    fn proof_has_terminal_candidate(&self, raw: &[u8]) -> bool {
+    fn proof_terminal_candidate(&self, raw: &[u8]) -> Option<ReceiptCandidate> {
         let Ok(packet) = Packet::parse(raw) else {
-            return false;
+            return None;
         };
         if packet.packet_type != PacketType::Proof {
-            return false;
+            return None;
         }
 
         let raw_destination: [u8; TRUNCATED_HASH_LEN] =
@@ -670,22 +670,31 @@ impl<S: TransportStorage> Transport<S> {
             && self.links.contains_key(&link_id)
             && matches!(packet.context, CONTEXT_LRPROOF | CONTEXT_RESOURCE_PRF)
         {
-            return false;
+            return None;
         }
 
-        if self.receipts.get(&raw_destination).is_some() {
-            return true;
-        }
-
-        if packet.payload.len() >= 96 {
-            let receipt_key: [u8; TRUNCATED_HASH_LEN] = packet.payload
+        // Channel proofs are Link-typed and overload destination_hash with the
+        // Link ID. Prefer their explicit packet hash before consulting the
+        // ordinary DATA receipt map, whose truncated key can theoretically
+        // collide with that Link ID. The normal ingest path uses the same
+        // ordering, so a reservation can never be bound to a different kind.
+        if packet.dest_type == DestType::Link && packet.payload.len() >= 96 {
+            let mut packet_hash = [0u8; 32];
+            packet_hash.copy_from_slice(&packet.payload[..32]);
+            let receipt_key: [u8; TRUNCATED_HASH_LEN] = packet_hash
                 [..TRUNCATED_HASH_LEN]
                 .try_into()
                 .unwrap();
-            return self.channel_receipts.contains_key(&receipt_key);
+            if self.channel_receipts.contains_key(&receipt_key) {
+                return Some(ReceiptCandidate::channel(packet_hash));
+            }
         }
 
-        false
+        if let Some(receipt) = self.receipts.get(&raw_destination) {
+            return Some(ReceiptCandidate::data(receipt.packet_hash));
+        }
+
+        None
     }
 
     /// Process an inbound packet while committing DATA/channel receipt proofs
@@ -710,15 +719,18 @@ impl<S: TransportStorage> Transport<S> {
         R: RngCore + CryptoRng,
         T: ReceiptTerminalSink,
     {
-        let reservation = if self.proof_has_terminal_candidate(raw) {
-            Some(sink.try_reserve()?)
-        } else {
-            None
+        let reservation = match self.proof_terminal_candidate(raw) {
+            Some(candidate) => Some((candidate, sink.try_reserve(candidate)?)),
+            None => None,
         };
         let result = self.ingest_on(raw, now, iface, rng, identity);
 
         match (&result, reservation) {
-            (IngestResult::ProofReceived { packet_hash }, Some(reservation)) => {
+            (IngestResult::ProofReceived { packet_hash }, Some((candidate, reservation))) => {
+                assert_eq!(
+                    packet_hash, &candidate.packet_hash,
+                    "validated proof must match its reserved receipt candidate"
+                );
                 reservation.commit(ReceiptTerminal::Delivered(*packet_hash));
             }
             (IngestResult::ProofReceived { .. }, None) => {
@@ -1147,16 +1159,13 @@ impl<S: TransportStorage> Transport<S> {
                     return self.handle_resource_data(&lid, pkt.context, pkt.payload, now, rng);
                 }
 
-                // Check receipt table for delivery proof (DATA packets)
-                if let Some(packet_hash) = self.receipts.validate_proof(&raw_dh, pkt.payload) {
-                    return IngestResult::ProofReceived { packet_hash };
-                }
-
                 // Check channel receipts for delivery proof (channel messages).
                 // Proof payload format: packet_hash[32] || sig[64].
                 // Link proofs use dest_type=Link with dest_hash=link_id, so we
                 // extract the truncated packet hash from the payload for lookup.
-                if pkt.payload.len() >= 96 {
+                // Channel lookup precedes DATA receipt lookup for Link-typed
+                // proofs, matching the candidate-reservation preflight above.
+                if pkt.dest_type == DestType::Link && pkt.payload.len() >= 96 {
                     let mut full_hash = [0u8; 32];
                     full_hash.copy_from_slice(&pkt.payload[..32]);
                     let mut receipt_key = [0u8; TRUNCATED_HASH_LEN];
@@ -1190,6 +1199,12 @@ impl<S: TransportStorage> Transport<S> {
                             };
                         }
                     }
+                }
+
+                // Check receipt table for ordinary DATA delivery proofs after
+                // Link-typed channel proofs have been disambiguated.
+                if let Some(packet_hash) = self.receipts.validate_proof(&raw_dh, pkt.payload) {
+                    return IngestResult::ProofReceived { packet_hash };
                 }
 
                 if self.local_identity_hash.is_some() {

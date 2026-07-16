@@ -42,9 +42,9 @@ pub use link::{
 };
 pub use path::{InterfaceMode, Path, PATH_EXPIRES_AP, PATH_EXPIRES_ROAMING};
 pub use receipt::{
-    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, PacketReceipt,
-    ReceiptRegistrationError, ReceiptSinkFull, ReceiptStatus, ReceiptTable, ReceiptTerminal,
-    ReceiptTerminalReservation, ReceiptTerminalSink, ReceiptTickSummary,
+    FixedReceiptTerminalReservation, FixedReceiptTerminalSink, PacketReceipt, ReceiptCandidate,
+    ReceiptKind, ReceiptRegistrationError, ReceiptSinkFull, ReceiptStatus, ReceiptTable,
+    ReceiptTerminal, ReceiptTerminalReservation, ReceiptTerminalSink, ReceiptTickSummary,
 };
 pub use request::{
     build_request, build_response, parse_request, parse_response, path_hash, request_id,
