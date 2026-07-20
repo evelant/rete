@@ -454,7 +454,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.transport.save_snapshot(detail)
     }
 
-    /// Restore transport state from a previously saved snapshot.
+    /// Restore safely rebindable transport state from a saved snapshot.
+    ///
+    /// This currently restores identities only. Persisted path observations
+    /// remain inactive until they can be rebound to stable interface identities.
     pub fn load_snapshot(&mut self, snap: &rete_transport::Snapshot) {
         self.transport.load_snapshot(snap);
     }

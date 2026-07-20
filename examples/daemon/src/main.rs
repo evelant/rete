@@ -205,7 +205,9 @@ async fn async_main() {
         Ok(Some(snap)) => {
             let (np, ni) = (snap.paths.len(), snap.identities.len());
             node.core.load_snapshot(&snap);
-            tracing::info!("restored {np} paths, {ni} identities from snapshot");
+            tracing::info!(
+                "restored {ni} identities from snapshot; ignored {np} saved path observations pending stable-interface rebinding"
+            );
         }
         Ok(None) => {}
         Err(e) => tracing::error!("failed to load snapshot: {e:?}"),

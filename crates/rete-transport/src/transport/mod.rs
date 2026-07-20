@@ -889,6 +889,21 @@ impl<S: TransportStorage> Transport<S> {
                     let tid_hash = IdentityHash::from_slice(tid);
 
                     if tid_hash == local_id {
+                        // LRPROOF is canonically emitted as HEADER_1 and has
+                        // stricter relay rules than ordinary link traffic.
+                        // In particular, Python excludes it from generic link
+                        // transport and validates its responder-side direction,
+                        // hop count, recalled identity and signature first.
+                        // Reject a targeted HEADER_2 form instead of allowing it
+                        // to bypass those checks through the generic H2 branch.
+                        if pkt.packet_type == PacketType::Proof
+                            && pkt.dest_type == DestType::Link
+                            && pkt.context == CONTEXT_LRPROOF
+                        {
+                            self.stats.packets_dropped_invalid += 1;
+                            return IngestResult::Invalid;
+                        }
+
                         let dest = DestHash::from_slice(pkt.destination_hash);
                         let is_link_request = pkt.packet_type == PacketType::LinkRequest;
                         let is_link_dest = pkt.dest_type == DestType::Link;
@@ -2076,6 +2091,51 @@ mod tests {
             }
         ));
         assert_eq!(transport.link_table.get(&link_id).unwrap().timestamp, 500);
+    }
+
+    #[test]
+    fn test_header2_lrproof_cannot_bypass_relay_validation() {
+        let mut rng = rand_core::OsRng;
+        let (mut transport, link_id, proof, identity) = make_relay_with_valid_lrproof(100);
+        let parsed = Packet::parse(&proof).unwrap();
+        let proof_payload = parsed.payload.to_vec();
+        let relay_hash = IdentityHash::from([0x11u8; TRUNCATED_HASH_LEN]);
+        let mut header2_proof = [0u8; rete_core::MTU];
+        let proof_len = PacketBuilder::new(&mut header2_proof)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(PacketType::Proof)
+            .dest_type(DestType::Link)
+            .transport_id(relay_hash.as_ref())
+            .destination_hash(link_id.as_ref())
+            .context(CONTEXT_LRPROOF)
+            .payload(&proof_payload)
+            .build()
+            .unwrap();
+
+        let forwarded_before = transport.stats().packets_forwarded;
+        assert!(matches!(
+            transport.ingest_on(
+                &mut header2_proof[..proof_len],
+                500,
+                1,
+                &mut rng,
+                &identity,
+            ),
+            IngestResult::Invalid
+        ));
+        assert_eq!(
+            transport.link_table.get(&link_id).unwrap().timestamp,
+            100,
+            "a HEADER_2 LRPROOF must not refresh the relay entry"
+        );
+        assert_eq!(transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(transport.stats().packets_dropped_invalid, 1);
+        assert_eq!(
+            transport.reverse_table.len(),
+            0,
+            "a rejected HEADER_2 LRPROOF must not allocate reverse state"
+        );
     }
 
     #[test]

@@ -385,10 +385,14 @@ Each session is self-contained: clear context between sessions, TDD red-green, f
 
 **Steps:**
 1. Integrate `JsonFileStore` snapshot into `SharedDaemon` for periodic + shutdown persistence
-2. Implement startup restore: load snapshot, rebuild path table + known identities
+2. Implement startup restore: load snapshot, restore known identities, and leave
+   saved path observations inactive pending stable-interface rebinding; active
+   paths must be learned again after restart
 3. Multi-instance isolation: separate sockets + data dirs per instance
 4. Config validation: reject invalid combos, conflicting ports
-5. Test restart cycle: Python client discovers paths -> stop daemon -> restart -> paths survive
+5. Test restart cycle: Python client discovers paths -> stop daemon -> snapshot
+   retains path observations -> restart -> identity survives and client reattaches;
+   active paths are relearned
 6. Test two daemons with different names don't interfere
 
 **Green checks:** Restart + isolation + config tests pass.
