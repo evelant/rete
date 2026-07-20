@@ -1005,6 +1005,30 @@ mod tests {
         SmallReceiptNodeCore::new(identity, "testapp", &["aspect1"]).unwrap()
     }
 
+    fn build_local_data_packet(
+        destination: DestHash,
+        destination_type: DestType,
+        payload: &[u8],
+        transport: Option<IdentityHash>,
+    ) -> Vec<u8> {
+        let mut raw = [0u8; MTU];
+        let builder = PacketBuilder::new(&mut raw)
+            .packet_type(PacketType::Data)
+            .dest_type(destination_type)
+            .destination_hash(destination.as_ref())
+            .context(0)
+            .payload(payload);
+        let builder = match transport {
+            Some(transport) => builder
+                .header_type(HeaderType::Header2)
+                .transport_type(TRANSPORT_TYPE_TRANSPORT)
+                .transport_id(transport.as_ref()),
+            None => builder,
+        };
+        let len = builder.build().unwrap();
+        raw[..len].to_vec()
+    }
+
     struct PanicRng;
 
     impl RngCore for PanicRng {
@@ -3371,6 +3395,203 @@ mod tests {
             outcome.events.is_empty(),
             "Group decrypt failure must drop packet, not deliver garbage"
         );
+    }
+
+    #[test]
+    fn owned_header2_local_data_requires_matching_destination_type() {
+        let mut core = make_core(b"owned-h2-destination-type");
+        let mut rng = rand::thread_rng();
+        let transport = core.identity.hash();
+
+        let single_hash = *core.dest_hash();
+        let recipient = Identity::from_public_key(&core.identity.public_key()).unwrap();
+        let mut single_ciphertext = [0u8; MTU];
+        let single_len = recipient
+            .encrypt(b"single payload", &mut rng, &mut single_ciphertext)
+            .unwrap();
+
+        let group_hash = core
+            .register_destination_typed(
+                "groupapp",
+                &["owned-h2-type"],
+                DestinationType::Group,
+                Direction::In,
+            )
+            .unwrap();
+        core.get_destination_mut(&group_hash)
+            .unwrap()
+            .create_group_keys(&mut rng)
+            .unwrap();
+        let mut group_ciphertext = [0u8; MTU];
+        let group_len = core
+            .get_destination(&group_hash)
+            .unwrap()
+            .encrypt(b"group payload", &mut rng, &mut group_ciphertext)
+            .unwrap();
+
+        let plain_hash = core
+            .register_destination_typed(
+                "plainapp",
+                &["owned-h2-type"],
+                DestinationType::Plain,
+                Direction::In,
+            )
+            .unwrap();
+
+        let mismatched = [
+            build_local_data_packet(
+                single_hash,
+                DestType::Plain,
+                &single_ciphertext[..single_len],
+                Some(transport),
+            ),
+            build_local_data_packet(
+                group_hash,
+                DestType::Single,
+                &group_ciphertext[..group_len],
+                Some(transport),
+            ),
+            build_local_data_packet(
+                plain_hash,
+                DestType::Group,
+                b"plain payload",
+                Some(transport),
+            ),
+        ];
+        for (index, packet) in mismatched.iter().enumerate() {
+            let outcome = core.handle_ingest(packet, 100 + index as u64, 3, &mut rng);
+            assert!(
+                outcome.events.is_empty()
+                    && outcome.packets.is_empty()
+                    && outcome.rejection.is_none(),
+                "mismatched owned HEADER_2 destination type {index} reached local dispatch"
+            );
+        }
+
+        let matched = [
+            (
+                build_local_data_packet(
+                    single_hash,
+                    DestType::Single,
+                    &single_ciphertext[..single_len],
+                    Some(transport),
+                ),
+                single_hash,
+                b"single payload".as_slice(),
+            ),
+            (
+                build_local_data_packet(
+                    group_hash,
+                    DestType::Group,
+                    &group_ciphertext[..group_len],
+                    Some(transport),
+                ),
+                group_hash,
+                b"group payload".as_slice(),
+            ),
+            (
+                build_local_data_packet(
+                    plain_hash,
+                    DestType::Plain,
+                    b"plain payload",
+                    Some(transport),
+                ),
+                plain_hash,
+                b"plain payload".as_slice(),
+            ),
+        ];
+        for (index, (packet, expected_hash, expected_payload)) in matched.iter().enumerate() {
+            let outcome = core.handle_ingest(packet, 110 + index as u64, 3, &mut rng);
+            assert!(matches!(
+                outcome.events.as_slice(),
+                [NodeEvent::DataReceived { dest_hash, payload }]
+                    if dest_hash == expected_hash && payload.as_slice() == *expected_payload
+            ));
+        }
+    }
+
+    #[test]
+    fn header1_local_data_uses_the_same_destination_type_gate() {
+        let mut core = make_core(b"h1-destination-type");
+        let mut rng = rand::thread_rng();
+        let plain_hash = core
+            .register_destination_typed(
+                "plainapp",
+                &["h1-type"],
+                DestinationType::Plain,
+                Direction::In,
+            )
+            .unwrap();
+
+        let mismatched = build_local_data_packet(
+            plain_hash,
+            DestType::Single,
+            b"must not dispatch",
+            None,
+        );
+        let received_before = core.transport.stats().packets_received;
+        let duplicates_before = core.transport.stats().packets_dropped_dedup;
+        let outcome = core.handle_ingest(&mismatched, 100, 1, &mut rng);
+        assert!(outcome.events.is_empty());
+        assert!(outcome.packets.is_empty());
+        assert_eq!(outcome.rejection, None);
+        assert_eq!(
+            core.transport.stats().packets_received,
+            received_before + 1,
+            "destination-type matching deliberately follows transport admission"
+        );
+
+        let replay = core.handle_ingest(&mismatched, 101, 1, &mut rng);
+        assert!(replay.events.is_empty());
+        assert!(replay.packets.is_empty());
+        assert_eq!(replay.rejection, None);
+        assert_eq!(
+            core.transport.stats().packets_dropped_dedup,
+            duplicates_before + 1,
+            "a mismatched destination type must retain normal dedup state"
+        );
+
+        let matched =
+            build_local_data_packet(plain_hash, DestType::Plain, b"dispatch", None);
+        let outcome = core.handle_ingest(&matched, 102, 1, &mut rng);
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [NodeEvent::DataReceived { dest_hash, payload }]
+                if *dest_hash == plain_hash && payload == b"dispatch"
+        ));
+    }
+
+    #[test]
+    fn local_data_never_dispatches_to_an_outbound_destination() {
+        let mut core = make_core(b"outbound-destination-direction");
+        let mut rng = rand::thread_rng();
+        let outbound_hash = core
+            .register_destination_typed(
+                "plainapp",
+                &["outbound-direction"],
+                DestinationType::Plain,
+                Direction::Out,
+            )
+            .unwrap();
+
+        // register_destination_typed correctly keeps OUT destinations out of
+        // the transport's local set. Add it explicitly to prove NodeCore's
+        // dispatch boundary remains fail-closed even if a lower-level caller
+        // or restored state marks that hash local.
+        core.transport.add_local_destination(outbound_hash);
+        let packet = build_local_data_packet(
+            outbound_hash,
+            DestType::Plain,
+            b"must not dispatch outbound",
+            Some(core.identity.hash()),
+        );
+        let received_before = core.transport.stats().packets_received;
+        let outcome = core.handle_ingest(&packet, 100, 1, &mut rng);
+
+        assert!(outcome.events.is_empty());
+        assert!(outcome.packets.is_empty());
+        assert_eq!(outcome.rejection, None);
+        assert_eq!(core.transport.stats().packets_received, received_before + 1);
     }
 
     // -----------------------------------------------------------------------

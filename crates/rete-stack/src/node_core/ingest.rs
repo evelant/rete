@@ -173,10 +173,22 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             }
             IngestResult::LocalData {
                 dest_hash,
+                dest_type,
                 payload,
                 packet_hash,
             } => {
-                let dest = match self.get_destination(&dest_hash) {
+                let registered_type = match dest_type {
+                    DestType::Single => DestinationType::Single,
+                    DestType::Group => DestinationType::Group,
+                    DestType::Plain => DestinationType::Plain,
+                    DestType::Link => DestinationType::Link,
+                };
+                // Python RNS resolves the registered destination and compares
+                // its direction/type after packet_filter has admitted and
+                // remembered the full packet hash. Preserve that ordering: a
+                // mismatch is a silent local-dispatch miss, not a pre-transport
+                // rejection that could be retried outside normal dedup state.
+                let dest = match self.get_inbound_destination(&dest_hash, registered_type) {
                     Some(d) => d,
                     None => return IngestOutcome::empty(),
                 };

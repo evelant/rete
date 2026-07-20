@@ -324,6 +324,8 @@ pub enum IngestResult<'a> {
     LocalData {
         /// Destination hash the packet was addressed to.
         dest_hash: DestHash,
+        /// Destination type declared by the wire packet.
+        dest_type: DestType,
         /// Payload data.
         payload: &'a [u8],
         /// Full 32-byte packet hash (for proof generation).
@@ -1317,6 +1319,7 @@ impl<S: TransportStorage> Transport<S> {
                 if self.is_local_destination(&dh) {
                     IngestResult::LocalData {
                         dest_hash: dh,
+                        dest_type: pkt.dest_type,
                         payload: pkt.payload,
                         packet_hash: pkt_hash,
                     }

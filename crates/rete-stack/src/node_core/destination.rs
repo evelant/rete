@@ -85,6 +85,21 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             .find(|d| d.dest_hash == *dest_hash)
     }
 
+    /// Look up the inbound destination matching both the wire hash and type.
+    pub(super) fn get_inbound_destination(
+        &self,
+        dest_hash: &DestHash,
+        dest_type: DestinationType,
+    ) -> Option<&Destination> {
+        core::iter::once(&self.primary_dest)
+            .chain(self.additional_dests.iter())
+            .find(|destination| {
+                destination.dest_hash == *dest_hash
+                    && destination.direction == Direction::In
+                    && destination.dest_type == dest_type
+            })
+    }
+
     /// Look up a destination mutably by hash.
     pub fn get_destination_mut(
         &mut self,
