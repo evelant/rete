@@ -142,8 +142,62 @@ impl ChannelEnvelope {
 #[derive(Debug, Clone)]
 struct PendingMessage {
     envelope: ChannelEnvelope,
+    generation: u64,
     retries: u8,
-    sent_at: u64,
+    sent_at: Option<u64>,
+}
+
+/// An immutable channel send prepared before packet construction commits any
+/// sequence or pending-window state.
+#[derive(Debug)]
+pub(crate) struct PreparedChannelSend {
+    envelope: ChannelEnvelope,
+    generation: u64,
+    packed: Vec<u8>,
+}
+
+impl PreparedChannelSend {
+    pub(crate) fn sequence(&self) -> u16 {
+        self.envelope.sequence
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+}
+
+/// An immutable snapshot of one timed-out channel envelope.
+///
+/// The expected retry count and timestamp make a delayed token fail closed if
+/// the pending message changes before it is committed.
+#[derive(Debug)]
+pub(crate) struct PreparedChannelRetry {
+    sequence: u16,
+    expected_generation: u64,
+    expected_retries: u8,
+    expected_sent_at: u64,
+    packed: Vec<u8>,
+}
+
+impl PreparedChannelRetry {
+    pub(crate) fn sequence(&self) -> u16 {
+        self.sequence
+    }
+
+    pub(crate) fn packed(&self) -> &[u8] {
+        &self.packed
+    }
+}
+
+/// Read-only channel maintenance discovered by a periodic tick.
+#[derive(Debug)]
+pub(crate) enum ChannelMaintenance {
+    Retransmit(Vec<PreparedChannelRetry>),
+    Teardown,
 }
 
 /// Reliable ordered channel over a Link.
@@ -152,6 +206,8 @@ struct PendingMessage {
 pub struct Channel {
     /// Next outbound sequence number.
     tx_sequence: u16,
+    /// Non-wrapping-in-practice identity for outbound attempts.
+    tx_generation: u64,
     /// Next expected inbound sequence number.
     rx_sequence: u16,
     /// Outbound window: messages sent but not yet confirmed.
@@ -194,6 +250,7 @@ impl Channel {
     pub fn new() -> Self {
         Channel {
             tx_sequence: 0,
+            tx_generation: 0,
             rx_sequence: 0,
             tx_pending: VecDeque::new(),
             rx_buffer: VecDeque::new(),
@@ -247,6 +304,27 @@ impl Channel {
     /// Queue a message for sending. Returns the packed envelope bytes,
     /// or `None` if the window is full.
     pub fn send(&mut self, message_type: u16, payload: &[u8]) -> Option<Vec<u8>> {
+        if !self.reserve_send_slot() {
+            return None;
+        }
+        let prepared = self.prepare_send(message_type, payload)?;
+        Some(self.commit_send(prepared, None))
+    }
+
+    /// Reserve the pending-queue slot needed by a later infallible send
+    /// commit. Capacity changes are not observable protocol state.
+    pub(crate) fn reserve_send_slot(&mut self) -> bool {
+        self.tx_pending.try_reserve(1).is_ok()
+    }
+
+    /// Prepare a message without advancing the sequence or occupying the send
+    /// window. Packet construction and receipt admission can therefore fail
+    /// without orphaning channel state.
+    pub(crate) fn prepare_send(
+        &self,
+        message_type: u16,
+        payload: &[u8],
+    ) -> Option<PreparedChannelSend> {
         if !self.is_ready_to_send() {
             return None;
         }
@@ -256,18 +334,54 @@ impl Channel {
             payload: payload.to_vec(),
         };
         let packed = envelope.pack();
+        Some(PreparedChannelSend {
+            envelope,
+            generation: self.tx_generation,
+            packed,
+        })
+    }
+
+    /// Commit a previously prepared send after its packet and receipt have
+    /// both been retained.
+    pub(crate) fn send_is_current(&self, prepared: &PreparedChannelSend) -> bool {
+        self.is_ready_to_send()
+            && prepared.sequence() == self.tx_sequence
+            && prepared.generation() == self.tx_generation
+    }
+
+    /// Commit a current prepared send. The caller must validate the token
+    /// immediately before its packet receipt is admitted.
+    pub(crate) fn commit_send(
+        &mut self,
+        prepared: PreparedChannelSend,
+        sent_at: Option<u64>,
+    ) -> Vec<u8> {
+        debug_assert!(self.is_ready_to_send());
+        debug_assert_eq!(prepared.sequence(), self.tx_sequence);
+        debug_assert_eq!(prepared.generation(), self.tx_generation);
+        let PreparedChannelSend {
+            envelope,
+            generation,
+            packed,
+        } = prepared;
         self.tx_pending.push_back(PendingMessage {
             envelope,
+            generation,
             retries: 0,
-            sent_at: 0, // will be set on actual send
+            sent_at,
         });
         self.tx_sequence = self.tx_sequence.wrapping_add(1);
-        Some(packed)
+        self.tx_generation = self.tx_generation.wrapping_add(1);
+        packed
     }
 
     /// Whether the channel can accept another outbound message.
     pub fn is_ready_to_send(&self) -> bool {
         (self.tx_pending.len() as u16) < self.window
+            && !self
+                .tx_pending
+                .iter()
+                .any(|pending| pending.envelope.sequence == self.tx_sequence)
     }
 
     /// Process a received channel message (after decryption).
@@ -285,6 +399,17 @@ impl Channel {
                 // Out of order but within forward half of sequence space — buffer
                 if self.rx_buffer.len() >= MAX_RX_BUFFER {
                     return; // buffer full, drop
+                }
+                // A retry has fresh ciphertext and a fresh packet hash, but
+                // retains the envelope sequence. Buffering it twice would let
+                // the stale copy block later sequences after the first copy is
+                // delivered.
+                if self
+                    .rx_buffer
+                    .iter()
+                    .any(|buffered| buffered.sequence == envelope.sequence)
+                {
+                    return;
                 }
                 // Insert in sorted order (by wrapping distance from rx_sequence)
                 let pos = self
@@ -376,23 +501,74 @@ impl Channel {
     /// On timeout, shrinks the window and window_max matching Python
     /// Channel._packet_timeout (lines 563-570).
     pub fn pending_retransmit(&mut self, now: u64) -> Vec<Vec<u8>> {
-        let mut retransmits = Vec::new();
-        let mut had_timeout = false;
-        for msg in &mut self.tx_pending {
-            if msg.sent_at > 0 && now.saturating_sub(msg.sent_at) > self.retry_timeout {
-                msg.retries += 1;
-                if msg.retries > MAX_RETRIES {
-                    self.teardown = true;
-                    return retransmits;
+        match self.pending_maintenance(now) {
+            None => Vec::new(),
+            Some(ChannelMaintenance::Teardown) => {
+                self.teardown = true;
+                Vec::new()
+            }
+            Some(ChannelMaintenance::Retransmit(retries)) => {
+                let mut retransmits = Vec::with_capacity(retries.len());
+                for (index, retry) in retries.into_iter().enumerate() {
+                    retransmits.push(self.commit_retry(retry, now, index == 0));
                 }
-                msg.sent_at = now;
-                retransmits.push(msg.envelope.pack());
-                had_timeout = true;
+                retransmits
             }
         }
+    }
 
-        // Shrink window on timeout (matches Python Channel._packet_timeout)
-        if had_timeout {
+    /// Discover due retransmits without changing retry counters, timestamps,
+    /// adaptive window state, or teardown state.
+    pub(crate) fn pending_maintenance(&self, now: u64) -> Option<ChannelMaintenance> {
+        let mut retries = Vec::new();
+        for msg in &self.tx_pending {
+            let Some(sent_at) = msg.sent_at else {
+                continue;
+            };
+            if now.saturating_sub(sent_at) > self.retry_timeout {
+                if msg.retries >= MAX_RETRIES {
+                    return Some(ChannelMaintenance::Teardown);
+                }
+                retries.push(PreparedChannelRetry {
+                    sequence: msg.envelope.sequence,
+                    expected_generation: msg.generation,
+                    expected_retries: msg.retries,
+                    expected_sent_at: sent_at,
+                    packed: msg.envelope.pack(),
+                });
+            }
+        }
+        (!retries.is_empty()).then_some(ChannelMaintenance::Retransmit(retries))
+    }
+
+    /// Check whether a prepared retry still names the exact pending attempt it
+    /// observed. This is used immediately before packet/receipt replacement.
+    pub(crate) fn retry_is_current(&self, retry: &PreparedChannelRetry) -> bool {
+        self.tx_pending.iter().any(|msg| {
+            msg.envelope.sequence == retry.sequence
+                && msg.generation == retry.expected_generation
+                && msg.retries == retry.expected_retries
+                && msg.sent_at == Some(retry.expected_sent_at)
+        })
+    }
+
+    /// Commit one current, successfully built and receipt-tracked retry.
+    pub(crate) fn commit_retry(
+        &mut self,
+        retry: PreparedChannelRetry,
+        now: u64,
+        shrink_window: bool,
+    ) -> Vec<u8> {
+        debug_assert!(self.retry_is_current(&retry));
+        let msg = self
+            .tx_pending
+            .iter_mut()
+            .find(|msg| msg.generation == retry.expected_generation)
+            .expect("current retry must retain its pending envelope");
+        msg.retries += 1;
+        msg.sent_at = Some(now);
+
+        if shrink_window {
             if self.window > self.window_min {
                 self.window -= 1;
             }
@@ -400,15 +576,14 @@ impl Channel {
                 self.window_max -= 1;
             }
         }
-
-        retransmits
+        retry.packed
     }
 
     /// Set the timestamp for the most recently sent message.
     pub fn mark_sent(&mut self, now: u64) {
         if let Some(last) = self.tx_pending.back_mut() {
-            if last.sent_at == 0 {
-                last.sent_at = now;
+            if last.sent_at.is_none() {
+                last.sent_at = Some(now);
             }
         }
     }
@@ -539,6 +714,27 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_retry_duplicate_cannot_block_later_sequences() {
+        let mut ch = Channel::new();
+        let envelope = |sequence, payload: &'static [u8]| ChannelEnvelope {
+            message_type: 0x01,
+            sequence,
+            payload: payload.to_vec(),
+        };
+
+        ch.receive(&envelope(1, b"one").pack());
+        ch.receive(&envelope(1, b"one retry").pack());
+        ch.receive(&envelope(2, b"two").pack());
+        ch.receive(&envelope(0, b"zero").pack());
+
+        assert_eq!(ch.ready_count(), 3);
+        for sequence in 0..3 {
+            assert_eq!(ch.next_received().unwrap().sequence, sequence);
+        }
+        assert!(ch.rx_buffer.is_empty());
+    }
+
+    #[test]
     fn channel_window_blocks_send() {
         let mut ch = Channel::new();
         // Fill the window (default 2)
@@ -548,6 +744,17 @@ mod tests {
         // Window full
         assert!(!ch.is_ready_to_send());
         assert!(ch.send(0x01, b"blocked").is_none());
+    }
+
+    #[test]
+    fn channel_blocks_sequence_reuse_while_old_generation_is_pending() {
+        let mut ch = Channel::new();
+        ch.send(0x01, b"old sequence zero").unwrap();
+        ch.tx_sequence = 0; // model wrap while the old sequence is outstanding
+
+        assert!(!ch.is_ready_to_send());
+        assert!(ch.send(0x01, b"new sequence zero").is_none());
+        assert_eq!(ch.pending_count(), 1);
     }
 
     #[test]
@@ -563,6 +770,24 @@ mod tests {
         // After timeout
         let retransmits = ch.pending_retransmit(116);
         assert_eq!(retransmits.len(), 1);
+    }
+
+    #[test]
+    fn stale_retry_token_cannot_alias_after_sequence_wrap() {
+        let mut ch = Channel::new();
+        ch.send(0x01, b"old generation").unwrap();
+        ch.mark_sent(100);
+        let stale = match ch.pending_maintenance(116).unwrap() {
+            ChannelMaintenance::Retransmit(mut retries) => retries.pop().unwrap(),
+            ChannelMaintenance::Teardown => panic!("first retry cannot be terminal"),
+        };
+
+        ch.mark_delivered(0, 0.0);
+        ch.tx_sequence = 0; // model the defined u16 sequence wrap
+        ch.send(0x01, b"new generation").unwrap();
+        ch.mark_sent(100);
+
+        assert!(!ch.retry_is_current(&stale));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Link lifecycle, handshake, keepalives, close.
 
-use crate::link::{compute_link_id, Link, LinkRole};
+use crate::channel::{ChannelMaintenance, PreparedChannelRetry};
+use crate::link::{compute_link_id, Link, LinkRole, LINK_MDU};
 use crate::storage::StorageMap;
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
@@ -17,6 +18,63 @@ enum OwnedLinkAdmission {
     Inserted,
     Existing,
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkSessionFingerprint {
+    local_ephemeral: [u8; 32],
+    peer_ephemeral: [u8; 32],
+}
+
+impl LinkSessionFingerprint {
+    fn of(link: &Link) -> Self {
+        Self {
+            local_ephemeral: link.our_x25519_pub,
+            peer_ephemeral: link.peer_x25519_pub,
+        }
+    }
+}
+
+/// One immutable channel retry discovered by periodic maintenance.
+///
+/// The token is intentionally non-cloneable and can only be committed by
+/// [`Transport::retry_channel_message`].
+#[derive(Debug)]
+pub struct PendingChannelRetry {
+    link_id: LinkId,
+    link_session: LinkSessionFingerprint,
+    retry: PreparedChannelRetry,
+}
+
+impl PendingChannelRetry {
+    /// Link whose channel owns this retry.
+    pub fn link_id(&self) -> &LinkId {
+        &self.link_id
+    }
+}
+
+/// Immutable terminal channel maintenance discovered for one Link.
+#[derive(Debug)]
+pub struct PendingChannelTeardown {
+    link_id: LinkId,
+    link_session: LinkSessionFingerprint,
+    discovered_at: u64,
+}
+
+impl PendingChannelTeardown {
+    /// Link whose channel exhausted its retry budget.
+    pub fn link_id(&self) -> &LinkId {
+        &self.link_id
+    }
+}
+
+/// Read-only channel work returned by periodic maintenance discovery.
+#[derive(Debug)]
+pub enum ChannelMaintenanceAction {
+    /// Build a fresh encrypted packet and replace the previous proof receipt.
+    Retransmit(PendingChannelRetry),
+    /// Remove a Link whose channel exhausted its retry budget.
+    Teardown(PendingChannelTeardown),
 }
 
 impl<S: crate::storage::TransportStorage> Transport<S> {
@@ -44,6 +102,16 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// Number of tracked channel receipts (pending channel ACKs).
     pub fn channel_receipt_count(&self) -> usize {
         self.channel_receipts.len()
+    }
+
+    /// Remove a locally owned Link and every proof receipt tied to it.
+    fn remove_owned_link(&mut self, link_id: &LinkId) -> Option<Link> {
+        let removed = self.links.remove(link_id);
+        if removed.is_some() {
+            self.channel_receipts
+                .retain(|_, receipt| receipt.link_id != *link_id);
+        }
+        removed
     }
 
     // -----------------------------------------------------------------------
@@ -191,20 +259,47 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         context: u8,
         rng: &mut R,
     ) -> Result<alloc::vec::Vec<u8>, SendError> {
+        let mut packet = alloc::vec::Vec::new();
+        packet
+            .try_reserve_exact(rete_core::MTU)
+            .map_err(|_| SendError::OutputAllocationFailed)?;
+        packet.resize(rete_core::MTU, 0);
+        let packet_len = Self::build_link_packet_into(
+            link,
+            link_id,
+            plaintext,
+            context,
+            rng,
+            &mut packet,
+        )?;
+        packet.truncate(packet_len);
+        Ok(packet)
+    }
+
+    /// Encrypt plaintext into caller-owned packet storage.
+    fn build_link_packet_into<R: RngCore + CryptoRng>(
+        link: &Link,
+        link_id: &LinkId,
+        plaintext: &[u8],
+        context: u8,
+        rng: &mut R,
+        output: &mut [u8],
+    ) -> Result<usize, SendError> {
+        if output.len() < rete_core::MTU {
+            return Err(SendError::PacketBuild(rete_core::Error::BufferTooSmall));
+        }
         let mut ct_buf = [0u8; rete_core::MTU];
         let ct_len = link
             .encrypt(plaintext, rng, &mut ct_buf)
             .map_err(SendError::Crypto)?;
-        let mut pkt_buf = [0u8; rete_core::MTU];
-        let pkt_len = PacketBuilder::new(&mut pkt_buf)
+        PacketBuilder::new(&mut output[..rete_core::MTU])
             .packet_type(PacketType::Data)
             .dest_type(DestType::Link)
             .destination_hash(link_id.as_ref())
             .context(context)
             .payload(&ct_buf[..ct_len])
             .build()
-            .map_err(SendError::PacketBuild)?;
-        Ok(pkt_buf[..pkt_len].to_vec())
+            .map_err(SendError::PacketBuild)
     }
 
     /// Build a LINKCLOSE packet and remove the link.
@@ -229,8 +324,9 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             .build()
             .map_err(SendError::PacketBuild)?;
 
-        self.links.remove(link_id);
-        Ok(pkt_buf[..pkt_len].to_vec())
+        let packet = pkt_buf[..pkt_len].to_vec();
+        self.remove_owned_link(link_id);
+        Ok(packet)
     }
 
     pub(super) fn handle_link_request<'a, R: RngCore + CryptoRng>(
@@ -280,7 +376,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             Some(link) => match link.build_proof(identity) {
                 Ok(proof) => proof,
                 Err(_) => {
-                    self.links.remove(&link_id);
+                    self.remove_owned_link(&link_id);
                     self.stats.links_failed += 1;
                     self.stats.crypto_failures += 1;
                     return IngestResult::Invalid;
@@ -290,7 +386,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 // A backend that reports successful insertion must make the
                 // inserted value observable. Fail closed if it violates that
                 // contract instead of emitting a proof without retained state.
-                self.links.remove(&link_id);
+                self.remove_owned_link(&link_id);
                 self.stats.links_failed += 1;
                 return IngestResult::Invalid;
             }
@@ -308,7 +404,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         {
             Ok(n) => n,
             Err(_) => {
-                self.links.remove(&link_id);
+                self.remove_owned_link(&link_id);
                 return IngestResult::Invalid;
             }
         };
@@ -542,7 +638,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             CONTEXT_LINKCLOSE => {
                 let lid = *link_id;
                 if link.handle_close(&dec_buf[..dec_len]) {
-                    self.links.remove(&lid);
+                    self.remove_owned_link(&lid);
                     self.stats.links_closed += 1;
                     IngestResult::LinkClosed { link_id: lid }
                 } else {
@@ -630,11 +726,102 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     // Channel message send
     // -----------------------------------------------------------------------
 
+    fn channel_receipt_key(packet_hash: &[u8; 32]) -> [u8; TRUNCATED_HASH_LEN] {
+        packet_hash[..TRUNCATED_HASH_LEN]
+            .try_into()
+            .expect("truncated packet hash length is fixed")
+    }
+
+    fn find_channel_receipt(
+        &self,
+        link_id: &LinkId,
+        sequence: u16,
+    ) -> Option<([u8; TRUNCATED_HASH_LEN], ChannelReceipt)> {
+        self.channel_receipts
+            .iter()
+            .find(|(_, receipt)| receipt.link_id == *link_id && receipt.sequence == sequence)
+            .map(|(key, receipt)| (*key, receipt.clone()))
+    }
+
+    /// Admit a new channel receipt without replacing a colliding entry.
+    fn admit_channel_receipt(&mut self, receipt: ChannelReceipt) -> Result<(), SendError> {
+        let key = Self::channel_receipt_key(&receipt.packet_hash);
+        if self.channel_receipts.contains_key(&key) {
+            return Err(SendError::ReceiptHashAlreadyTracked);
+        }
+        match self.channel_receipts.insert(key, receipt) {
+            Ok(None) => Ok(()),
+            Ok(Some(previous)) => {
+                let restored = self.channel_receipts.insert(key, previous);
+                debug_assert!(matches!(restored, Ok(Some(_))));
+                Err(SendError::ReceiptHashAlreadyTracked)
+            }
+            Err(_) => Err(SendError::ReceiptTableFull),
+        }
+    }
+
+    /// Atomically replace the exact prior attempt for a channel sequence.
+    ///
+    /// Removing the old entry first makes this capacity-neutral for bounded
+    /// maps. Any unexpected insertion failure restores the old proof target.
+    fn replace_channel_receipt(
+        &mut self,
+        link_id: &LinkId,
+        sequence: u16,
+        receipt: ChannelReceipt,
+    ) -> Result<(), SendError> {
+        let Some((old_key, old_receipt)) = self.find_channel_receipt(link_id, sequence) else {
+            return self.admit_channel_receipt(receipt);
+        };
+        if old_receipt.packet_hash == receipt.packet_hash {
+            return Err(SendError::ReceiptHashAlreadyTracked);
+        }
+
+        let new_key = Self::channel_receipt_key(&receipt.packet_hash);
+        if new_key == old_key {
+            return match self.channel_receipts.insert(new_key, receipt) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => {
+                    // The map changed despite exclusive access. Restore the
+                    // prior proof target and fail closed.
+                    let restored = self.channel_receipts.insert(old_key, old_receipt);
+                    debug_assert!(matches!(restored, Ok(Some(_))));
+                    Err(SendError::ReceiptHashAlreadyTracked)
+                }
+                Err(_) => Err(SendError::ReceiptTableFull),
+            };
+        }
+        if self.channel_receipts.contains_key(&new_key) {
+            return Err(SendError::ReceiptHashAlreadyTracked);
+        }
+
+        let removed = self
+            .channel_receipts
+            .remove(&old_key)
+            .expect("located channel receipt must remain under exclusive access");
+        match self.channel_receipts.insert(new_key, receipt) {
+            Ok(None) => Ok(()),
+            Ok(Some(displaced)) => {
+                self.channel_receipts.remove(&new_key);
+                let restored_displaced = self.channel_receipts.insert(new_key, displaced);
+                debug_assert!(matches!(restored_displaced, Ok(None)));
+                let restored_old = self.channel_receipts.insert(old_key, removed);
+                debug_assert!(matches!(restored_old, Ok(None)));
+                Err(SendError::ReceiptHashAlreadyTracked)
+            }
+            Err(_) => {
+                let restored = self.channel_receipts.insert(old_key, removed);
+                debug_assert!(matches!(restored, Ok(None)));
+                Err(SendError::ReceiptTableFull)
+            }
+        }
+    }
+
     /// Send a channel message on a link.
     ///
-    /// Lazy-inits the channel, enqueues the message, encrypts it, and returns
-    /// the raw packet bytes. Returns `Err` if the link is not active or the
-    /// channel window is full.
+    /// Packet output and receipt admission are preflighted before encryption.
+    /// The channel sequence/window and Link timestamp commit only after the
+    /// exact packet receipt has been retained.
     pub fn send_channel_message<R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
@@ -643,36 +830,87 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         now: u64,
         rng: &mut R,
     ) -> Result<alloc::vec::Vec<u8>, SendError> {
-        let link = self.links.get_mut(link_id).ok_or(SendError::LinkNotFound)?;
+        let link = self.links.get(link_id).ok_or(SendError::LinkNotFound)?;
         if !link.is_active() {
             return Err(SendError::LinkNotActive);
         }
-        let channel = link
-            .channel
-            .get_or_insert_with(crate::channel::Channel::new);
-        let sequence = channel.next_tx_sequence();
-        let envelope_bytes = channel
-            .send(message_type, payload)
-            .ok_or(SendError::WindowFull)?;
-        channel.mark_sent(now);
-        link.last_outbound = now;
-        let raw = Self::build_link_packet(link, link_id, &envelope_bytes, CONTEXT_CHANNEL, rng)?;
-
-        // Register channel receipt: parse the built packet to get its hash
-        if let Ok(parsed) = Packet::parse(&raw) {
-            let pkt_hash = parsed.compute_hash();
-            let mut trunc = [0u8; TRUNCATED_HASH_LEN];
-            trunc.copy_from_slice(&pkt_hash[..TRUNCATED_HASH_LEN]);
-            let _ = self.channel_receipts.insert(
-                trunc,
-                ChannelReceipt {
-                    link_id: *link_id,
-                    packet_hash: pkt_hash,
-                    sequence,
-                    sent_at: now,
-                },
-            );
+        if crate::channel::ENVELOPE_HEADER_SIZE
+            .checked_add(payload.len())
+            .filter(|length| *length <= LINK_MDU)
+            .is_none()
+        {
+            return Err(SendError::PacketBuild(rete_core::Error::PayloadTooLarge));
         }
+        if self.channel_receipts.is_full() {
+            return Err(SendError::ReceiptTableFull);
+        }
+
+        let mut new_channel = None;
+        let prepared = match self
+            .links
+            .get_mut(link_id)
+            .expect("validated channel Link must remain under exclusive access")
+            .channel
+            .as_mut()
+        {
+            Some(channel) => {
+                if !channel.reserve_send_slot() {
+                    return Err(SendError::OutputAllocationFailed);
+                }
+                channel
+                    .prepare_send(message_type, payload)
+                    .ok_or(SendError::WindowFull)?
+            }
+            None => {
+                let mut channel = crate::channel::Channel::new();
+                if !channel.reserve_send_slot() {
+                    return Err(SendError::OutputAllocationFailed);
+                }
+                let prepared = channel
+                    .prepare_send(message_type, payload)
+                    .ok_or(SendError::WindowFull)?;
+                new_channel = Some(channel);
+                prepared
+            }
+        };
+        let sequence = prepared.sequence();
+        let link = self
+            .links
+            .get(link_id)
+            .expect("prepared channel Link must remain under exclusive access");
+        let raw = Self::build_link_packet(link, link_id, prepared.packed(), CONTEXT_CHANNEL, rng)?;
+        let packet_hash = Packet::parse(&raw)
+            .map_err(SendError::PacketBuild)?
+            .compute_hash();
+
+        // No channel state can change while this method exclusively owns the
+        // transport, but validate the immutable token at the transaction edge.
+        let current = self
+            .links
+            .get(link_id)
+            .and_then(|link| link.channel.as_ref())
+            .or(new_channel.as_ref())
+            .is_some_and(|channel| channel.send_is_current(&prepared));
+        debug_assert!(current);
+        self.admit_channel_receipt(ChannelReceipt {
+            link_id: *link_id,
+            packet_hash,
+            sequence,
+            sent_at: now,
+        })?;
+
+        let link = self
+            .links
+            .get_mut(link_id)
+            .expect("channel Link must remain under exclusive access");
+        if let Some(channel) = new_channel {
+            debug_assert!(link.channel.is_none());
+            link.channel = Some(channel);
+        }
+        let channel = link.channel.as_mut().expect("prepared channel must be retained");
+        debug_assert!(channel.send_is_current(&prepared));
+        let _ = channel.commit_send(prepared, Some(now));
+        link.last_outbound = now;
 
         Ok(raw)
     }
@@ -681,53 +919,158 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     // Channel retransmission
     // -----------------------------------------------------------------------
 
-    /// Build retransmit packets for all channels that have timed-out messages.
-    ///
-    /// Also checks for channel teardown (max retries exceeded) and closes
-    /// the associated link.
+    /// Discover channel retries and terminal teardowns without mutating Link,
+    /// channel, receipt, timestamp, or entropy state.
+    pub fn pending_channel_maintenance(&self, now: u64) -> alloc::vec::Vec<ChannelMaintenanceAction> {
+        let mut actions = alloc::vec::Vec::new();
+        for (link_id, link) in self.links.iter() {
+            if !link.is_active() {
+                continue;
+            }
+            let Some(channel) = link.channel.as_ref() else {
+                continue;
+            };
+            match channel.pending_maintenance(now) {
+                Some(ChannelMaintenance::Retransmit(retries)) => {
+                    actions.extend(retries.into_iter().map(|retry| {
+                        ChannelMaintenanceAction::Retransmit(PendingChannelRetry {
+                            link_id: *link_id,
+                            link_session: LinkSessionFingerprint::of(link),
+                            retry,
+                        })
+                    }));
+                }
+                Some(ChannelMaintenance::Teardown) => {
+                    actions.push(ChannelMaintenanceAction::Teardown(PendingChannelTeardown {
+                        link_id: *link_id,
+                        link_session: LinkSessionFingerprint::of(link),
+                        discovered_at: now,
+                    }));
+                }
+                None => {}
+            }
+        }
+        actions
+    }
+
+    /// Commit one fresh-ciphertext channel retry and atomically move its proof
+    /// target from the previous packet hash to the new packet hash.
+    pub fn retry_channel_message<R: RngCore + CryptoRng>(
+        &mut self,
+        pending: PendingChannelRetry,
+        now: u64,
+        shrink_window: bool,
+        rng: &mut R,
+    ) -> Result<alloc::vec::Vec<u8>, SendError> {
+        let PendingChannelRetry {
+            link_id,
+            link_session,
+            retry,
+        } = pending;
+        let link = self.links.get(&link_id).ok_or(SendError::LinkNotFound)?;
+        if !link.is_active() {
+            return Err(SendError::LinkNotActive);
+        }
+        if LinkSessionFingerprint::of(link) != link_session {
+            return Err(SendError::PacketBuild(rete_core::Error::InvalidArgument(
+                "stale channel retry Link session",
+            )));
+        }
+        let channel = link.channel.as_ref().ok_or(SendError::LinkNotActive)?;
+        if !channel.retry_is_current(&retry) {
+            return Err(SendError::PacketBuild(rete_core::Error::InvalidArgument(
+                "stale channel retry",
+            )));
+        }
+        let sequence = retry.sequence();
+        let old_receipt = self.find_channel_receipt(&link_id, sequence);
+        if old_receipt.is_none() && self.channel_receipts.is_full() {
+            return Err(SendError::ReceiptTableFull);
+        }
+
+        let raw = Self::build_link_packet(
+            link,
+            &link_id,
+            retry.packed(),
+            CONTEXT_CHANNEL,
+            rng,
+        )?;
+        let packet_hash = Packet::parse(&raw)
+            .map_err(SendError::PacketBuild)?
+            .compute_hash();
+        self.replace_channel_receipt(
+            &link_id,
+            sequence,
+            ChannelReceipt {
+                link_id,
+                packet_hash,
+                sequence,
+                sent_at: now,
+            },
+        )?;
+
+        let link = self
+            .links
+            .get_mut(&link_id)
+            .expect("retry Link must remain under exclusive access");
+        let channel = link
+            .channel
+            .as_mut()
+            .expect("retry token must retain its channel");
+        debug_assert!(channel.retry_is_current(&retry));
+        let _ = channel.commit_retry(retry, now, shrink_window);
+        link.last_outbound = now;
+        Ok(raw)
+    }
+
+    /// Commit a previously discovered terminal channel teardown.
+    pub fn commit_channel_teardown(&mut self, pending: PendingChannelTeardown) -> bool {
+        let should_teardown = self
+            .links
+            .get(&pending.link_id)
+            .filter(|link| {
+                link.is_active() && LinkSessionFingerprint::of(link) == pending.link_session
+            })
+            .and_then(|link| link.channel.as_ref())
+            .and_then(|channel| channel.pending_maintenance(pending.discovered_at))
+            .is_some_and(|maintenance| matches!(maintenance, ChannelMaintenance::Teardown));
+        should_teardown && self.remove_owned_link(&pending.link_id).is_some()
+    }
+
+    /// Compatibility wrapper that discovers and commits all channel work
+    /// without an external routing preflight.
     pub fn pending_channel_retransmits<R: RngCore + CryptoRng>(
         &mut self,
         now: u64,
         rng: &mut R,
     ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        let actions = self.pending_channel_maintenance(now);
         let mut packets = alloc::vec::Vec::new();
-        let mut teardown_links = alloc::vec::Vec::<LinkId>::new();
-
-        let mut link_ids = alloc::vec::Vec::<LinkId>::new();
-        for (lid, l) in self.links.iter() {
-            if l.channel.is_some() && l.is_active() {
-                link_ids.push(*lid);
-            }
+        let mut retried_links = alloc::vec::Vec::<LinkId>::new();
+        if packets.try_reserve(actions.len()).is_err()
+            || retried_links.try_reserve(actions.len()).is_err()
+        {
+            return packets;
         }
-
-        for lid in link_ids {
-            let link = match self.links.get_mut(&lid) {
-                Some(l) => l,
-                None => continue,
-            };
-            let channel = match link.channel.as_mut() {
-                Some(c) => c,
-                None => continue,
-            };
-            let retransmits = channel.pending_retransmit(now);
-            if channel.teardown {
-                teardown_links.push(lid);
-                continue;
-            }
-            for envelope_bytes in retransmits {
-                if let Ok(pkt) =
-                    Self::build_link_packet(link, &lid, &envelope_bytes, CONTEXT_CHANNEL, rng)
-                {
-                    packets.push(pkt);
+        for action in actions {
+            match action {
+                ChannelMaintenanceAction::Retransmit(pending) => {
+                    let link_id = *pending.link_id();
+                    let shrink_window = !retried_links.contains(&link_id);
+                    if let Ok(packet) =
+                        self.retry_channel_message(pending, now, shrink_window, rng)
+                    {
+                        if shrink_window {
+                            retried_links.push(link_id);
+                        }
+                        packets.push(packet);
+                    }
+                }
+                ChannelMaintenanceAction::Teardown(pending) => {
+                    self.commit_channel_teardown(pending);
                 }
             }
         }
-
-        // Close links that hit max retries
-        for lid in teardown_links {
-            self.links.remove(&lid);
-        }
-
         packets
     }
 
@@ -764,5 +1107,124 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             }
         }
         packets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HeaplessStorage;
+
+    type TestTransport = Transport<HeaplessStorage<8, 4, 16, 2>>;
+
+    fn receipt(link_id: LinkId, packet_hash: [u8; 32], sequence: u16) -> ChannelReceipt {
+        ChannelReceipt {
+            link_id,
+            packet_hash,
+            sequence,
+            sent_at: 100,
+        }
+    }
+
+    #[test]
+    fn retry_receipt_rejects_identical_full_hash_without_mutation() {
+        let mut transport = TestTransport::new();
+        let link_id = LinkId::from([0x11; TRUNCATED_HASH_LEN]);
+        let packet_hash = [0x22; 32];
+        transport
+            .admit_channel_receipt(receipt(link_id, packet_hash, 7))
+            .unwrap();
+
+        assert_eq!(
+            transport.replace_channel_receipt(
+                &link_id,
+                7,
+                receipt(link_id, packet_hash, 7),
+            ),
+            Err(SendError::ReceiptHashAlreadyTracked)
+        );
+        assert_eq!(transport.channel_receipt_count(), 1);
+        assert_eq!(
+            transport
+                .find_channel_receipt(&link_id, 7)
+                .unwrap()
+                .1
+                .packet_hash,
+            packet_hash
+        );
+    }
+
+    #[test]
+    fn retry_receipt_rejects_another_receipts_truncated_hash() {
+        let mut transport = TestTransport::new();
+        let link_id = LinkId::from([0x31; TRUNCATED_HASH_LEN]);
+        let other_link = LinkId::from([0x32; TRUNCATED_HASH_LEN]);
+        let old_hash = [0x41; 32];
+        let mut other_hash = [0x52; 32];
+        other_hash[TRUNCATED_HASH_LEN..].fill(0x53);
+        transport
+            .admit_channel_receipt(receipt(link_id, old_hash, 1))
+            .unwrap();
+        transport
+            .admit_channel_receipt(receipt(other_link, other_hash, 2))
+            .unwrap();
+        let mut colliding_hash = other_hash;
+        colliding_hash[TRUNCATED_HASH_LEN..].fill(0x54);
+
+        assert_eq!(
+            transport.replace_channel_receipt(
+                &link_id,
+                1,
+                receipt(link_id, colliding_hash, 1),
+            ),
+            Err(SendError::ReceiptHashAlreadyTracked)
+        );
+        assert_eq!(transport.channel_receipt_count(), 2);
+        assert_eq!(
+            transport
+                .find_channel_receipt(&link_id, 1)
+                .unwrap()
+                .1
+                .packet_hash,
+            old_hash
+        );
+        assert_eq!(
+            transport
+                .find_channel_receipt(&other_link, 2)
+                .unwrap()
+                .1
+                .packet_hash,
+            other_hash
+        );
+    }
+
+    #[test]
+    fn retry_receipt_can_replace_in_place_at_full_capacity() {
+        let mut transport = TestTransport::new();
+        let link_id = LinkId::from([0x61; TRUNCATED_HASH_LEN]);
+        let other_link = LinkId::from([0x62; TRUNCATED_HASH_LEN]);
+        let old_hash = [0x71; 32];
+        let other_hash = [0x72; 32];
+        transport
+            .admit_channel_receipt(receipt(link_id, old_hash, 3))
+            .unwrap();
+        transport
+            .admit_channel_receipt(receipt(other_link, other_hash, 4))
+            .unwrap();
+        let mut new_hash = old_hash;
+        new_hash[TRUNCATED_HASH_LEN..].fill(0x73);
+
+        transport
+            .replace_channel_receipt(&link_id, 3, receipt(link_id, new_hash, 3))
+            .unwrap();
+        assert_eq!(transport.channel_receipt_count(), 2);
+        assert_eq!(
+            transport
+                .find_channel_receipt(&link_id, 3)
+                .unwrap()
+                .1
+                .packet_hash,
+            new_hash
+        );
     }
 }

@@ -5,6 +5,7 @@ mod link;
 mod path;
 mod receipt;
 mod resource;
+pub use link::{ChannelMaintenanceAction, PendingChannelRetry, PendingChannelTeardown};
 pub use resource::ResourceOptions;
 
 use alloc::vec::Vec;
@@ -124,7 +125,7 @@ pub enum SendError {
     LinkInterfaceUnknown,
     /// Channel send window is full (back-pressure).
     WindowFull,
-    /// The bounded DATA receipt table has no free entry.
+    /// The bounded DATA or channel receipt table has no free entry.
     ReceiptTableFull,
     /// Another outstanding receipt already uses this packet's truncated hash.
     ReceiptHashAlreadyTracked,
@@ -1738,9 +1739,13 @@ impl<S: TransportStorage> Transport<S> {
         self.links.retain(|_, link| !link.check_stale(now));
         let closed_count = prev_links - self.links.len();
 
-        // Expire stale channel receipts
-        self.channel_receipts
-            .retain(|_, cr| now.saturating_sub(cr.sent_at) <= RECEIPT_TIMEOUT);
+        // Expire stale channel receipts and reclaim receipts whose owned Link
+        // was removed by the stale-link pass above.
+        let links = &self.links;
+        self.channel_receipts.retain(|_, receipt| {
+            links.contains_key(&receipt.link_id)
+                && now.saturating_sub(receipt.sent_at) <= RECEIPT_TIMEOUT
+        });
 
         self.stats.paths_expired += expired_count as u64;
         self.stats.links_closed += closed_count as u64;

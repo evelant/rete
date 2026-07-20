@@ -61,8 +61,9 @@ pub use storage::{
 #[cfg(feature = "hosted")]
 pub use storage_std::StdStorage;
 pub use transport::{
-    AnnounceRateEntry, ForwardTarget, IngestResult, LinkTableEntry, LinkTableKind, ResourceOptions,
-    ReverseEntry, SendError, TickResult, TickSummary, Transport, TransportStats, PATH_REQUEST_DEST,
+    AnnounceRateEntry, ChannelMaintenanceAction, ForwardTarget, IngestResult, LinkTableEntry,
+    LinkTableKind, PendingChannelRetry, PendingChannelTeardown, ResourceOptions, ReverseEntry,
+    SendError, TickResult, TickSummary, Transport, TransportStats, PATH_REQUEST_DEST,
     RECEIPT_TIMEOUT, REVERSE_TIMEOUT,
 };
 

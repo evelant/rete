@@ -1126,19 +1126,19 @@ mod tests {
 
     impl RngCore for PanicRng {
         fn next_u32(&mut self) -> u32 {
-            panic!("receipt-capacity rejection consumed entropy")
+            panic!("preflight rejection consumed entropy")
         }
 
         fn next_u64(&mut self) -> u64 {
-            panic!("receipt-capacity rejection consumed entropy")
+            panic!("preflight rejection consumed entropy")
         }
 
         fn fill_bytes(&mut self, _dest: &mut [u8]) {
-            panic!("receipt-capacity rejection consumed entropy")
+            panic!("preflight rejection consumed entropy")
         }
 
         fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            panic!("receipt-capacity rejection consumed entropy")
+            panic!("preflight rejection consumed entropy")
         }
     }
 
@@ -2149,6 +2149,158 @@ mod tests {
         );
     }
 
+    #[test]
+    fn due_channel_retry_without_bound_interface_does_not_commit_attempt() {
+        let mut core = make_core(b"unbound-channel-retry");
+        let peer = Identity::from_seed(b"unbound-channel-peer").unwrap();
+        let mut rng = rand::thread_rng();
+        let destination = DestHash::from([0xA5; TRUNCATED_HASH_LEN]);
+        let (request, link_id) = core
+            .initiate_link(destination, 100, &mut rng)
+            .expect("initial Link request should build");
+        let request = Packet::parse(&request.data).unwrap();
+        let responder = rete_transport::Link::from_request(
+            link_id,
+            request.payload,
+            &mut rng,
+            100,
+        )
+        .unwrap();
+        let proof = responder.build_proof(&peer).unwrap();
+        let link = core.transport.get_link_mut(&link_id).unwrap();
+        link.validate_proof(&proof, &peer).unwrap();
+        link.activate(100);
+        assert_eq!(link.bound_interface(), None);
+
+        core.transport
+            .send_channel_message(&link_id, 0x01, b"route before retry", 200, &mut rng)
+            .unwrap();
+        let link = core.transport.get_link(&link_id).unwrap();
+        let last_outbound = link.last_outbound;
+        let window = link.channel().unwrap().window();
+        assert_eq!(core.transport.channel_receipt_count(), 1);
+
+        let outcome = core.handle_tick(216, &mut PanicRng);
+        assert!(outcome.packets.is_empty());
+        let link = core.transport.get_link(&link_id).unwrap();
+        assert_eq!(link.last_outbound, last_outbound);
+        assert_eq!(link.channel().unwrap().window(), window);
+        assert_eq!(link.channel().unwrap().pending_count(), 1);
+        assert_eq!(core.transport.channel_receipt_count(), 1);
+        assert!(matches!(
+            core.transport.pending_channel_maintenance(216).as_slice(),
+            [rete_transport::ChannelMaintenanceAction::Retransmit(_)]
+        ));
+    }
+
+    #[test]
+    fn channel_retries_replace_the_only_valid_proof_target() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let initial = init
+            .send_channel_message(&link_id, 0x01, b"lost proof", 200, &mut rng)
+            .unwrap();
+        let initial_hash = Packet::parse(&initial.data).unwrap().compute_hash();
+        let initial_receive = resp.handle_ingest(&initial.data, 200, 0, &mut rng);
+        let initial_proof = initial_receive
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+            })
+            .expect("initial channel packet must be proved")
+            .data
+            .clone();
+        assert_eq!(init.transport.channel_receipt_count(), 1);
+
+        let first_tick = init.handle_tick(216, &mut rng);
+        let first_retry = first_tick
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.context == rete_core::CONTEXT_CHANNEL)
+            })
+            .expect("first retry must be emitted");
+        let first_retry_hash = Packet::parse(&first_retry.data).unwrap().compute_hash();
+        assert_ne!(first_retry_hash, initial_hash);
+        assert_eq!(init.transport.channel_receipt_count(), 1);
+        let first_retry_receive = resp.handle_ingest(&first_retry.data, 216, 0, &mut rng);
+        assert!(
+            first_retry_receive.events.is_empty(),
+            "duplicate envelope must not be delivered twice"
+        );
+        let first_retry_proof = first_retry_receive
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+            })
+            .expect("duplicate envelope still needs a proof")
+            .data
+            .clone();
+
+        let second_tick = init.handle_tick(232, &mut rng);
+        let second_retry = second_tick
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.context == rete_core::CONTEXT_CHANNEL)
+            })
+            .expect("second retry must be emitted");
+        let second_retry_hash = Packet::parse(&second_retry.data).unwrap().compute_hash();
+        assert_ne!(second_retry_hash, initial_hash);
+        assert_ne!(second_retry_hash, first_retry_hash);
+        assert_eq!(init.transport.channel_receipt_count(), 1);
+        let second_retry_receive = resp.handle_ingest(&second_retry.data, 232, 0, &mut rng);
+        assert!(second_retry_receive.events.is_empty());
+        let second_retry_proof = second_retry_receive
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+            })
+            .expect("latest duplicate envelope must be proved")
+            .data
+            .clone();
+
+        for obsolete_proof in [&initial_proof, &first_retry_proof] {
+            let rejected = init.handle_ingest(obsolete_proof, 233, 0, &mut rng);
+            assert!(rejected.events.is_empty());
+            assert_eq!(init.transport.channel_receipt_count(), 1);
+            assert_eq!(
+                init.transport
+                    .get_link(&link_id)
+                    .unwrap()
+                    .channel()
+                    .unwrap()
+                    .pending_count(),
+                1
+            );
+        }
+
+        let delivered = init.handle_ingest(&second_retry_proof, 234, 0, &mut rng);
+        assert!(matches!(
+            delivered.events.first(),
+            Some(NodeEvent::ProofReceived { packet_hash }) if packet_hash == &second_retry_hash
+        ));
+        assert_eq!(init.transport.channel_receipt_count(), 0);
+        assert_eq!(
+            init.transport
+                .get_link(&link_id)
+                .unwrap()
+                .channel()
+                .unwrap()
+                .pending_count(),
+            0
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Phase 5: Stream convenience tests
     // -----------------------------------------------------------------------
@@ -2795,8 +2947,27 @@ mod tests {
         let outbound = init
             .send_channel_message(&link_id, 0x42, b"bounded ack", 200, &mut rng)
             .unwrap();
-        let packet_hash = Packet::parse(&outbound.data).unwrap().compute_hash();
-        let response = resp.handle_ingest(&outbound.data, 200, 0, &mut rng);
+        let initial_hash = Packet::parse(&outbound.data).unwrap().compute_hash();
+        let initial_response = resp.handle_ingest(&outbound.data, 200, 0, &mut rng);
+        assert!(initial_response.packets.iter().any(|packet| {
+            Packet::parse(&packet.data)
+                .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+        }));
+
+        // Lose the first proof, then exercise sink backpressure against the
+        // replacement receipt for a fresh-ciphertext retry.
+        let retry_tick = init.handle_tick(216, &mut rng);
+        let retry = retry_tick
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.context == rete_core::CONTEXT_CHANNEL)
+            })
+            .expect("timed-out channel packet should retry");
+        let packet_hash = Packet::parse(&retry.data).unwrap().compute_hash();
+        assert_ne!(packet_hash, initial_hash);
+        let response = resp.handle_ingest(&retry.data, 216, 0, &mut rng);
         let proof = response
             .packets
             .iter()
@@ -2826,7 +2997,7 @@ mod tests {
         assert!(matches!(
             init.handle_ingest_with_receipt_sink(
                 &proof.data,
-                201,
+                217,
                 0,
                 &mut rng,
                 &mut full_sink,
@@ -2846,7 +3017,7 @@ mod tests {
 
         let mut sink = RecordingReceiptSink::default();
         let outcome = init
-            .handle_ingest_with_receipt_sink(&proof.data, 202, 0, &mut rng, &mut sink)
+            .handle_ingest_with_receipt_sink(&proof.data, 218, 0, &mut rng, &mut sink)
             .unwrap();
         assert!(outcome.events.is_empty());
         assert!(outcome.packets.is_empty());

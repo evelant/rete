@@ -144,6 +144,71 @@ fn make_bounded_responder<const L: usize>(
     (transport, identity, dest_hash)
 }
 
+struct PanicRng;
+
+impl RngCore for PanicRng {
+    fn next_u32(&mut self) -> u32 {
+        panic!("preflight rejection consumed entropy")
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        panic!("preflight rejection consumed entropy")
+    }
+
+    fn fill_bytes(&mut self, _dest: &mut [u8]) {
+        panic!("preflight rejection consumed entropy")
+    }
+
+    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        panic!("preflight rejection consumed entropy")
+    }
+}
+
+impl rand_core::CryptoRng for PanicRng {}
+
+fn bounded_handshake<const L: usize>() -> (
+    Transport<HeaplessStorage<64, 16, 128, L>>,
+    Identity,
+    Transport<HeaplessStorage<64, 16, 128, L>>,
+    Identity,
+    LinkId,
+) {
+    let mut rng = rand::thread_rng();
+    let (mut responder, responder_identity, responder_dest) =
+        make_bounded_responder::<L>(b"bounded-responder");
+    let initiator_identity = Identity::from_seed(b"bounded-initiator").unwrap();
+    let mut initiator = Transport::<HeaplessStorage<64, 16, 128, L>>::new();
+    initiator.register_identity(
+        responder_dest,
+        responder_identity.public_key(),
+        100,
+    );
+
+    let (mut request, link_id) = initiator
+        .initiate_link(responder_dest, &initiator_identity, &mut rng, 100)
+        .unwrap();
+    let mut proof = match responder.ingest(
+        &mut request,
+        100,
+        &mut rng,
+        &responder_identity,
+    ) {
+        IngestResult::LinkRequestReceived { proof_raw, .. } => proof_raw,
+        other => panic!("expected bounded Link request, got {other:?}"),
+    };
+    assert!(matches!(
+        initiator.ingest(&mut proof, 101, &mut rng, &initiator_identity),
+        IngestResult::LinkEstablished { .. }
+    ));
+    (
+        initiator,
+        initiator_identity,
+        responder,
+        responder_identity,
+        link_id,
+    )
+}
+
 /// Full handshake between two transports. Returns (initiator, responder, link_id).
 fn full_handshake() -> (
     TestTransport,
@@ -668,10 +733,20 @@ fn linkclose_tears_down() {
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
 
+    init_t
+        .send_channel_message(&link_id, 0x01, b"local close receipt", 190, &mut rng)
+        .unwrap();
+    resp_t
+        .send_channel_message(&link_id, 0x01, b"remote close receipt", 190, &mut rng)
+        .unwrap();
+    assert_eq!(init_t.channel_receipt_count(), 1);
+    assert_eq!(resp_t.channel_receipt_count(), 1);
+
     // Initiator closes link
     let close = init_t.build_linkclose_packet(&link_id, &mut rng).unwrap();
     // Initiator's link should be removed
     assert_eq!(init_t.link_count(), 0);
+    assert_eq!(init_t.channel_receipt_count(), 0);
 
     // Responder receives close
     let mut close_buf = close;
@@ -682,6 +757,7 @@ fn linkclose_tears_down() {
         other => panic!("expected LinkClosed, got {:?}", other),
     }
     assert_eq!(resp_t.link_count(), 0);
+    assert_eq!(resp_t.channel_receipt_count(), 0);
 }
 
 #[test]
@@ -700,15 +776,27 @@ fn link_stale_in_tick() {
     let link = resp_t.get_link(&link_id).unwrap();
     assert_eq!(link.state, LinkState::Active);
     let stale_time = link.stale_time;
+    resp_t
+        .send_channel_message(
+            &link_id,
+            0x01,
+            b"stale cleanup receipt",
+            101 + stale_time,
+            &mut rng,
+        )
+        .unwrap();
+    assert_eq!(resp_t.channel_receipt_count(), 1);
 
     // Stale begins at two keepalive intervals, with five seconds to revive.
     let result = resp_t.tick(102 + stale_time);
     assert_eq!(result.closed_links, 0);
     assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
+    assert_eq!(resp_t.channel_receipt_count(), 1);
 
     let result = resp_t.tick(102 + stale_time + rete_transport::STALE_GRACE);
     assert_eq!(result.closed_links, 1);
     assert_eq!(resp_t.link_count(), 0);
+    assert_eq!(resp_t.channel_receipt_count(), 0);
 }
 
 #[test]
@@ -1286,6 +1374,30 @@ fn channel_send_receive_through_transport() {
 }
 
 #[test]
+fn oversized_channel_send_rejects_before_entropy_or_channel_state() {
+    let (mut initiator, _initiator_id, _responder, _responder_id, link_id) = full_handshake();
+    let last_outbound = initiator.get_link(&link_id).unwrap().last_outbound;
+    let oversized = vec![
+        0x55;
+        rete_transport::LINK_MDU - rete_transport::ENVELOPE_HEADER_SIZE + 1
+    ];
+
+    assert_eq!(
+        initiator.send_channel_message(
+            &link_id,
+            0x01,
+            &oversized,
+            200,
+            &mut PanicRng,
+        ),
+        Err(SendError::PacketBuild(rete_core::Error::PayloadTooLarge))
+    );
+    assert!(initiator.get_link(&link_id).unwrap().channel().is_none());
+    assert_eq!(initiator.get_link(&link_id).unwrap().last_outbound, last_outbound);
+    assert_eq!(initiator.channel_receipt_count(), 0);
+}
+
+#[test]
 fn channel_reorder_through_transport() {
     let (mut init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
     let mut rng = rand::thread_rng();
@@ -1339,9 +1451,11 @@ fn channel_retransmit_on_timeout() {
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
 
     // Send channel message from initiator (marks sent_at=200)
-    let _pkt = init_t
+    let pkt = init_t
         .send_channel_message(&link_id, 0x01, b"retry me", 200, &mut rng)
         .unwrap();
+    let initial_hash = Packet::parse(&pkt).unwrap().compute_hash();
+    assert_eq!(init_t.channel_receipt_count(), 1);
 
     // Before timeout: no retransmits
     let retx = init_t.pending_channel_retransmits(210, &mut rng);
@@ -1350,6 +1464,131 @@ fn channel_retransmit_on_timeout() {
     // After timeout (15s default)
     let retx = init_t.pending_channel_retransmits(216, &mut rng);
     assert_eq!(retx.len(), 1, "should retransmit one message");
+    let retry_hash = Packet::parse(&retx[0]).unwrap().compute_hash();
+    assert_ne!(retry_hash, initial_hash, "retry must use fresh ciphertext");
+    assert_eq!(
+        init_t.channel_receipt_count(),
+        1,
+        "retry must replace rather than append its proof receipt"
+    );
+}
+
+#[test]
+fn channel_send_at_monotonic_zero_still_retries() {
+    let (mut initiator, _initiator_id, _responder, _responder_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    initiator
+        .send_channel_message(&link_id, 0x01, b"boot-time send", 0, &mut rng)
+        .unwrap();
+    assert!(initiator
+        .pending_channel_retransmits(15, &mut rng)
+        .is_empty());
+    assert_eq!(
+        initiator
+            .pending_channel_retransmits(16, &mut rng)
+            .len(),
+        1
+    );
+    assert_eq!(initiator.channel_receipt_count(), 1);
+}
+
+#[test]
+fn identical_ciphertext_retry_is_rejected_without_advancing_channel_state() {
+    let (mut initiator, _initiator_id, _responder, _responder_id, link_id) = full_handshake();
+    let mut initial_rng = StdRng::seed_from_u64(0x5eed);
+    let initial = initiator
+        .send_channel_message(
+            &link_id,
+            0x01,
+            b"repeat deterministic IV",
+            200,
+            &mut initial_rng,
+        )
+        .unwrap();
+    let initial_hash = Packet::parse(&initial).unwrap().compute_hash();
+    let last_outbound = initiator.get_link(&link_id).unwrap().last_outbound;
+    let window = initiator
+        .get_link(&link_id)
+        .unwrap()
+        .channel()
+        .unwrap()
+        .window();
+    let pending = match initiator.pending_channel_maintenance(216).pop().unwrap() {
+        rete_transport::ChannelMaintenanceAction::Retransmit(pending) => pending,
+        other => panic!("expected retry, got {other:?}"),
+    };
+
+    // Replaying the IV stream constructs the exact same encrypted packet. It
+    // cannot become a new attempt, and the old receipt must remain authoritative.
+    let mut repeated_rng = StdRng::seed_from_u64(0x5eed);
+    assert_eq!(
+        initiator.retry_channel_message(pending, 216, true, &mut repeated_rng),
+        Err(SendError::ReceiptHashAlreadyTracked)
+    );
+    let channel = initiator.get_link(&link_id).unwrap().channel().unwrap();
+    assert_eq!(channel.pending_count(), 1);
+    assert_eq!(channel.next_tx_sequence(), 1);
+    assert_eq!(channel.window(), window);
+    assert_eq!(initiator.get_link(&link_id).unwrap().last_outbound, last_outbound);
+    assert_eq!(initiator.channel_receipt_count(), 1);
+
+    let pending = match initiator.pending_channel_maintenance(216).pop().unwrap() {
+        rete_transport::ChannelMaintenanceAction::Retransmit(pending) => pending,
+        other => panic!("failed retry should remain due, got {other:?}"),
+    };
+    let mut fresh_rng = StdRng::seed_from_u64(0x5eee);
+    let retry = initiator
+        .retry_channel_message(pending, 216, true, &mut fresh_rng)
+        .unwrap();
+    assert_ne!(Packet::parse(&retry).unwrap().compute_hash(), initial_hash);
+    assert_eq!(initiator.channel_receipt_count(), 1);
+}
+
+#[test]
+fn full_receipt_table_rejects_new_send_but_allows_retry_replacement() {
+    let (mut initiator, _initiator_identity, _responder, _responder_identity, link_id) =
+        bounded_handshake::<2>();
+    let mut rng = rand::thread_rng();
+
+    let initial_0 = initiator
+        .send_channel_message(&link_id, 0x01, b"occupy sole slot", 200, &mut rng)
+        .unwrap();
+    let initial_1 = initiator
+        .send_channel_message(&link_id, 0x01, b"occupy second slot", 200, &mut rng)
+        .unwrap();
+    let initial_hashes = [
+        Packet::parse(&initial_0).unwrap().compute_hash(),
+        Packet::parse(&initial_1).unwrap().compute_hash(),
+    ];
+    let channel = initiator.get_link(&link_id).unwrap().channel().unwrap();
+    assert_eq!(channel.pending_count(), 2);
+    assert_eq!(channel.next_tx_sequence(), 2);
+    assert_eq!(initiator.channel_receipt_count(), 2);
+    let last_outbound = initiator.get_link(&link_id).unwrap().last_outbound;
+
+    assert_eq!(
+        initiator.send_channel_message(
+            &link_id,
+            0x01,
+            b"must not mutate",
+            201,
+            &mut PanicRng,
+        ),
+        Err(SendError::ReceiptTableFull)
+    );
+    let channel = initiator.get_link(&link_id).unwrap().channel().unwrap();
+    assert_eq!(channel.pending_count(), 2);
+    assert_eq!(channel.next_tx_sequence(), 2);
+    assert_eq!(initiator.get_link(&link_id).unwrap().last_outbound, last_outbound);
+    assert_eq!(initiator.channel_receipt_count(), 2);
+
+    let retries = initiator.pending_channel_retransmits(216, &mut rng);
+    assert_eq!(retries.len(), 2);
+    for (retry, initial_hash) in retries.iter().zip(initial_hashes) {
+        assert_ne!(Packet::parse(retry).unwrap().compute_hash(), initial_hash);
+    }
+    assert_eq!(initiator.channel_receipt_count(), 2);
 }
 
 #[test]
@@ -1413,6 +1652,59 @@ fn channel_teardown_on_max_retries() {
         init_t.link_count(),
         0,
         "link should be removed after max retries"
+    );
+    assert_eq!(
+        init_t.channel_receipt_count(),
+        0,
+        "channel teardown must reclaim its proof receipt"
+    );
+}
+
+#[test]
+fn proof_after_teardown_discovery_cancels_stale_teardown_token() {
+    let (mut initiator, initiator_identity, _responder, responder_identity, link_id) =
+        full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let mut latest = initiator
+        .send_channel_message(&link_id, 0x01, b"late proof", 100, &mut rng)
+        .unwrap();
+    let mut now = 100u64;
+    for _ in 0..rete_transport::channel::MAX_RETRIES {
+        now += 16;
+        let retries = initiator.pending_channel_retransmits(now, &mut rng);
+        assert_eq!(retries.len(), 1);
+        latest = retries.into_iter().next().unwrap();
+    }
+
+    now += 16;
+    let pending = match initiator.pending_channel_maintenance(now).pop().unwrap() {
+        rete_transport::ChannelMaintenanceAction::Teardown(pending) => pending,
+        other => panic!("expected terminal channel maintenance, got {other:?}"),
+    };
+    let latest_hash = Packet::parse(&latest).unwrap().compute_hash();
+    let mut proof = TestTransport::build_link_proof_packet(
+        &responder_identity,
+        &latest_hash,
+        &link_id,
+    )
+    .unwrap();
+    assert!(matches!(
+        initiator.ingest(&mut proof, now, &mut rng, &initiator_identity),
+        IngestResult::ProofReceived { packet_hash } if packet_hash == latest_hash
+    ));
+
+    assert!(!initiator.commit_channel_teardown(pending));
+    assert_eq!(initiator.link_count(), 1);
+    assert_eq!(initiator.channel_receipt_count(), 0);
+    assert_eq!(
+        initiator
+            .get_link(&link_id)
+            .unwrap()
+            .channel()
+            .unwrap()
+            .pending_count(),
+        0
     );
 }
 

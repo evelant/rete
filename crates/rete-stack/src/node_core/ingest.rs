@@ -1009,10 +1009,42 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             }
         }
 
-        // Channel retransmissions
-        for retx in self.transport.pending_channel_retransmits(now, rng) {
-            if let Some(outbound) = self.route_owned_link_raw(retx) {
-                packets.push(outbound);
+        // Channel maintenance is discovered without mutation. Retry packet
+        // construction and receipt replacement happen only after the Link's
+        // authoritative route is known, and that route is carried directly
+        // into the outbound packet.
+        let actions = self.transport.pending_channel_maintenance(now);
+        let mut retried_links = Vec::<LinkId>::new();
+        if packets.try_reserve(actions.len()).is_err()
+            || retried_links.try_reserve(actions.len()).is_err()
+        {
+            return packets;
+        }
+        for action in actions {
+            match action {
+                rete_transport::ChannelMaintenanceAction::Retransmit(pending) => {
+                    let link_id = *pending.link_id();
+                    let Ok(routing) = self.owned_link_routing(&link_id) else {
+                        continue;
+                    };
+                    let shrink_window = !retried_links.contains(&link_id);
+                    if let Ok(data) = self.transport.retry_channel_message(
+                        pending,
+                        now,
+                        shrink_window,
+                        rng,
+                    ) {
+                        if shrink_window {
+                            retried_links.push(link_id);
+                        }
+                        packets.push(OutboundPacket { data, routing });
+                    }
+                }
+                rete_transport::ChannelMaintenanceAction::Teardown(pending) => {
+                    // Teardown emits no packet, so it does not depend on an
+                    // interface route and must still reclaim an unbound Link.
+                    self.transport.commit_channel_teardown(pending);
+                }
             }
         }
 
