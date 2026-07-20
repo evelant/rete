@@ -191,10 +191,10 @@ fn handle_event(
                 let mut echo_msg = b"echo:".to_vec();
                 echo_msg.extend_from_slice(&payload);
                 if let Ok(pkt) = core.build_data_packet(&peer, &echo_msg, rng, now) {
-                    out.push(OutboundPacket {
-                        data: pkt,
-                        routing: PacketRouting::SourceInterface,
-                    });
+                    out.push(OutboundPacket::new(
+                        pkt,
+                        PacketRouting::SourceInterface,
+                    ));
                 }
             }
         }

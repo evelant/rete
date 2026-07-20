@@ -1,11 +1,11 @@
 //! Link lifecycle, handshake, keepalives, close.
 
 use crate::channel::{ChannelMaintenance, PreparedChannelRetry};
-use crate::link::{compute_link_id, Link, LinkRole, LINK_MDU};
+use crate::link::{compute_link_id, Link, LinkRole, LinkState, LINK_MDU};
 use crate::storage::StorageMap;
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    DestHash, DestType, Identity, LinkId, PacketBuilder, PacketType, CONTEXT_CHANNEL,
+    DestHash, DestType, Identity, LinkId, MonotonicInstant, PacketBuilder, PacketType, CONTEXT_CHANNEL,
     CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_REQUEST,
     CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_HMU, CONTEXT_RESOURCE_ICL,
     CONTEXT_RESOURCE_PRF, CONTEXT_RESOURCE_RCL, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, Packet,
@@ -101,6 +101,53 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         self.links.get(link_id).and_then(Link::bound_interface)
     }
 
+    /// Correlate a bounded Link with an opaque runtime dispatch token.
+    pub fn assign_link_protocol_token(
+        &mut self,
+        link_id: &LinkId,
+        role: LinkRole,
+        token: core::num::NonZeroU64,
+    ) -> bool {
+        if self
+            .links
+            .iter()
+            .any(|(_, link)| link.outbound_protocol_token() == Some(token))
+        {
+            return false;
+        }
+        self.links.get_mut(link_id).is_some_and(|link| {
+            link.role == role && link.assign_outbound_protocol_token(token)
+        })
+    }
+
+    /// Confirm one Link request timestamp from a completed interface dispatch.
+    ///
+    /// Initiators select `started_at`; responders select `completed_at`, matching
+    /// Python's pre-LINKREQUEST and post-LRPROOF timing edges. Responders also
+    /// require the interface retained from LINKREQUEST ingress.
+    pub fn confirm_link_protocol_dispatch(
+        &mut self,
+        token: core::num::NonZeroU64,
+        interface: u8,
+        started_at: MonotonicInstant,
+        completed_at: MonotonicInstant,
+    ) -> bool {
+        if started_at > completed_at {
+            return false;
+        }
+        self.links.iter_mut().any(|(_, link)| {
+            if link.outbound_protocol_token() != Some(token) {
+                return false;
+            }
+            let selected = if link.role == LinkRole::Initiator {
+                started_at
+            } else {
+                completed_at
+            };
+            link.confirm_request_started_at(token, interface, selected)
+        })
+    }
+
     /// Number of tracked channel receipts (pending channel ACKs).
     pub fn channel_receipt_count(&self) -> usize {
         self.channel_receipts.len()
@@ -114,6 +161,17 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 .retain(|_, receipt| receipt.link_id != *link_id);
         }
         removed
+    }
+
+    /// Discard a locally owned Link that has not reached an established state.
+    ///
+    /// NodeCore uses this to roll back responder admission when its unique
+    /// outbound LRPROOF timing-token namespace is exhausted.
+    pub fn discard_unestablished_link(&mut self, link_id: &LinkId) -> bool {
+        let removable = self.links.get(link_id).is_some_and(|link| {
+            !matches!(link.state, LinkState::Active | LinkState::Stale)
+        });
+        removable && self.remove_owned_link(link_id).is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -154,6 +212,24 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         rng: &mut R,
         now: u64,
     ) -> Result<(alloc::vec::Vec<u8>, LinkId), SendError> {
+        self.initiate_link_at(
+            dest_hash,
+            identity,
+            rng,
+            now,
+            MonotonicInstant::from_secs(now),
+        )
+    }
+
+    /// Initiate a Link with an explicit high-resolution monotonic clock.
+    pub fn initiate_link_at<R: RngCore + CryptoRng>(
+        &mut self,
+        dest_hash: DestHash,
+        identity: &Identity,
+        rng: &mut R,
+        now: u64,
+        link_now: MonotonicInstant,
+    ) -> Result<(alloc::vec::Vec<u8>, LinkId), SendError> {
         // Python Link snapshots hops_to(destination) at construction. Retain
         // that value atomically with the pending Link so later path changes do
         // not alter which LRPROOF height can establish this handshake.
@@ -162,12 +238,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             .get(&dest_hash)
             .map(|path| path.hops)
             .unwrap_or(PATHFINDER_M);
-        let (mut link, request_payload) = Link::new_initiator_with_expected_hops(
+        let (mut link, request_payload) = Link::new_initiator_with_expected_hops_at(
             dest_hash,
             identity.ed25519_pub(),
             expected_hops,
             rng,
-            now,
+            link_now,
         );
 
         // Build LINKREQUEST packet.
@@ -265,6 +341,16 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         request: bool,
         now: u64,
     ) -> Result<alloc::vec::Vec<u8>, SendError> {
+        self.build_keepalive_packet_at(link_id, request, MonotonicInstant::from_secs(now))
+    }
+
+    /// Precise-clock variant of [`Self::build_keepalive_packet`].
+    pub fn build_keepalive_packet_at(
+        &mut self,
+        link_id: &LinkId,
+        request: bool,
+        now: MonotonicInstant,
+    ) -> Result<alloc::vec::Vec<u8>, SendError> {
         let link = self.links.get(link_id).ok_or(SendError::LinkNotFound)?;
         if !link.is_active() {
             return Err(SendError::LinkNotActive);
@@ -286,7 +372,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         self.links
             .get_mut(link_id)
             .expect("keepalive Link cannot disappear during synchronous construction")
-            .note_keepalive_outbound(now);
+            .note_keepalive_outbound_at(now);
         Ok(packet)
     }
 
@@ -373,7 +459,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         raw: &'a [u8],
         dest_hash: &DestHash,
         payload: &[u8],
-        now: u64,
+        link_now: MonotonicInstant,
         iface: u8,
         rng: &mut R,
         identity: &Identity,
@@ -388,7 +474,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             return IngestResult::Duplicate;
         }
 
-        let mut link = match Link::from_request(link_id, payload, rng, now) {
+        let mut link = match Link::from_request_at(link_id, payload, rng, link_now) {
             Ok(l) => l,
             Err(_) => {
                 self.stats.links_failed += 1;
@@ -498,7 +584,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         &mut self,
         link_id: &LinkId,
         proof_payload: &[u8],
-        now: u64,
+        now: MonotonicInstant,
         iface: u8,
     ) -> IngestResult<'a> {
         // Look up the initiator link
@@ -545,15 +631,14 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         // unauthenticated packet.
         link.bound_interface = Some(iface);
 
-        // Compute RTT: time since LINKREQUEST was sent (last_outbound was set at creation).
-        // With u64-second timestamps, loopback RTT rounds to 0. Use a floor of 0.001s
-        // so update_keepalive still fires (producing keepalive=5s for sub-second RTT).
-        let raw_rtt = now.saturating_sub(link.last_outbound) as f32;
-        let rtt = if raw_rtt <= 0.0 { 0.001 } else { raw_rtt };
+        // The request origin is immutable and may have been refined by a
+        // runtime dispatch confirmation. Zero is a valid loopback RTT and
+        // still produces Python's five-second keepalive floor.
+        let rtt = link.request_elapsed_seconds(now);
         link.update_keepalive(rtt);
 
         // Initiator activates after proof validation (will send LRRTT next)
-        link.activate(now);
+        link.activate_at(now);
 
         self.stats.links_established += 1;
         IngestResult::LinkEstablished { link_id: *link_id }
@@ -570,13 +655,18 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         link_id: &LinkId,
         rng: &mut R,
     ) -> IngestResult<'a> {
+        let was_established = self.links.get(link_id).is_some_and(|link| {
+            matches!(link.state, crate::link::LinkState::Active | crate::link::LinkState::Stale)
+        });
         let interface = self.links.get(link_id).and_then(Link::bound_interface);
         let close_raw = self.build_linkclose_packet(link_id, rng).ok();
         if close_raw.is_none() {
             self.remove_owned_link(link_id);
         }
         self.stats.packets_dropped_invalid += 1;
-        self.stats.links_failed += 1;
+        if !was_established {
+            self.stats.links_failed += 1;
+        }
         self.stats.links_closed += 1;
         IngestResult::LinkTeardown {
             link_id: *link_id,
@@ -590,6 +680,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         link_id: &LinkId,
         packet: &Packet<'_>,
         now: u64,
+        link_now: MonotonicInstant,
         pkt_hash: [u8; 32],
         rng: &mut R,
     ) -> IngestResult<'a> {
@@ -604,7 +695,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 Some(link) => link,
                 None => return IngestResult::Invalid,
             };
-            return match link.consume_keepalive(ciphertext, now) {
+            return match link.consume_keepalive_at(ciphertext, link_now) {
                 Some(reply) => IngestResult::Keepalive {
                     link_id: *link_id,
                     reply,
@@ -643,7 +734,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                     if !link.accepts_inbound() {
                         return IngestResult::Invalid;
                     }
-                    link.touch_inbound(now);
+                    link.touch_inbound_at(link_now);
                 }
                 return self.handle_resource_data(link_id, context, ciphertext, now, rng);
             }
@@ -661,7 +752,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 }
                 match link.decrypt(ciphertext, &mut dec_buf) {
                     Ok(n) => {
-                        link.touch_inbound(now);
+                        link.touch_inbound_at(link_now);
                         n
                     }
                     Err(_) => {
@@ -692,19 +783,21 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
 
         match context {
             CONTEXT_LRRTT => {
-                // Rete intentionally consumes LRRTT only for a pending
-                // responder. Python also reprocesses it on Active responders,
-                // but exact parity there requires an immutable request_time;
-                // Rete's last_outbound changes after activation. Decrypt and
-                // decode the complete first MessagePack object before changing
-                // any Link lifecycle state. Python's unpackb() deliberately
-                // leaves trailing bytes unread, so no exact-length check is
-                // applied.
+                // Python accepts fresh authenticated LRRTT on responder Links
+                // in Handshake, Active and Stale. Decrypt and decode the first
+                // MessagePack object before changing lifecycle or liveness;
+                // this intentionally retains Rete's pre-auth hardening.
                 if link.role != LinkRole::Responder
-                    || link.state != crate::link::LinkState::Handshake
+                    || !matches!(
+                        link.state,
+                        crate::link::LinkState::Handshake
+                            | crate::link::LinkState::Active
+                            | crate::link::LinkState::Stale
+                    )
                 {
                     return IngestResult::Invalid;
                 }
+                let first_activation = link.state == crate::link::LinkState::Handshake;
                 let mut pos = 0;
                 let peer_rtt = match rete_core::msgpack::read_float64(
                     &dec_buf[..dec_len],
@@ -717,12 +810,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 // Python computes max(measured_rtt, peer_rtt). Express it as
                 // the comparison Python's max() performs so a peer NaN does
                 // not replace a finite local measurement.
-                let measured_rtt = now.saturating_sub(link.last_outbound) as f64;
-                let measured_rtt = if measured_rtt <= 0.0 {
-                    0.001
-                } else {
-                    measured_rtt
-                };
+                let measured_rtt = link.request_elapsed_seconds(link_now);
                 let rtt = if peer_rtt > measured_rtt {
                     peer_rtt
                 } else {
@@ -731,10 +819,14 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
 
                 // Only authenticated, numeric LRRTT reaches lifecycle mutation.
                 link.set_expected_hops(hops);
-                link.update_keepalive(rtt as f32);
-                link.activate(now);
-                self.stats.links_established += 1;
-                IngestResult::LinkEstablished { link_id: *link_id }
+                link.update_keepalive(rtt);
+                link.activate_at(link_now);
+                if first_activation {
+                    self.stats.links_established += 1;
+                    IngestResult::LinkEstablished { link_id: *link_id }
+                } else {
+                    IngestResult::LinkRttUpdated { link_id: *link_id }
+                }
             }
             CONTEXT_LINKCLOSE => {
                 let lid = *link_id;
@@ -750,7 +842,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
-                link.touch_inbound(now);
+                link.touch_inbound_at(link_now);
                 // Lazy-init channel
                 let channel = link
                     .channel
@@ -777,7 +869,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
-                link.touch_inbound(now);
+                link.touch_inbound_at(link_now);
                 match crate::request::parse_request(&dec_buf[..dec_len]) {
                     Ok((ts, rq_path_hash, data)) => {
                         // Python RNS uses the packet's truncated hash as request_id
@@ -798,7 +890,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
-                link.touch_inbound(now);
+                link.touch_inbound_at(link_now);
                 match crate::request::parse_response(&dec_buf[..dec_len]) {
                     Ok((req_id, data)) => IngestResult::ResponseReceived {
                         link_id: *link_id,
@@ -813,7 +905,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
-                link.touch_inbound(now);
+                link.touch_inbound_at(link_now);
                 IngestResult::LinkData {
                     link_id: *link_id,
                     data: dec_buf[..dec_len].to_vec(),
@@ -1011,7 +1103,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         let channel = link.channel.as_mut().expect("prepared channel must be retained");
         debug_assert!(channel.send_is_current(&prepared));
         let _ = channel.commit_send(prepared, Some(now));
-        link.last_outbound = now;
+        link.note_outbound(now);
 
         Ok(raw)
     }
@@ -1120,7 +1212,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             .expect("retry token must retain its channel");
         debug_assert!(channel.retry_is_current(&retry));
         let _ = channel.commit_retry(retry, now, shrink_window);
-        link.last_outbound = now;
+        link.note_outbound(now);
         Ok(raw)
     }
 
@@ -1185,9 +1277,17 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// routing can therefore preflight an authoritative route before packet
     /// construction commits the keepalive timestamp.
     pub fn pending_keepalive_link_ids(&self, now: u64) -> alloc::vec::Vec<LinkId> {
+        self.pending_keepalive_link_ids_at(MonotonicInstant::from_secs(now))
+    }
+
+    /// Precise-clock variant of [`Self::pending_keepalive_link_ids`].
+    pub fn pending_keepalive_link_ids_at(
+        &self,
+        now: MonotonicInstant,
+    ) -> alloc::vec::Vec<LinkId> {
         self.links
             .iter()
-            .filter_map(|(link_id, link)| link.needs_keepalive(now).then_some(*link_id))
+            .filter_map(|(link_id, link)| link.needs_keepalive_at(now).then_some(*link_id))
             .collect()
     }
 
@@ -1198,12 +1298,21 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     pub fn build_pending_keepalives<R: RngCore + CryptoRng>(
         &mut self,
         now: u64,
+        rng: &mut R,
+    ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+        self.build_pending_keepalives_at(MonotonicInstant::from_secs(now), rng)
+    }
+
+    /// Precise-clock variant of [`Self::build_pending_keepalives`].
+    pub fn build_pending_keepalives_at<R: RngCore + CryptoRng>(
+        &mut self,
+        now: MonotonicInstant,
         _rng: &mut R,
     ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-        let need_ka = self.pending_keepalive_link_ids(now);
+        let need_ka = self.pending_keepalive_link_ids_at(now);
         let mut packets = alloc::vec::Vec::new();
         for lid in need_ka {
-            if let Ok(pkt) = self.build_keepalive_packet(&lid, true, now) {
+            if let Ok(pkt) = self.build_keepalive_packet_at(&lid, true, now) {
                 packets.push(pkt);
             }
         }

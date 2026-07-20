@@ -4,14 +4,15 @@
 //! edge cases (stale, invalid proof, duplicate request, etc.).
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
+use core::num::NonZeroU64;
 use rete_core::{
-    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketBuilder,
-    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
-    CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
+    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, MonotonicDuration,
+    Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF,
+    CONTEXT_LRRTT, CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
-    compute_link_id, HeaplessStorage, IngestResult, Link, LinkState, LinkTableKind, Path,
-    SendError, Transport,
+    compute_link_id, HeaplessStorage, IngestResult, Link, LinkRole, LinkState, LinkTableKind,
+    Path, SendError, Transport,
 };
 
 type TestTransport = Transport<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
@@ -277,6 +278,310 @@ fn full_handshake() -> (
     }
 
     (init_t, init_id, resp_t2, resp_id2, init_link_id)
+}
+
+#[test]
+fn precise_lrrtt_lifecycle_uses_confirmed_edges_and_updates_once() {
+    let mut rng = rand::thread_rng();
+    let (mut responder, responder_id, responder_dest) =
+        make_responder(b"precise-lrrtt-responder");
+    let initiator_id = Identity::from_seed(b"precise-lrrtt-initiator").unwrap();
+    let mut initiator = TestTransport::new();
+    initiator.register_identity(responder_dest, responder_id.public_key(), 10);
+
+    let provisional_request = rete_core::MonotonicInstant::from_micros(10_000_000);
+    let (mut request, link_id) = initiator
+        .initiate_link_at(
+            responder_dest,
+            &initiator_id,
+            &mut rng,
+            10,
+            provisional_request,
+        )
+        .unwrap();
+    let initiator_token = NonZeroU64::new(1).unwrap();
+    assert!(initiator.assign_link_protocol_token(
+        &link_id,
+        LinkRole::Initiator,
+        initiator_token,
+    ));
+    let request_started = rete_core::MonotonicInstant::from_micros(10_125_000);
+    assert!(initiator.confirm_link_protocol_dispatch(
+        initiator_token,
+        7,
+        request_started,
+        rete_core::MonotonicInstant::from_micros(10_150_000),
+    ));
+    let initiator_link = initiator.get_link(&link_id).unwrap();
+    assert_eq!(initiator_link.request_started_at(), request_started);
+    assert!(initiator_link.request_time_confirmed());
+    assert_eq!(initiator_link.request_dispatch_interface(), Some(7));
+    assert!(!initiator.confirm_link_protocol_dispatch(
+        initiator_token,
+        7,
+        request_started,
+        rete_core::MonotonicInstant::from_micros(10_150_000),
+    ));
+
+    let request_received = rete_core::MonotonicInstant::from_micros(10_250_000);
+    let mut proof = match responder.ingest_on_at(
+        &mut request,
+        10,
+        request_received,
+        7,
+        &mut rng,
+        &responder_id,
+    ) {
+        IngestResult::LinkRequestReceived {
+            link_id: observed,
+            proof_raw,
+        } => {
+            assert_eq!(observed, link_id);
+            proof_raw
+        }
+        other => panic!("expected responder request admission, got {other:?}"),
+    };
+    assert_eq!(responder.stats().links_established, 0);
+
+    let responder_token = NonZeroU64::new(2).unwrap();
+    assert!(responder.assign_link_protocol_token(
+        &link_id,
+        LinkRole::Responder,
+        responder_token,
+    ));
+    let proof_started = rete_core::MonotonicInstant::from_micros(10_300_000);
+    let proof_completed = rete_core::MonotonicInstant::from_micros(10_375_000);
+    assert!(!responder.confirm_link_protocol_dispatch(
+        responder_token,
+        8,
+        proof_started,
+        proof_completed,
+    ));
+    assert!(!responder.get_link(&link_id).unwrap().request_time_confirmed());
+    assert!(responder.confirm_link_protocol_dispatch(
+        responder_token,
+        7,
+        proof_started,
+        proof_completed,
+    ));
+    let responder_link = responder.get_link(&link_id).unwrap();
+    assert_eq!(responder_link.request_started_at(), proof_completed);
+    assert_eq!(responder_link.request_dispatch_interface(), Some(7));
+
+    let proof_received = rete_core::MonotonicInstant::from_micros(10_625_000);
+    assert!(matches!(
+        initiator.ingest_on_at(
+            &mut proof,
+            10,
+            proof_received,
+            7,
+            &mut rng,
+            &initiator_id,
+        ),
+        IngestResult::LinkEstablished { link_id: observed } if observed == link_id
+    ));
+    assert_eq!(initiator.get_link(&link_id).unwrap().rtt.to_bits(), 0.5f64.to_bits());
+
+    let first_lrrtt = initiator
+        .build_lrrtt_packet_for_rtt(&link_id, 0.5, &mut rng)
+        .unwrap();
+    let first_received = rete_core::MonotonicInstant::from_micros(10_875_000);
+    let mut first_buf = first_lrrtt.clone();
+    assert!(matches!(
+        responder.ingest_on_at(
+            &mut first_buf,
+            10,
+            first_received,
+            7,
+            &mut rng,
+            &responder_id,
+        ),
+        IngestResult::LinkEstablished { link_id: observed } if observed == link_id
+    ));
+    let immutable_request_origin = responder.get_link(&link_id).unwrap().request_started_at();
+    assert_eq!(immutable_request_origin, proof_completed);
+    assert_eq!(responder.get_link(&link_id).unwrap().rtt.to_bits(), 0.5f64.to_bits());
+    assert_eq!(responder.stats().links_established, 1);
+
+    // Exact ciphertext replay remains a dedup outcome and emits no RTT update.
+    let mut exact_replay = first_lrrtt;
+    assert!(matches!(
+        responder.ingest_on_at(
+            &mut exact_replay,
+            11,
+            rete_core::MonotonicInstant::from_micros(11_000_000),
+            7,
+            &mut rng,
+            &responder_id,
+        ),
+        IngestResult::Duplicate
+    ));
+    assert_eq!(responder.stats().links_established, 1);
+
+    // Fresh ciphertext reuses the immutable proof-dispatch origin.
+    let mut fresh_repeat = initiator
+        .build_lrrtt_packet_for_rtt(&link_id, 0.5, &mut rng)
+        .unwrap();
+    let repeat_received = rete_core::MonotonicInstant::from_micros(11_625_000);
+    assert!(matches!(
+        responder.ingest_on_at(
+            &mut fresh_repeat,
+            11,
+            repeat_received,
+            7,
+            &mut rng,
+            &responder_id,
+        ),
+        IngestResult::LinkRttUpdated { link_id: observed } if observed == link_id
+    ));
+    let responder_link = responder.get_link(&link_id).unwrap();
+    assert_eq!(responder_link.request_started_at(), immutable_request_origin);
+    assert_eq!(responder_link.rtt.to_bits(), 1.25f64.to_bits());
+    assert_eq!(responder_link.last_inbound, repeat_received);
+    assert_eq!(responder.stats().links_established, 1);
+
+    // A fresh LRRTT also revives Stale and still does not establish twice.
+    let stale_at = responder_link.last_inbound + responder_link.stale_time;
+    assert_eq!(responder.tick_at(stale_at.as_secs(), stale_at).closed_links, 0);
+    assert_eq!(responder.get_link(&link_id).unwrap().state, LinkState::Stale);
+    let mut stale_repeat = initiator
+        .build_lrrtt_packet_for_rtt(&link_id, 0.5, &mut rng)
+        .unwrap();
+    let revived_at = stale_at + MonotonicDuration::from_micros(250_000);
+    assert!(matches!(
+        responder.ingest_on_at(
+            &mut stale_repeat,
+            revived_at.as_secs(),
+            revived_at,
+            7,
+            &mut rng,
+            &responder_id,
+        ),
+        IngestResult::LinkRttUpdated { link_id: observed } if observed == link_id
+    ));
+    let revived = responder.get_link(&link_id).unwrap();
+    assert_eq!(revived.state, LinkState::Active);
+    assert_eq!(revived.request_started_at(), immutable_request_origin);
+    assert_eq!(responder.stats().links_established, 1);
+}
+
+#[test]
+fn unconfirmed_protocol_edges_use_provisional_time_and_cannot_confirm_after_activation() {
+    let mut rng = rand::thread_rng();
+    let (mut responder, responder_id, responder_dest) =
+        make_responder(b"provisional-lrrtt-responder");
+    let initiator_id = Identity::from_seed(b"provisional-lrrtt-initiator").unwrap();
+    let mut initiator = TestTransport::new();
+    initiator.register_identity(responder_dest, responder_id.public_key(), 20);
+
+    let provisional = rete_core::MonotonicInstant::from_micros(20_125_000);
+    let (mut request, link_id) = initiator
+        .initiate_link_at(
+            responder_dest,
+            &initiator_id,
+            &mut rng,
+            20,
+            provisional,
+        )
+        .unwrap();
+    let initiator_token = NonZeroU64::new(10).unwrap();
+    assert!(initiator.assign_link_protocol_token(
+        &link_id,
+        LinkRole::Initiator,
+        initiator_token,
+    ));
+
+    let mut proof = match responder.ingest_on_at(
+        &mut request,
+        20,
+        provisional,
+        3,
+        &mut rng,
+        &responder_id,
+    ) {
+        IngestResult::LinkRequestReceived { proof_raw, .. } => proof_raw,
+        other => panic!("expected responder request admission, got {other:?}"),
+    };
+    let responder_token = NonZeroU64::new(11).unwrap();
+    assert!(responder.assign_link_protocol_token(
+        &link_id,
+        LinkRole::Responder,
+        responder_token,
+    ));
+
+    assert!(matches!(
+        initiator.ingest_on_at(
+            &mut proof,
+            20,
+            provisional,
+            3,
+            &mut rng,
+            &initiator_id,
+        ),
+        IngestResult::LinkEstablished { .. }
+    ));
+    assert_eq!(initiator.get_link(&link_id).unwrap().rtt, 0.0);
+    assert!(!initiator.get_link(&link_id).unwrap().request_time_confirmed());
+    assert!(!initiator.confirm_link_protocol_dispatch(
+        initiator_token,
+        3,
+        provisional,
+        provisional,
+    ));
+    assert_eq!(initiator.get_link(&link_id).unwrap().request_started_at(), provisional);
+
+    let mut lrrtt = initiator
+        .build_lrrtt_packet_for_rtt(&link_id, 0.0, &mut rng)
+        .unwrap();
+    assert!(matches!(
+        responder.ingest_on_at(
+            &mut lrrtt,
+            20,
+            provisional,
+            3,
+            &mut rng,
+            &responder_id,
+        ),
+        IngestResult::LinkEstablished { .. }
+    ));
+    let responder_link = responder.get_link(&link_id).unwrap();
+    assert_eq!(responder_link.rtt, 0.0);
+    assert_eq!(responder_link.keepalive_interval, MonotonicDuration::from_secs(5));
+    assert_eq!(responder_link.stale_time, MonotonicDuration::from_secs(10));
+    assert!(!responder_link.request_time_confirmed());
+    assert!(!responder.confirm_link_protocol_dispatch(
+        responder_token,
+        3,
+        provisional,
+        provisional,
+    ));
+    assert_eq!(responder.get_link(&link_id).unwrap().request_started_at(), provisional);
+}
+
+#[test]
+fn protocol_tokens_are_unique_within_the_bounded_link_table() {
+    let mut rng = rand::thread_rng();
+    let identity = Identity::from_seed(b"protocol-token-uniqueness").unwrap();
+    let mut transport = TestTransport::new();
+    let (_, first) = transport
+        .initiate_link(
+            DestHash::from([0xA1; TRUNCATED_HASH_LEN]),
+            &identity,
+            &mut rng,
+            1,
+        )
+        .unwrap();
+    let (_, second) = transport
+        .initiate_link(
+            DestHash::from([0xA2; TRUNCATED_HASH_LEN]),
+            &identity,
+            &mut rng,
+            1,
+        )
+        .unwrap();
+    let token = NonZeroU64::new(42).unwrap();
+    assert!(transport.assign_link_protocol_token(&first, LinkRole::Initiator, token));
+    assert!(!transport.assign_link_protocol_token(&second, LinkRole::Initiator, token));
 }
 
 // ---------------------------------------------------------------------------
@@ -562,14 +867,14 @@ fn lrrtt_accepts_python_numeric_scalars_and_uses_python_max_ordering() {
     }
 
     let cases = vec![
-        (vec![0xff], 2.0f32), // negative fixint
+        (vec![0xff], 2.0f64), // negative fixint
         (vec![0xd3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd], 2.0),
         (vec![0xc3, 0xc1, 0xff], 2.0), // bool, then ignored trailing objects
         (float32_payload(4.5), 4.5),
         (float64_payload(3.5), 3.5),
         (float64_payload(f64::NAN), 2.0),
         (float64_payload(f64::NEG_INFINITY), 2.0),
-        (float64_payload(f64::INFINITY), f32::INFINITY),
+        (float64_payload(f64::INFINITY), f64::INFINITY),
     ];
 
     for (payload, expected) in cases {
@@ -586,6 +891,10 @@ fn lrrtt_accepts_python_numeric_scalars_and_uses_python_max_ordering() {
 
         let link = resp_t.get_link(&link_id).unwrap();
         assert_eq!(link.rtt, expected, "payload {payload:02x?}");
+        if expected == f64::INFINITY {
+            assert_eq!(link.keepalive_interval, MonotonicDuration::from_secs(360));
+            assert_eq!(link.stale_time, MonotonicDuration::from_secs(720));
+        }
         assert_eq!(link.state, LinkState::Active);
         assert_eq!(link.expected_hops(), Some(1));
         assert_eq!(resp_t.stats().links_established, 1);
@@ -664,7 +973,7 @@ fn authenticated_malformed_lrrtt_tears_down_once_and_returns_encrypted_close() {
 }
 
 #[test]
-fn malformed_lrrtt_does_not_teardown_outside_pending_responder_handshake() {
+fn malformed_lrrtt_tears_down_active_responder_but_not_initiator() {
     let (mut init_t, init_id, mut resp_t, resp_id, link_id) = full_handshake();
     let mut rng = rand::thread_rng();
 
@@ -693,20 +1002,66 @@ fn malformed_lrrtt_does_not_teardown_outside_pending_responder_handshake() {
     let resp_failed = resp_t.stats().links_failed;
     let resp_closed = resp_t.stats().links_closed;
 
-    // Intentional current Rete hardening/divergence: unlike Python, an Active
-    // responder does not reprocess LRRTT. Exact repeated-LRRTT parity requires
-    // retaining immutable request_time instead of the mutable last_outbound.
+    // Authenticated malformed LRRTT is a protocol error in every responder
+    // state that accepts fresh RTT updates.
     let malformed_for_active_responder = init_t
         .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
         .unwrap();
     let mut responder_buf = malformed_for_active_responder;
     assert!(matches!(
         resp_t.ingest(&mut responder_buf, 103, &mut rng, &resp_id),
-        IngestResult::Invalid
+        IngestResult::LinkTeardown {
+            link_id: id,
+            close_raw: Some(_),
+            ..
+        } if id == link_id
     ));
-    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Active);
+    assert!(resp_t.get_link(&link_id).is_none());
     assert_eq!(resp_t.stats().links_failed, resp_failed);
-    assert_eq!(resp_t.stats().links_closed, resp_closed);
+    assert_eq!(resp_t.stats().links_closed, resp_closed + 1);
+}
+
+#[test]
+fn authenticated_malformed_lrrtt_tears_down_stale_responder_without_failure_count() {
+    let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let mut valid = init_t
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
+        .unwrap();
+    assert!(matches!(
+        resp_t.ingest(&mut valid, 102, &mut rng, &resp_id),
+        IngestResult::LinkEstablished { .. }
+    ));
+    let link = resp_t.get_link(&link_id).unwrap();
+    let stale_at = link.last_inbound + link.stale_time;
+    assert_eq!(resp_t.tick_at(stale_at.as_secs(), stale_at).closed_links, 0);
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
+
+    let failed_before = resp_t.stats().links_failed;
+    let closed_before = resp_t.stats().links_closed;
+    let mut malformed = init_t
+        .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+        .unwrap();
+    let malformed_at = stale_at + MonotonicDuration::from_micros(1);
+    assert!(matches!(
+        resp_t.ingest_on_at(
+            &mut malformed,
+            malformed_at.as_secs(),
+            malformed_at,
+            0,
+            &mut rng,
+            &resp_id,
+        ),
+        IngestResult::LinkTeardown {
+            link_id: id,
+            close_raw: Some(_),
+            ..
+        } if id == link_id
+    ));
+    assert!(resp_t.get_link(&link_id).is_none());
+    assert_eq!(resp_t.stats().links_failed, failed_before);
+    assert_eq!(resp_t.stats().links_closed, closed_before + 1);
 }
 
 #[test]
@@ -848,7 +1203,7 @@ fn keepalive_request_response() {
         resp_t.ingest(&mut repeated, 202, &mut rng, &resp_id),
         IngestResult::Keepalive { reply: true, .. }
     ));
-    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, 202);
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound.as_secs(), 202);
     assert_eq!(resp_t.stats().packets_dropped_dedup, 0);
 
     let mut repeated_response = response;
@@ -856,7 +1211,7 @@ fn keepalive_request_response() {
         init_t.ingest(&mut repeated_response, 203, &mut rng, &init_id),
         IngestResult::Keepalive { reply: false, .. }
     ));
-    assert_eq!(init_t.get_link(&link_id).unwrap().last_inbound, 203);
+    assert_eq!(init_t.get_link(&link_id).unwrap().last_inbound.as_secs(), 203);
     assert_eq!(init_t.stats().packets_dropped_dedup, 0);
 }
 
@@ -887,7 +1242,7 @@ fn keepalive_wrong_interface_does_not_poison_correct_copy() {
         resp_t.ingest_on(&mut correct, 202, 0, &mut rng, &resp_id),
         IngestResult::Keepalive { reply: true, .. }
     ));
-    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, 202);
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound.as_secs(), 202);
     assert_eq!(resp_t.stats().packets_dropped_dedup, 0);
 }
 
@@ -1009,24 +1364,27 @@ fn link_stale_in_tick() {
     let link = resp_t.get_link(&link_id).unwrap();
     assert_eq!(link.state, LinkState::Active);
     let stale_time = link.stale_time;
+    let stale_at = link.last_inbound + stale_time;
+    let grace = link.stale_grace();
     resp_t
         .send_channel_message(
             &link_id,
             0x01,
             b"stale cleanup receipt",
-            101 + stale_time,
+            stale_at.as_secs(),
             &mut rng,
         )
         .unwrap();
     assert_eq!(resp_t.channel_receipt_count(), 1);
 
     // Stale begins at two keepalive intervals, with five seconds to revive.
-    let result = resp_t.tick(102 + stale_time);
+    let result = resp_t.tick_at(stale_at.as_secs(), stale_at);
     assert_eq!(result.closed_links, 0);
     assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
     assert_eq!(resp_t.channel_receipt_count(), 1);
 
-    let result = resp_t.tick(102 + stale_time + rete_transport::STALE_GRACE);
+    let close_at = stale_at + grace;
+    let result = resp_t.tick_at(close_at.as_secs(), close_at);
     assert_eq!(result.closed_links, 1);
     assert_eq!(resp_t.link_count(), 0);
     assert_eq!(resp_t.channel_receipt_count(), 0);
@@ -1045,7 +1403,8 @@ fn authenticated_link_data_revives_stale_link_during_grace() {
 
     let last_inbound = resp_t.get_link(&link_id).unwrap().last_inbound;
     let stale_at = last_inbound + resp_t.get_link(&link_id).unwrap().stale_time;
-    let result = resp_t.tick(stale_at);
+    let grace = resp_t.get_link(&link_id).unwrap().stale_grace();
+    let result = resp_t.tick_at(stale_at.as_secs(), stale_at);
     assert_eq!(result.closed_links, 0);
     assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
 
@@ -1054,8 +1413,16 @@ fn authenticated_link_data_revives_stale_link_during_grace() {
         .build_link_data_packet(&link_id, b"corrupt", CONTEXT_NONE, &mut rng)
         .unwrap();
     *corrupt.last_mut().unwrap() ^= 0x01;
+    let corrupt_at = stale_at + MonotonicDuration::from_secs(1);
     assert!(matches!(
-        resp_t.ingest(&mut corrupt, stale_at + 1, &mut rng, &resp_id),
+        resp_t.ingest_on_at(
+            &mut corrupt,
+            corrupt_at.as_secs(),
+            corrupt_at,
+            0,
+            &mut rng,
+            &resp_id,
+        ),
         IngestResult::Invalid
     ));
     assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
@@ -1067,8 +1434,16 @@ fn authenticated_link_data_revives_stale_link_during_grace() {
     let mut valid = init_t
         .build_link_data_packet(&link_id, b"revive", CONTEXT_NONE, &mut rng)
         .unwrap();
+    let valid_at = stale_at + MonotonicDuration::from_secs(2);
     assert!(matches!(
-        resp_t.ingest(&mut valid, stale_at + 2, &mut rng, &resp_id),
+        resp_t.ingest_on_at(
+            &mut valid,
+            valid_at.as_secs(),
+            valid_at,
+            0,
+            &mut rng,
+            &resp_id,
+        ),
         IngestResult::LinkData {
             link_id: id,
             data,
@@ -1078,11 +1453,12 @@ fn authenticated_link_data_revives_stale_link_during_grace() {
     assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Active);
     assert_eq!(
         resp_t.get_link(&link_id).unwrap().last_inbound,
-        stale_at + 2
+        valid_at
     );
 
     // The old stale-transition deadline no longer applies after revival.
-    let result = resp_t.tick(stale_at + rete_transport::STALE_GRACE);
+    let old_deadline = stale_at + grace;
+    let result = resp_t.tick_at(old_deadline.as_secs(), old_deadline);
     assert_eq!(result.closed_links, 0);
     assert_eq!(resp_t.link_count(), 1);
 }
@@ -1530,17 +1906,21 @@ fn transport_keepalive_sent_when_due() {
     let activated_at = link.last_inbound;
 
     // Not due yet
-    let keepalives = init_t.build_pending_keepalives(activated_at, &mut rng);
+    let keepalives = init_t.build_pending_keepalives_at(activated_at, &mut rng);
     assert!(keepalives.is_empty(), "no keepalive should be needed yet");
 
-    let keepalives = init_t.build_pending_keepalives(activated_at + ka_interval - 1, &mut rng);
+    let keepalives = init_t.build_pending_keepalives_at(
+        activated_at + ka_interval - MonotonicDuration::from_micros(1),
+        &mut rng,
+    );
     assert!(
         keepalives.is_empty(),
         "half-interval probes are not RNS-compatible"
     );
 
     // Initiator probes after a full interval of inbound silence.
-    let keepalives = init_t.build_pending_keepalives(activated_at + ka_interval, &mut rng);
+    let keepalives =
+        init_t.build_pending_keepalives_at(activated_at + ka_interval, &mut rng);
     assert_eq!(keepalives.len(), 1, "should produce one keepalive");
 
     // Verify it's a parseable packet
@@ -1553,18 +1933,21 @@ fn transport_keepalive_sent_when_due() {
 
     // The previous probe rate-limits deterministic retries for a full interval.
     assert!(init_t
-        .build_pending_keepalives(activated_at + 2 * ka_interval - 1, &mut rng)
+        .build_pending_keepalives_at(
+            activated_at + ka_interval * 2 - MonotonicDuration::from_micros(1),
+            &mut rng,
+        )
         .is_empty());
     assert_eq!(
         init_t
-            .build_pending_keepalives(activated_at + 2 * ka_interval, &mut rng)
+            .build_pending_keepalives_at(activated_at + ka_interval * 2, &mut rng)
             .len(),
         1
     );
 
     // Responders never initiate requests, even after long silence.
     assert!(resp_t
-        .build_pending_keepalives(activated_at + 100 * ka_interval, &mut rng)
+        .build_pending_keepalives_at(activated_at + ka_interval * 100, &mut rng)
         .is_empty());
 }
 
@@ -1956,7 +2339,8 @@ fn link_handshake_sets_dynamic_keepalive() {
     let init_link = init_t.get_link(&link_id).unwrap();
     // RTT=1s → keepalive = 1.0 * (360/1.75) ≈ 205.7 → 205
     assert_ne!(
-        init_link.keepalive_interval, 360,
+        init_link.keepalive_interval,
+        MonotonicDuration::from_secs(360),
         "initiator keepalive should be updated from default 360"
     );
     assert!(init_link.rtt > 0.0, "initiator RTT should be set");

@@ -37,7 +37,7 @@ fn node_core_link_capacity_emits_no_event_or_proof() {
         let initiator = Identity::from_seed(seed).unwrap();
         let request = build_request(destination, &initiator, &mut rng);
         let outcome = core.handle_ingest(&request, 100, 0, &mut rng);
-        assert_eq!(outcome.events.len(), 1);
+        assert!(outcome.events.is_empty());
         assert_eq!(outcome.packets.len(), 1);
     }
 

@@ -110,18 +110,18 @@ fn exact_interface_dispatch_targets_named_slot_and_drops_unknown() {
                 let (tx1, mut rx1) = tokio::sync::mpsc::channel(4);
                 let slots = vec![InterfaceSlot::Direct(tx0), InterfaceSlot::Direct(tx1)];
 
-                let same_interface = [OutboundPacket {
-                    data: b"same-interface".to_vec(),
-                    routing: PacketRouting::ExactInterface(0),
-                }];
+                let same_interface = [OutboundPacket::new(
+                    b"same-interface".to_vec(),
+                    PacketRouting::ExactInterface(0),
+                )];
                 dispatch(&slots, &same_interface, 0, None).await;
                 assert_eq!(rx0.try_recv().unwrap(), b"same-interface");
                 assert!(rx1.try_recv().is_err());
 
-                let unknown_interface = [OutboundPacket {
-                    data: b"unknown-interface".to_vec(),
-                    routing: PacketRouting::ExactInterface(9),
-                }];
+                let unknown_interface = [OutboundPacket::new(
+                    b"unknown-interface".to_vec(),
+                    PacketRouting::ExactInterface(9),
+                )];
                 dispatch(&slots, &unknown_interface, 0, None).await;
                 assert!(rx0.try_recv().is_err());
                 assert!(rx1.try_recv().is_err());
@@ -141,10 +141,10 @@ fn exact_interface_same_hub_slot_excludes_only_source_client() {
                 let (source_client, mut source_rx) = hub.register().await;
                 let (_peer_client, mut peer_rx) = hub.register().await;
                 let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
-                let packets = [OutboundPacket {
-                    data: b"same-hub-relay".to_vec(),
-                    routing: PacketRouting::ExactInterface(0),
-                }];
+                let packets = [OutboundPacket::new(
+                    b"same-hub-relay".to_vec(),
+                    PacketRouting::ExactInterface(0),
+                )];
 
                 dispatch(&slots, &packets, 0, Some(source_client)).await;
 
@@ -166,10 +166,10 @@ fn exact_interface_same_hub_without_source_client_sends_selected_slot() {
                 let (_first_client, mut first_rx) = hub.register().await;
                 let (_second_client, mut second_rx) = hub.register().await;
                 let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
-                let packets = [OutboundPacket {
-                    data: b"local-exact".to_vec(),
-                    routing: PacketRouting::ExactInterface(0),
-                }];
+                let packets = [OutboundPacket::new(
+                    b"local-exact".to_vec(),
+                    PacketRouting::ExactInterface(0),
+                )];
 
                 dispatch(&slots, &packets, 0, None).await;
 
@@ -191,10 +191,10 @@ fn bound_interface_same_hub_slot_targets_source_client() {
                 let (source_client, mut source_rx) = hub.register().await;
                 let (_peer_client, mut peer_rx) = hub.register().await;
                 let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
-                let packets = [OutboundPacket {
-                    data: b"synchronous-bound".to_vec(),
-                    routing: PacketRouting::BoundInterface(0),
-                }];
+                let packets = [OutboundPacket::new(
+                    b"synchronous-bound".to_vec(),
+                    PacketRouting::BoundInterface(0),
+                )];
 
                 dispatch(&slots, &packets, 0, Some(source_client)).await;
 
@@ -216,10 +216,10 @@ fn bound_interface_hub_without_client_identity_broadcasts_instead_of_dropping() 
                 let (_first_client, mut first_rx) = hub.register().await;
                 let (_second_client, mut second_rx) = hub.register().await;
                 let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
-                let packets = [OutboundPacket {
-                    data: b"asynchronous-bound".to_vec(),
-                    routing: PacketRouting::BoundInterface(0),
-                }];
+                let packets = [OutboundPacket::new(
+                    b"asynchronous-bound".to_vec(),
+                    PacketRouting::BoundInterface(0),
+                )];
 
                 dispatch(&slots, &packets, 0, None).await;
 

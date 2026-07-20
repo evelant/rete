@@ -158,6 +158,13 @@ pub enum NodeEvent {
         /// The link_id.
         link_id: LinkId,
     },
+    /// A fresh authenticated LRRTT updated an already-established Link.
+    LinkRttUpdated {
+        /// The link_id.
+        link_id: LinkId,
+        /// Updated round-trip time in seconds.
+        rtt: f64,
+    },
     /// Decrypted data received on an active link.
     LinkData {
         /// The link_id.

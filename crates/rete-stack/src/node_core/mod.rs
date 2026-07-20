@@ -147,6 +147,44 @@ pub enum PacketRouting {
     All,
 }
 
+/// Opaque correlation token for an outbound protocol timing edge.
+///
+/// Tokens are carried by LINKREQUEST and LRPROOF packets produced by NodeCore.
+/// Runtimes copy the token before dispatch and return it with a bounded dispatch
+/// interval; only NodeCore can interpret its contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundProtocolToken(core::num::NonZeroU64);
+
+/// Monotonic interval bounding one outbound interface dispatch operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundDispatchInterval {
+    started_at: rete_core::MonotonicInstant,
+    completed_at: rete_core::MonotonicInstant,
+}
+
+impl OutboundDispatchInterval {
+    /// Construct an ordered dispatch interval.
+    pub fn new(
+        started_at: rete_core::MonotonicInstant,
+        completed_at: rete_core::MonotonicInstant,
+    ) -> Option<Self> {
+        (started_at <= completed_at).then_some(Self {
+            started_at,
+            completed_at,
+        })
+    }
+
+    /// Beginning of the dispatch operation.
+    pub const fn started_at(self) -> rete_core::MonotonicInstant {
+        self.started_at
+    }
+
+    /// Completion of the dispatch API/egress-handoff operation.
+    pub const fn completed_at(self) -> rete_core::MonotonicInstant {
+        self.completed_at
+    }
+}
+
 /// A packet to be sent, with routing instructions.
 #[derive(Debug, Clone)]
 pub struct OutboundPacket {
@@ -154,15 +192,32 @@ pub struct OutboundPacket {
     pub data: Vec<u8>,
     /// How to route this packet.
     pub routing: PacketRouting,
+    protocol_token: Option<OutboundProtocolToken>,
 }
 
 impl OutboundPacket {
+    /// Create a packet with no lifecycle timing marker.
+    pub fn new(data: Vec<u8>, routing: PacketRouting) -> Self {
+        Self {
+            data,
+            routing,
+            protocol_token: None,
+        }
+    }
+
     /// Create a packet to be sent on all interfaces.
     pub fn broadcast(data: Vec<u8>) -> Self {
-        OutboundPacket {
-            data,
-            routing: PacketRouting::All,
-        }
+        Self::new(data, PacketRouting::All)
+    }
+
+    /// Return the opaque protocol timing token, when this packet carries one.
+    pub const fn protocol_token(&self) -> Option<OutboundProtocolToken> {
+        self.protocol_token
+    }
+
+    pub(super) fn with_protocol_token(mut self, token: OutboundProtocolToken) -> Self {
+        self.protocol_token = Some(token);
+        self
     }
 }
 
@@ -230,6 +285,16 @@ pub enum IngestRejection {
     ReverseRouteConflict {
         /// Truncated packet hash whose retained route conflicts.
         truncated_hash: [u8; TRUNCATED_HASH_LEN],
+    },
+    /// A LINKREQUEST was admitted, but no unique LRPROOF timing token remains.
+    ProtocolTokenExhausted {
+        /// Link ID discarded without sending an unconfirmable LRPROOF.
+        link_id: LinkId,
+    },
+    /// A freshly allocated token could not be attached to an admitted Link.
+    ProtocolTokenAssignmentFailed {
+        /// Link ID discarded before an unconfirmable packet could be emitted.
+        link_id: LinkId,
     },
 }
 
@@ -338,6 +403,8 @@ pub struct NodeCore<S: rete_transport::TransportStorage> {
     pub(super) resource_strategy: ResourceStrategy,
     /// Pending outbound requests awaiting responses.
     pub(super) pending_requests: Vec<request_receipt::PendingRequest>,
+    /// Next compact outbound protocol token, or `None` after permanent exhaustion.
+    next_outbound_protocol_token: Option<core::num::NonZeroU64>,
 }
 
 /// Buffer entry for a partially-received split resource.
@@ -349,6 +416,15 @@ pub(super) struct SplitRecvEntry {
 }
 
 impl<S: rete_transport::TransportStorage> NodeCore<S> {
+    fn allocate_outbound_protocol_token(&mut self) -> Option<OutboundProtocolToken> {
+        let token = self.next_outbound_protocol_token?;
+        self.next_outbound_protocol_token = token
+            .get()
+            .checked_add(1)
+            .and_then(core::num::NonZeroU64::new);
+        Some(OutboundProtocolToken(token))
+    }
+
     /// Create a new NodeCore with the given identity and destination.
     pub fn new(
         identity: Identity,
@@ -383,6 +459,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             ratchet_store: None,
             resource_strategy: ResourceStrategy::AcceptAll,
             pending_requests: Vec::new(),
+            next_outbound_protocol_token: core::num::NonZeroU64::new(1),
         })
     }
 
@@ -675,27 +752,27 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         link_id: &LinkId,
         data: Vec<u8>,
     ) -> Result<OutboundPacket, SendError> {
-        Ok(OutboundPacket {
+        Ok(OutboundPacket::new(
             data,
-            routing: self.owned_link_routing(link_id)?,
-        })
+            self.owned_link_routing(link_id)?,
+        ))
     }
 
     /// Build a keepalive only after its authoritative Link route is known.
     ///
     /// Keepalive construction commits the probe timestamp, so routing must be
     /// preflighted and carried into the infallible `OutboundPacket` formation.
-    pub(super) fn build_owned_keepalive_outbound(
+    pub(super) fn build_owned_keepalive_outbound_at(
         &mut self,
         link_id: &LinkId,
         request: bool,
-        now: u64,
+        now: rete_core::MonotonicInstant,
     ) -> Result<OutboundPacket, SendError> {
         let routing = self.owned_link_routing(link_id)?;
         let data = self
             .transport
-            .build_keepalive_packet(link_id, request, now)?;
-        Ok(OutboundPacket { data, routing })
+            .build_keepalive_packet_at(link_id, request, now)?;
+        Ok(OutboundPacket::new(data, routing))
     }
 
     /// Recover the Link ID from an internally queued Link packet and apply its
@@ -724,10 +801,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
     ///
     /// Uses `dest_type=Single` — for non-link (DATA) proofs only.
     pub(super) fn proof_outbound(&self, packet_hash: &[u8; 32]) -> Option<OutboundPacket> {
-        Transport::<S>::build_proof_packet(&self.identity, packet_hash).map(|data| OutboundPacket {
-            data,
-            routing: PacketRouting::SourceInterface,
-        })
+        Transport::<S>::build_proof_packet(&self.identity, packet_hash)
+            .map(|data| OutboundPacket::new(data, PacketRouting::SourceInterface))
     }
 
     /// Build a link-destination proof OutboundPacket for a link-related packet.
@@ -743,10 +818,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             // This synchronous proof is attached to the authoritative ingress
             // operation itself. Preserve SourceInterface provenance so callers
             // can distinguish a generated delivery proof from a relayed proof.
-            OutboundPacket {
-                data,
-                routing: PacketRouting::SourceInterface,
-            }
+            OutboundPacket::new(data, PacketRouting::SourceInterface)
         })
     }
 
@@ -761,7 +833,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let pkt =
             self.transport
                 .build_link_data_packet(link_id, data, rete_core::CONTEXT_NONE, rng)?;
-        Ok(OutboundPacket { data: pkt, routing })
+        Ok(OutboundPacket::new(pkt, routing))
     }
 
     /// Send a link.request() on an established link.
@@ -801,7 +873,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
         self.register_pending_request(req_id, *link_id, now, None);
 
-        Ok((OutboundPacket { data: pkt, routing }, req_id))
+        Ok((OutboundPacket::new(pkt, routing), req_id))
     }
 
     /// Send a large request as a resource transfer with `is_request=true`.
@@ -830,7 +902,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let mut rh = [0u8; TRUNCATED_HASH_LEN];
         rh.copy_from_slice(&resource_hash[..TRUNCATED_HASH_LEN]);
         self.register_pending_request(req_id, *link_id, now, Some(rh));
-        Ok((OutboundPacket { data: pkt, routing }, req_id))
+        Ok((OutboundPacket::new(pkt, routing), req_id))
     }
 
     /// Register a pending request for timeout tracking.
@@ -844,7 +916,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let timeout = self
             .transport
             .get_link(&link_id)
-            .map(|l| request_receipt::compute_request_timeout(l.rtt))
+            .map(|l| request_receipt::compute_request_timeout(l.rtt as f32))
             .unwrap_or(request_receipt::DEFAULT_REQUEST_TIMEOUT);
         self.pending_requests.push(request_receipt::PendingRequest {
             request_id,
@@ -888,7 +960,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             rete_core::CONTEXT_RESPONSE,
             rng,
         )?;
-        Ok(OutboundPacket { data: pkt, routing })
+        Ok(OutboundPacket::new(pkt, routing))
     }
 
     /// Get the link MDU for a given link.
@@ -936,7 +1008,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 rng,
             )
             .ok_or(SendError::ResourceLimit)?;
-        Ok(OutboundPacket { data: pkt, routing })
+        Ok(OutboundPacket::new(pkt, routing))
     }
 
     /// Start a resource transfer on a link.
@@ -963,7 +1035,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 .transport
                 .start_resource(link_id, data, data, false, rng)
                 .ok_or(SendError::ResourceLimit)?;
-            return Ok(OutboundPacket { data: pkt, routing });
+            return Ok(OutboundPacket::new(pkt, routing));
         }
 
         let compressed = self
@@ -981,7 +1053,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             .transport
             .start_resource(link_id, &send_data, data, is_compressed, rng)
             .ok_or(SendError::ResourceLimit)?;
-        Ok(OutboundPacket { data: pkt, routing })
+        Ok(OutboundPacket::new(pkt, routing))
     }
 
     /// Accept a deferred resource offer (for AcceptApp strategy).
@@ -997,7 +1069,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             return Vec::new();
         };
         match self.transport.accept_resource(link_id, resource_hash, rng) {
-            Some(pkt) => vec![OutboundPacket { data: pkt, routing }],
+            Some(pkt) => vec![OutboundPacket::new(pkt, routing)],
             None => Vec::new(),
         }
     }
@@ -1015,7 +1087,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             return Vec::new();
         };
         let packets = match self.transport.reject_resource(link_id, resource_hash, rng) {
-            Some(pkt) => vec![OutboundPacket { data: pkt, routing }],
+            Some(pkt) => vec![OutboundPacket::new(pkt, routing)],
             None => Vec::new(),
         };
         self.transport.cleanup_resources();
@@ -1045,7 +1117,10 @@ pub type HostedNodeCore = NodeCore<rete_transport::StdStorage>;
 mod tests {
     use super::*;
     use alloc::vec;
-    use rete_core::{HeaderType, Packet, PacketType, TRANSPORT_TYPE_TRANSPORT};
+    use rete_core::{
+        HeaderType, MonotonicDuration, MonotonicInstant, Packet, PacketType,
+        TRANSPORT_TYPE_TRANSPORT,
+    };
 
     type TestNodeCore = NodeCore<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
     type SmallReceiptNodeCore = NodeCore<rete_transport::HeaplessStorage<4, 4, 8, 2>>;
@@ -1738,15 +1813,9 @@ mod tests {
             "registered direct path should be retained at Link creation"
         );
 
-        // Responder ingests LINKREQUEST → emits LinkEstablished + proof
+        // Responder ingests LINKREQUEST → retains Handshake and emits proof.
         let resp_outcome = resp.handle_ingest(&outbound.data, 100, 0, &mut rng);
-        assert!(
-            matches!(
-                resp_outcome.events.first(),
-                Some(NodeEvent::LinkEstablished { .. })
-            ),
-            "responder should emit LinkEstablished"
-        );
+        assert!(resp_outcome.events.is_empty());
         assert!(
             !resp_outcome.packets.is_empty(),
             "responder should send LRPROOF"
@@ -1827,6 +1896,163 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 1: LRRTT auto-send tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn precise_receipt_sink_path_confirms_tokens_and_emits_one_shot_link_events() {
+        assert_eq!(core::mem::size_of::<OutboundProtocolToken>(), 8);
+
+        let mut rng = rand::thread_rng();
+        let mut responder = make_core(b"precise-sink-responder");
+        let mut initiator = make_core(b"precise-sink-initiator");
+        let responder_id = Identity::from_seed(b"precise-sink-responder").unwrap();
+        initiator
+            .register_peer(&responder_id, "testapp", &["aspect1"], 30)
+            .unwrap();
+        let mut initiator_sink = RecordingReceiptSink::default();
+        let mut responder_sink = RecordingReceiptSink::default();
+
+        let provisional = MonotonicInstant::from_micros(30_000_000);
+        let (request, link_id) = initiator
+            .initiate_link_at(*responder.dest_hash(), 30, provisional, &mut rng)
+            .unwrap();
+        let request_token = request.protocol_token().expect("LINKREQUEST timing token");
+        let request_started = MonotonicInstant::from_micros(30_125_000);
+        let request_interval = OutboundDispatchInterval::new(
+            request_started,
+            MonotonicInstant::from_micros(30_150_000),
+        )
+        .unwrap();
+        assert_eq!(request_interval.started_at(), request_started);
+        assert!(initiator.confirm_outbound_protocol(request_token, 4, request_interval));
+        assert!(!initiator.confirm_outbound_protocol(request_token, 4, request_interval));
+
+        let request_received = MonotonicInstant::from_micros(30_250_000);
+        let accepted = responder
+            .handle_ingest_with_receipt_sink_at(
+                &request.data,
+                30,
+                request_received,
+                4,
+                &mut rng,
+                &mut responder_sink,
+            )
+            .unwrap();
+        assert!(accepted.events.is_empty(), "LINKREQUEST is not establishment");
+        assert_eq!(responder.transport.stats().links_established, 0);
+        let proof = accepted.packets.first().expect("LRPROOF packet");
+        let proof_token = proof.protocol_token().expect("LRPROOF timing token");
+        let proof_interval = OutboundDispatchInterval::new(
+            MonotonicInstant::from_micros(30_300_000),
+            MonotonicInstant::from_micros(30_375_000),
+        )
+        .unwrap();
+        assert!(!responder.confirm_outbound_protocol(proof_token, 5, proof_interval));
+        assert!(responder.confirm_outbound_protocol(proof_token, 4, proof_interval));
+
+        let proof_received = MonotonicInstant::from_micros(30_625_000);
+        let established = initiator
+            .handle_ingest_with_receipt_sink_at(
+                &proof.data,
+                30,
+                proof_received,
+                4,
+                &mut rng,
+                &mut initiator_sink,
+            )
+            .unwrap();
+        assert!(matches!(
+            established.events.as_slice(),
+            [NodeEvent::LinkEstablished { link_id: observed }] if *observed == link_id
+        ));
+        assert_eq!(initiator.transport.get_link(&link_id).unwrap().rtt, 0.5);
+        let lrrtt = established
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_LRRTT)
+            })
+            .expect("automatic LRRTT");
+
+        let first_received = MonotonicInstant::from_micros(30_875_000);
+        let first = responder
+            .handle_ingest_with_receipt_sink_at(
+                &lrrtt.data,
+                30,
+                first_received,
+                4,
+                &mut rng,
+                &mut responder_sink,
+            )
+            .unwrap();
+        assert!(matches!(
+            first.events.as_slice(),
+            [NodeEvent::LinkEstablished { link_id: observed }] if *observed == link_id
+        ));
+        assert_eq!(responder.transport.stats().links_established, 1);
+        assert_eq!(responder.transport.get_link(&link_id).unwrap().rtt, 0.5);
+
+        let fresh = initiator
+            .transport
+            .build_lrrtt_packet_for_rtt(&link_id, 0.5, &mut rng)
+            .unwrap();
+        let repeat_received = MonotonicInstant::from_micros(31_625_000);
+        let repeat = responder
+            .handle_ingest_with_receipt_sink_at(
+                &fresh,
+                31,
+                repeat_received,
+                4,
+                &mut rng,
+                &mut responder_sink,
+            )
+            .unwrap();
+        assert!(matches!(
+            repeat.events.as_slice(),
+            [NodeEvent::LinkRttUpdated {
+                link_id: observed,
+                rtt,
+            }] if *observed == link_id && rtt.to_bits() == 1.25f64.to_bits()
+        ));
+        assert_eq!(responder.transport.stats().links_established, 1);
+    }
+
+    #[test]
+    fn protocol_token_allocator_exhausts_without_wrapping_or_link_mutation() {
+        let mut core = make_core(b"token-exhaustion");
+        let mut rng = rand::thread_rng();
+        core.next_outbound_protocol_token =
+            core::num::NonZeroU64::new(u64::MAX);
+
+        let first = core
+            .initiate_link(DestHash::from([0xA1; TRUNCATED_HASH_LEN]), 1, &mut rng)
+            .unwrap();
+        assert!(first.0.protocol_token().is_some());
+        assert!(core.next_outbound_protocol_token.is_none());
+        let retained = core.transport.link_count();
+
+        assert!(matches!(
+            core.initiate_link(DestHash::from([0xA2; TRUNCATED_HASH_LEN]), 2, &mut rng),
+            Err(SendError::ProtocolTokenExhausted)
+        ));
+        assert_eq!(core.transport.link_count(), retained);
+
+        let mut responder = make_core(b"responder-token-exhaustion");
+        let mut initiator = make_core(b"responder-token-exhaustion-peer");
+        let request = initiator
+            .initiate_link(*responder.dest_hash(), 3, &mut rng)
+            .unwrap()
+            .0;
+        responder.next_outbound_protocol_token = None;
+        let rejected = responder.handle_ingest(&request.data, 3, 6, &mut rng);
+        assert!(matches!(
+            rejected.rejection,
+            Some(IngestRejection::ProtocolTokenExhausted { .. })
+        ));
+        assert!(rejected.events.is_empty());
+        assert!(rejected.packets.is_empty());
+        assert_eq!(responder.transport.link_count(), 0);
+    }
 
     #[test]
     fn node_core_link_established_initiator_sends_lrrtt() {
@@ -2063,13 +2289,15 @@ mod tests {
         let ka_interval = init_link.keepalive_interval;
         let activated_at = init_link.last_inbound;
 
-        let early = init.handle_tick(activated_at + ka_interval - 1, &mut rng);
+        let early_at = activated_at + ka_interval - MonotonicDuration::from_micros(1);
+        let early = init.handle_tick_at(early_at.as_secs(), early_at, &mut rng);
         assert!(early.packets.iter().all(|packet| {
             Packet::parse(&packet.data)
                 .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
         }));
 
-        let request = init.handle_tick(activated_at + ka_interval, &mut rng);
+        let request_at = activated_at + ka_interval;
+        let request = init.handle_tick_at(request_at.as_secs(), request_at, &mut rng);
         let requests: Vec<_> = request
             .packets
             .iter()
@@ -2083,8 +2311,13 @@ mod tests {
         assert_eq!(requests[0].data.len(), 20);
         assert_eq!(Packet::parse(&requests[0].data).unwrap().payload, &[0xFF]);
 
-        let response =
-            resp.handle_ingest(&requests[0].data, activated_at + ka_interval, 0, &mut rng);
+        let response = resp.handle_ingest_at(
+            &requests[0].data,
+            request_at.as_secs(),
+            request_at,
+            0,
+            &mut rng,
+        );
         assert!(
             response.events.is_empty(),
             "keepalive request is not app data"
@@ -2100,9 +2333,11 @@ mod tests {
             &[0xFE]
         );
 
-        let consumed = init.handle_ingest(
+        let response_at = request_at + MonotonicDuration::from_secs(1);
+        let consumed = init.handle_ingest_at(
             &response.packets[0].data,
-            activated_at + ka_interval + 1,
+            response_at.as_secs(),
+            response_at,
             0,
             &mut rng,
         );
@@ -2115,7 +2350,8 @@ mod tests {
         // A responder does not originate an FF request at its own interval.
         let resp_link = resp.transport.get_link(&link_id).unwrap();
         let responder_due = resp_link.last_inbound + resp_link.keepalive_interval;
-        let responder_tick = resp.handle_tick(responder_due, &mut rng);
+        let responder_tick =
+            resp.handle_tick_at(responder_due.as_secs(), responder_due, &mut rng);
         assert!(responder_tick.packets.iter().all(|packet| {
             Packet::parse(&packet.data)
                 .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
@@ -2137,10 +2373,13 @@ mod tests {
             let link = core.transport.get_link_mut(&link_id).unwrap();
             link.activate(100);
             assert_eq!(link.bound_interface(), None);
-            (100 + link.keepalive_interval, link.last_keepalive)
+            (
+                MonotonicInstant::from_secs(100) + link.keepalive_interval,
+                link.last_keepalive,
+            )
         };
 
-        let outcome = core.handle_tick(due_at, &mut rng);
+        let outcome = core.handle_tick_at(due_at.as_secs(), due_at, &mut rng);
         assert!(outcome.packets.iter().all(|packet| {
             Packet::parse(&packet.data)
                 .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
@@ -2148,7 +2387,7 @@ mod tests {
 
         let link = core.transport.get_link(&link_id).unwrap();
         assert_eq!(link.last_keepalive, previous_keepalive);
-        assert!(link.needs_keepalive(due_at));
+        assert!(link.needs_keepalive_at(due_at));
     }
 
     #[test]
@@ -2160,8 +2399,11 @@ mod tests {
         let keepalive_interval = link.keepalive_interval;
         let stale_time = link.stale_time;
         let stale_at = last_inbound + stale_time;
+        let grace = link.stale_grace();
 
-        let first_probe = init.handle_tick(last_inbound + keepalive_interval, &mut rng);
+        let first_probe_at = last_inbound + keepalive_interval;
+        let first_probe =
+            init.handle_tick_at(first_probe_at.as_secs(), first_probe_at, &mut rng);
         assert!(first_probe.packets.iter().any(|packet| {
             Packet::parse(&packet.data).is_ok_and(|parsed| {
                 parsed.context == rete_core::CONTEXT_KEEPALIVE && parsed.payload == [0xFF]
@@ -2170,7 +2412,7 @@ mod tests {
 
         // prepare_tick emits the final initiator probe before tick transitions
         // the Link into the five-second Stale revival window.
-        let stale = init.handle_tick(stale_at, &mut rng);
+        let stale = init.handle_tick_at(stale_at.as_secs(), stale_at, &mut rng);
         assert_eq!(
             init.transport.get_link(&link_id).unwrap().state,
             rete_transport::LinkState::Stale
@@ -2186,12 +2428,24 @@ mod tests {
         assert_eq!(request.routing, PacketRouting::BoundInterface(0));
         assert_eq!(Packet::parse(&request.data).unwrap().payload, &[0xFF]);
 
-        let response = resp.handle_ingest(&request.data, stale_at, 0, &mut rng);
+        let response = resp.handle_ingest_at(
+            &request.data,
+            stale_at.as_secs(),
+            stale_at,
+            0,
+            &mut rng,
+        );
         assert!(response.events.is_empty());
         assert_eq!(response.packets.len(), 1);
 
-        let reply_at = stale_at + rete_transport::STALE_GRACE - 1;
-        let revived = init.handle_ingest(&response.packets[0].data, reply_at, 0, &mut rng);
+        let reply_at = stale_at + grace - MonotonicDuration::from_micros(1);
+        let revived = init.handle_ingest_at(
+            &response.packets[0].data,
+            reply_at.as_secs(),
+            reply_at,
+            0,
+            &mut rng,
+        );
         assert!(revived.events.is_empty());
         assert!(revived.packets.is_empty());
         assert_eq!(
@@ -2203,7 +2457,9 @@ mod tests {
             reply_at
         );
 
-        let after_old_deadline = init.handle_tick(stale_at + rete_transport::STALE_GRACE, &mut rng);
+        let old_deadline = stale_at + grace;
+        let after_old_deadline =
+            init.handle_tick_at(old_deadline.as_secs(), old_deadline, &mut rng);
         assert!(matches!(
             after_old_deadline.events.last(),
             Some(NodeEvent::Tick {
@@ -3632,13 +3888,7 @@ mod tests {
         // 5c. Feed the forwarded LINKREQUEST to C (arriving on iface 1 from B's direction).
         // C is the local destination, so it accepts the link and produces LRPROOF.
         let c_outcome = node_c.handle_ingest(forwarded_lr, 101, 1, &mut rng);
-        assert!(
-            matches!(
-                c_outcome.events.first(),
-                Some(NodeEvent::LinkEstablished { .. })
-            ),
-            "C should emit LinkEstablished on receiving LINKREQUEST"
-        );
+        assert!(c_outcome.events.is_empty());
         assert!(!c_outcome.packets.is_empty(), "C should produce LRPROOF");
         assert_eq!(
             node_c
@@ -4005,12 +4255,9 @@ mod tests {
         assert!(b_out.events.is_empty());
         assert_eq!(b_out.packets.len(), 1);
 
-        // A receives LINKREQUEST → emits LinkEstablished + LRPROOF
+        // A receives LINKREQUEST → retains Handshake and emits LRPROOF.
         let a_out = node_a.handle_ingest(&b_out.packets[0].data, 101, 1, &mut rng);
-        assert!(matches!(
-            a_out.events.first(),
-            Some(NodeEvent::LinkEstablished { .. })
-        ));
+        assert!(a_out.events.is_empty());
         assert!(!a_out.packets.is_empty());
 
         // B forwards LRPROOF

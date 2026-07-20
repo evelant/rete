@@ -359,6 +359,9 @@ pub fn on_node_event(event: NodeEvent) {
                 link: hex::encode(link_id),
             }.emit();
         }
+        NodeEvent::LinkRttUpdated { link_id, rtt } => {
+            tracing::debug!(link = %hex::encode(link_id), rtt, "link RTT updated");
+        }
         NodeEvent::LinkData { link_id, data, .. } => {
             let payload = match std::str::from_utf8(&data) {
                 Ok(text) => text.to_string(),

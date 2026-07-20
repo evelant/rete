@@ -6,7 +6,9 @@ use rete_transport::SendError;
 
 use crate::NodeEvent;
 
-use super::{NodeCore, OutboundPacket};
+use super::{
+    NodeCore, OutboundDispatchInterval, OutboundPacket, OutboundProtocolToken,
+};
 
 impl<S: rete_transport::TransportStorage> NodeCore<S> {
     /// Initiate a link to a destination.
@@ -18,6 +20,27 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         now: u64,
         rng: &mut R,
     ) -> Result<(OutboundPacket, LinkId), SendError> {
+        self.initiate_link_at(
+            dest_hash,
+            now,
+            rete_core::MonotonicInstant::from_secs(now),
+            rng,
+        )
+    }
+
+    /// Precise-clock variant of [`Self::initiate_link`].
+    pub fn initiate_link_at<R: RngCore + CryptoRng>(
+        &mut self,
+        dest_hash: DestHash,
+        now: u64,
+        link_now: rete_core::MonotonicInstant,
+        rng: &mut R,
+    ) -> Result<(OutboundPacket, LinkId), SendError> {
+        // Allocate before mutating Transport so exhaustion cannot strand a
+        // request that the runtime has no unique way to confirm.
+        let token = self
+            .allocate_outbound_protocol_token()
+            .ok_or(SendError::ProtocolTokenExhausted)?;
         // A learned path selects only this initial request. The Link itself is
         // deliberately left unbound until a valid LRPROOF arrives.
         let routing = self
@@ -28,8 +51,36 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             .unwrap_or(super::PacketRouting::All);
         let (raw, link_id) = self
             .transport
-            .initiate_link(dest_hash, &self.identity, rng, now)?;
-        Ok((OutboundPacket { data: raw, routing }, link_id))
+            .initiate_link_at(dest_hash, &self.identity, rng, now, link_now)?;
+        if !self.transport.assign_link_protocol_token(
+            &link_id,
+            rete_transport::LinkRole::Initiator,
+            token.0,
+        ) {
+            self.transport.discard_unestablished_link(&link_id);
+            return Err(SendError::ProtocolTokenAssignmentFailed);
+        }
+        Ok((OutboundPacket::new(raw, routing).with_protocol_token(token), link_id))
+    }
+
+    /// Confirm a protocol packet's bounded runtime dispatch interval.
+    ///
+    /// LINKREQUEST uses the interval's pre-dispatch edge. LRPROOF uses the
+    /// post-dispatch API/egress-handoff edge. The underlying Link accepts one
+    /// confirmation only while it has not activated.
+    pub fn confirm_outbound_protocol(
+        &mut self,
+        token: OutboundProtocolToken,
+        completed_interface: u8,
+        interval: OutboundDispatchInterval,
+    ) -> bool {
+        self.transport
+            .confirm_link_protocol_dispatch(
+                token.0,
+                completed_interface,
+                interval.started_at(),
+                interval.completed_at(),
+            )
     }
 
     /// Send a channel message on a link.
@@ -48,7 +99,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let raw = self
             .transport
             .send_channel_message(link_id, message_type, payload, now, rng)?;
-        Ok(OutboundPacket { data: raw, routing })
+        Ok(OutboundPacket::new(raw, routing))
     }
 
     /// Send stream data on a link via channel.
@@ -97,7 +148,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         } else {
             None
         };
-        (pkt.map(|data| OutboundPacket { data, routing }), event)
+        (pkt.map(|data| OutboundPacket::new(data, routing)), event)
     }
 
     /// Send a LINKIDENTIFY packet on an established link.
@@ -124,6 +175,6 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             rete_core::CONTEXT_LINKIDENTIFY,
             rng,
         )?;
-        Ok(OutboundPacket { data: pkt, routing })
+        Ok(OutboundPacket::new(pkt, routing))
     }
 }

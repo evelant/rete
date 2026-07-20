@@ -132,10 +132,10 @@ fn dispatch_dual_source_interface_routes_to_source_only() {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
 
-        let packets = vec![OutboundPacket {
-            data: b"test-packet".to_vec(),
-            routing: PacketRouting::SourceInterface,
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"test-packet".to_vec(),
+            PacketRouting::SourceInterface,
+        )];
 
         // source_iface = 0 → should only go to iface0
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
@@ -157,10 +157,10 @@ fn dispatch_dual_exact_interface_can_route_back_to_source_slot() {
     block_on(async {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
-        let packets = vec![OutboundPacket {
-            data: b"same-interface-relay".to_vec(),
-            routing: PacketRouting::ExactInterface(0),
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"same-interface-relay".to_vec(),
+            PacketRouting::ExactInterface(0),
+        )];
 
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
 
@@ -174,10 +174,10 @@ fn dispatch_dual_bound_interface_routes_to_bound_slot() {
     block_on(async {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
-        let packets = vec![OutboundPacket {
-            data: b"bound-link-packet".to_vec(),
-            routing: PacketRouting::BoundInterface(1),
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"bound-link-packet".to_vec(),
+            PacketRouting::BoundInterface(1),
+        )];
 
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
 
@@ -191,10 +191,10 @@ fn dispatch_dual_unknown_exact_interface_drops_packet() {
     block_on(async {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
-        let packets = vec![OutboundPacket {
-            data: b"unknown-interface".to_vec(),
-            routing: PacketRouting::ExactInterface(9),
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"unknown-interface".to_vec(),
+            PacketRouting::ExactInterface(9),
+        )];
 
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
 
@@ -207,10 +207,10 @@ fn dispatch_dual_unknown_exact_interface_drops_packet() {
 fn dispatch_single_unknown_exact_interface_drops_packet() {
     block_on(async {
         let mut iface = MockInterface::new();
-        let packets = vec![OutboundPacket {
-            data: b"unknown-interface".to_vec(),
-            routing: PacketRouting::ExactInterface(1),
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"unknown-interface".to_vec(),
+            PacketRouting::ExactInterface(1),
+        )];
 
         dispatch_single(&mut iface, &packets).await;
 
@@ -223,14 +223,14 @@ fn dispatch_single_bound_interface_zero_sends_and_unknown_drops() {
     block_on(async {
         let mut iface = MockInterface::new();
         let packets = vec![
-            OutboundPacket {
-                data: b"bound-zero".to_vec(),
-                routing: PacketRouting::BoundInterface(0),
-            },
-            OutboundPacket {
-                data: b"bound-unknown".to_vec(),
-                routing: PacketRouting::BoundInterface(1),
-            },
+            OutboundPacket::new(
+                b"bound-zero".to_vec(),
+                PacketRouting::BoundInterface(0),
+            ),
+            OutboundPacket::new(
+                b"bound-unknown".to_vec(),
+                PacketRouting::BoundInterface(1),
+            ),
         ];
 
         dispatch_single(&mut iface, &packets).await;
@@ -245,10 +245,10 @@ fn dispatch_dual_all_except_source_excludes_source() {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
 
-        let packets = vec![OutboundPacket {
-            data: b"test-packet".to_vec(),
-            routing: PacketRouting::AllExceptSource,
-        }];
+        let packets = vec![OutboundPacket::new(
+            b"test-packet".to_vec(),
+            PacketRouting::AllExceptSource,
+        )];
 
         // source = 0 → send to iface1 only
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
@@ -263,10 +263,7 @@ fn dispatch_dual_all_sends_to_both() {
         let mut iface0 = MockInterface::new();
         let mut iface1 = MockInterface::new();
 
-        let packets = vec![OutboundPacket {
-            data: b"test-packet".to_vec(),
-            routing: PacketRouting::All,
-        }];
+        let packets = vec![OutboundPacket::broadcast(b"test-packet".to_vec())];
 
         dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
         assert_eq!(iface0.outbound.len(), 1);

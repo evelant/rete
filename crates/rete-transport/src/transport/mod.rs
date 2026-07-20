@@ -39,7 +39,7 @@ use crate::resource::Resource;
 use crate::storage::{StorageMap, TransportStorage};
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketType,
+    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, MonotonicInstant, Packet, PacketType,
     CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, TRUNCATED_HASH_LEN,
 };
 
@@ -132,6 +132,10 @@ pub enum SendError {
     /// A compatibility API could not reserve owned packet output before
     /// mutating protocol state.
     OutputAllocationFailed,
+    /// The non-repeating outbound protocol-token namespace is exhausted.
+    ProtocolTokenExhausted,
+    /// Internal Link state rejected assignment of a freshly allocated token.
+    ProtocolTokenAssignmentFailed,
     /// Cryptographic operation failed (encrypt, sign, ECDH).
     Crypto(rete_core::Error),
     /// Packet building failed (buffer too small, invalid fields).
@@ -159,6 +163,12 @@ impl core::fmt::Display for SendError {
             }
             SendError::OutputAllocationFailed => {
                 write!(f, "could not reserve outbound packet storage")
+            }
+            SendError::ProtocolTokenExhausted => {
+                write!(f, "outbound protocol token namespace exhausted")
+            }
+            SendError::ProtocolTokenAssignmentFailed => {
+                write!(f, "outbound protocol token assignment failed")
             }
             SendError::Crypto(e) => write!(f, "crypto error: {e}"),
             SendError::PacketBuild(e) => write!(f, "packet build error: {e}"),
@@ -399,6 +409,15 @@ pub enum IngestResult<'a> {
     },
     /// A link handshake completed (LRPROOF validated or LRRTT processed).
     LinkEstablished {
+        /// The link_id.
+        link_id: LinkId,
+    },
+    /// An established responder accepted a fresh authenticated LRRTT update.
+    ///
+    /// This is deliberately distinct from [`Self::LinkEstablished`]: Python
+    /// re-runs its destination callback for such packets, but Rete's public
+    /// establishment event is a one-shot lifecycle trigger.
+    LinkRttUpdated {
         /// The link_id.
         link_id: LinkId,
     },
@@ -960,12 +979,38 @@ impl<S: TransportStorage> Transport<S> {
         R: RngCore + CryptoRng,
         T: ReceiptTerminalSink,
     {
+        self.ingest_on_with_receipt_sink_at(
+            raw,
+            now,
+            MonotonicInstant::from_secs(now),
+            iface,
+            rng,
+            identity,
+            sink,
+        )
+    }
+
+    /// Precise Link-clock variant of [`Self::ingest_on_with_receipt_sink`].
+    pub fn ingest_on_with_receipt_sink_at<'a, R, T>(
+        &mut self,
+        raw: &'a mut [u8],
+        now: u64,
+        link_now: MonotonicInstant,
+        iface: u8,
+        rng: &mut R,
+        identity: &Identity,
+        sink: &mut T,
+    ) -> Result<IngestResult<'a>, ReceiptSinkFull>
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
         let ingress_identity = self.local_identity_hash.unwrap_or_else(|| identity.hash());
         let reservation = match self.proof_terminal_candidate(raw, ingress_identity) {
             Some(candidate) => Some((candidate, sink.try_reserve(candidate)?)),
             None => None,
         };
-        let result = self.ingest_on(raw, now, iface, rng, identity);
+        let result = self.ingest_on_at(raw, now, link_now, iface, rng, identity);
 
         match (&result, reservation) {
             (IngestResult::ProofReceived { packet_hash }, Some((candidate, reservation))) => {
@@ -997,6 +1042,30 @@ impl<S: TransportStorage> Transport<S> {
         &mut self,
         raw: &'a mut [u8],
         now: u64,
+        iface: u8,
+        rng: &mut R,
+        identity: &Identity,
+    ) -> IngestResult<'a> {
+        self.ingest_on_at(
+            raw,
+            now,
+            MonotonicInstant::from_secs(now),
+            iface,
+            rng,
+            identity,
+        )
+    }
+
+    /// Precise Link-clock variant of [`Self::ingest_on`].
+    ///
+    /// `now` remains the whole-second logical clock used by path and receipt
+    /// tables. `link_now` is a process-local monotonic instant used only for
+    /// Link RTT and liveness calculations.
+    pub fn ingest_on_at<'a, R: RngCore + CryptoRng>(
+        &mut self,
+        raw: &'a mut [u8],
+        now: u64,
+        link_now: MonotonicInstant,
         iface: u8,
         rng: &mut R,
         identity: &Identity,
@@ -1294,6 +1363,7 @@ impl<S: TransportStorage> Transport<S> {
                             &lid,
                             &pkt,
                             now,
+                            link_now,
                             pkt_hash,
                             rng,
                         );
@@ -1349,6 +1419,7 @@ impl<S: TransportStorage> Transport<S> {
                         &lid,
                         &pkt,
                         now,
+                        link_now,
                         pkt_hash,
                         rng,
                     );
@@ -1447,7 +1518,7 @@ impl<S: TransportStorage> Transport<S> {
                     && pkt.dest_type == DestType::Link
                     && self.links.contains_key(&lid)
                 {
-                    return self.handle_lrproof(&lid, pkt.payload, now, iface);
+                    return self.handle_lrproof(&lid, pkt.payload, link_now, iface);
                 }
 
                 // Check for RESOURCE_PRF (resource completion proof from receiver).
@@ -1459,7 +1530,7 @@ impl<S: TransportStorage> Transport<S> {
                     && self.links.contains_key(&lid)
                 {
                     if let Some(link) = self.links.get_mut(&lid) {
-                        link.touch_inbound(now);
+                        link.touch_inbound_at(link_now);
                     }
                     return self.handle_resource_data(&lid, pkt.context, pkt.payload, now, rng);
                 }
@@ -1495,10 +1566,10 @@ impl<S: TransportStorage> Transport<S> {
                         if verified {
                             self.channel_receipts.remove(&receipt_key);
                             if let Some(link) = self.links.get_mut(&link_id) {
-                                link.touch_inbound(now);
+                                link.touch_inbound_at(link_now);
                                 let rtt = link.rtt;
                                 if let Some(channel) = link.channel.as_mut() {
-                                    channel.mark_delivered(sequence, rtt);
+                                    channel.mark_delivered(sequence, rtt as f32);
                                 }
                             }
                             return IngestResult::ProofReceived {
@@ -1663,7 +1734,15 @@ impl<S: TransportStorage> Transport<S> {
                         self.stats.packets_dropped_invalid += 1;
                         return IngestResult::Invalid;
                     }
-                    self.handle_link_request(raw, &dh, pkt.payload, now, iface, rng, identity)
+                    self.handle_link_request(
+                        raw,
+                        &dh,
+                        pkt.payload,
+                        link_now,
+                        iface,
+                        rng,
+                        identity,
+                    )
                 } else {
                     if h2_ownership == Header2Ownership::Own {
                         // Remote HEADER_2 LINKREQUEST/SINGLE was handled by
@@ -1749,7 +1828,11 @@ impl<S: TransportStorage> Transport<S> {
     // Periodic maintenance
     // -----------------------------------------------------------------------
 
-    fn tick_non_receipts(&mut self, now: u64) -> (usize, usize) {
+    fn tick_non_receipts(
+        &mut self,
+        now: u64,
+        link_now: MonotonicInstant,
+    ) -> (usize, usize) {
         // Lazy-init started_at on first tick
         if self.stats.started_at == 0 {
             self.stats.started_at = now;
@@ -1772,7 +1855,8 @@ impl<S: TransportStorage> Transport<S> {
 
         // Check for stale links
         let prev_links = self.links.len();
-        self.links.retain(|_, link| !link.check_stale(now));
+        self.links
+            .retain(|_, link| !link.check_stale_at(link_now));
         let closed_count = prev_links - self.links.len();
 
         // Expire stale channel receipts and reclaim receipts whose owned Link
@@ -1801,8 +1885,18 @@ impl<S: TransportStorage> Transport<S> {
         now: u64,
         sink: &mut T,
     ) -> TickSummary {
+        self.tick_with_receipt_sink_at(now, MonotonicInstant::from_secs(now), sink)
+    }
+
+    /// Precise Link-clock variant of [`Self::tick_with_receipt_sink`].
+    pub fn tick_with_receipt_sink_at<T: ReceiptTerminalSink>(
+        &mut self,
+        now: u64,
+        link_now: MonotonicInstant,
+        sink: &mut T,
+    ) -> TickSummary {
         let receipts = self.receipts.tick_into(now, sink);
-        let (expired_paths, closed_links) = self.tick_non_receipts(now);
+        let (expired_paths, closed_links) = self.tick_non_receipts(now, link_now);
 
         TickSummary {
             expired_paths,
@@ -1819,8 +1913,13 @@ impl<S: TransportStorage> Transport<S> {
     /// delivery-failure notifications. The output vector reserves enough
     /// capacity before any receipt entry is removed.
     pub fn tick(&mut self, now: u64) -> TickResult {
+        self.tick_at(now, MonotonicInstant::from_secs(now))
+    }
+
+    /// Precise Link-clock variant of [`Self::tick`].
+    pub fn tick_at(&mut self, now: u64, link_now: MonotonicInstant) -> TickResult {
         let failed_receipts = self.receipts.tick(now);
-        let (expired_paths, closed_links) = self.tick_non_receipts(now);
+        let (expired_paths, closed_links) = self.tick_non_receipts(now, link_now);
 
         TickResult {
             expired_paths,
@@ -3254,7 +3353,12 @@ mod tests {
         assert_eq!(transport.stats().packets_dropped_dedup, 0);
 
         assert!(matches!(
-            transport.handle_lrproof(&link_id, &proof_payload, now + 3, 5),
+            transport.handle_lrproof(
+                &link_id,
+                &proof_payload,
+                rete_core::MonotonicInstant::from_secs(now + 3),
+                5,
+            ),
             IngestResult::Invalid
         ));
         let unchanged = transport.get_link(&link_id).unwrap();
@@ -3401,9 +3505,12 @@ mod tests {
         assert_eq!(transport.link_count(), 1);
 
         let stale_time = transport.get_link(&link_id).unwrap().stale_time;
+        let active_at = rete_core::MonotonicInstant::from_secs(now);
+        let stale_at = active_at + stale_time;
+        let grace = transport.get_link(&link_id).unwrap().stale_grace();
 
         // At stale_time the link enters Stale but remains retained for revival.
-        let result = transport.tick(now + stale_time);
+        let result = transport.tick_at(stale_at.as_secs(), stale_at);
         assert_eq!(result.closed_links, 0);
         assert_eq!(transport.link_count(), 1);
         assert_eq!(
@@ -3411,12 +3518,14 @@ mod tests {
             crate::link::LinkState::Stale
         );
 
-        let result = transport.tick(now + stale_time + crate::link::STALE_GRACE - 1);
+        let before_close = stale_at + grace - rete_core::MonotonicDuration::from_micros(1);
+        let result = transport.tick_at(before_close.as_secs(), before_close);
         assert_eq!(result.closed_links, 0);
         assert_eq!(transport.link_count(), 1);
 
         // Python RNS 1.3.8's watchdog gives the final probe five seconds.
-        let result = transport.tick(now + stale_time + crate::link::STALE_GRACE);
+        let close_at = stale_at + grace;
+        let result = transport.tick_at(close_at.as_secs(), close_at);
         assert_eq!(result.closed_links, 1);
         assert_eq!(transport.link_count(), 0);
     }
@@ -3426,11 +3535,13 @@ mod tests {
         let now = 1000u64;
         let (mut transport, link_id, _) = make_transport_with_active_link(now);
         let stale_time = transport.get_link(&link_id).unwrap().stale_time;
-        let transition_at = now + stale_time + 100;
+        let transition_at = rete_core::MonotonicInstant::from_secs(now)
+            + stale_time
+            + rete_core::MonotonicDuration::from_secs(100);
 
         // Even though the nominal stale deadline is long past, this first
         // watchdog observation starts (rather than consumes) the grace window.
-        let result = transport.tick(transition_at);
+        let result = transport.tick_at(transition_at.as_secs(), transition_at);
         assert_eq!(result.closed_links, 0);
         assert_eq!(transport.link_count(), 1);
         assert_eq!(
@@ -3438,11 +3549,14 @@ mod tests {
             crate::link::LinkState::Stale
         );
 
-        let result = transport.tick(transition_at + crate::link::STALE_GRACE - 1);
+        let grace = transport.get_link(&link_id).unwrap().stale_grace();
+        let before_close = transition_at + grace - rete_core::MonotonicDuration::from_micros(1);
+        let result = transport.tick_at(before_close.as_secs(), before_close);
         assert_eq!(result.closed_links, 0);
         assert_eq!(transport.link_count(), 1);
 
-        let result = transport.tick(transition_at + crate::link::STALE_GRACE);
+        let close_at = transition_at + grace;
+        let result = transport.tick_at(close_at.as_secs(), close_at);
         assert_eq!(result.closed_links, 1);
         assert_eq!(transport.link_count(), 0);
     }
@@ -3454,13 +3568,17 @@ mod tests {
         let mut rng = rand_core::OsRng;
 
         let keepalive_interval = transport.get_link(&link_id).unwrap().keepalive_interval;
+        let active_at = rete_core::MonotonicInstant::from_secs(now);
 
         // A full interval of inbound silence is required.
         assert!(transport
-            .build_pending_keepalives(now + keepalive_interval - 1, &mut rng)
+            .build_pending_keepalives_at(
+                active_at + keepalive_interval - rete_core::MonotonicDuration::from_micros(1),
+                &mut rng,
+            )
             .is_empty());
-        let ka_time = now + keepalive_interval;
-        let packets = transport.build_pending_keepalives(ka_time, &mut rng);
+        let ka_time = active_at + keepalive_interval;
+        let packets = transport.build_pending_keepalives_at(ka_time, &mut rng);
         assert!(
             !packets.is_empty(),
             "should produce at least one keepalive packet"

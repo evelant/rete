@@ -24,8 +24,12 @@
 
 use crate::channel::Channel;
 use rand_core::{CryptoRng, RngCore};
-use rete_core::{DestHash, Identity, IdentityHash, LinkId, Token, TRUNCATED_HASH_LEN};
+use rete_core::{
+    DestHash, Identity, IdentityHash, LinkId, MonotonicDuration, MonotonicInstant, Token,
+    TRUNCATED_HASH_LEN,
+};
 use sha2::{Digest, Sha256};
+use core::num::NonZeroU64;
 use zeroize::Zeroize;
 
 /// Link state.
@@ -112,27 +116,36 @@ pub struct Link {
     #[allow(dead_code)]
     our_ed25519_pub: [u8; 32],
     /// Measured round-trip time (seconds).
-    pub rtt: f32,
-    /// Last activity timestamp (monotonic seconds).
-    pub last_inbound: u64,
+    pub rtt: f64,
+    /// Last authenticated inbound activity.
+    pub last_inbound: MonotonicInstant,
     /// Last outbound timestamp.
-    pub last_outbound: u64,
+    pub last_outbound: MonotonicInstant,
     /// Last outbound keepalive timestamp.
     ///
     /// Keepalives are deterministic on the wire, so this is tracked separately
     /// from ordinary outbound traffic. Python RNS schedules probes from inbound
     /// silence and the previous probe, not from arbitrary outbound data.
-    pub last_keepalive: u64,
+    pub last_keepalive: MonotonicInstant,
+    /// Immutable start of the Link request/response timing exchange.
+    ///
+    /// A provisional value is installed during logical packet construction so
+    /// legacy callers remain functional. A runtime may replace it exactly once
+    /// with a dispatch-edge confirmation before the Link activates.
+    request_started_at: MonotonicInstant,
+    request_time_confirmed: bool,
+    outbound_protocol_token: Option<NonZeroU64>,
+    request_dispatch_interface: Option<u8>,
     /// Timestamp at which the watchdog actually transitioned this Link to Stale.
     ///
     /// The revival grace starts at the transition/final-probe time, not at the
     /// nominal `last_inbound + stale_time` deadline. This matters when watchdog
-    /// ticks are delayed. Zero is the compact inactive sentinel.
-    stale_since: u64,
-    /// Keepalive interval in seconds.
-    pub keepalive_interval: u64,
+    /// ticks are delayed.
+    stale_since: Option<MonotonicInstant>,
+    /// Precise keepalive interval.
+    pub keepalive_interval: MonotonicDuration,
     /// Stale timeout = keepalive × 2.
-    pub stale_time: u64,
+    pub stale_time: MonotonicDuration,
     /// Destination hash this link is associated with.
     pub destination_hash: DestHash,
     /// Hop count retained when the Link was created.
@@ -219,6 +232,21 @@ impl Link {
         rng: &mut R,
         now: u64,
     ) -> Result<Self, rete_core::Error> {
+        Self::from_request_at(
+            link_id,
+            request_payload,
+            rng,
+            MonotonicInstant::from_secs(now),
+        )
+    }
+
+    /// Precise-clock variant of [`Self::from_request`].
+    pub fn from_request_at<R: RngCore + CryptoRng>(
+        link_id: LinkId,
+        request_payload: &[u8],
+        rng: &mut R,
+        now: MonotonicInstant,
+    ) -> Result<Self, rete_core::Error> {
         if request_payload.len() < LINK_REQUEST_KEY_SIZE {
             return Err(rete_core::Error::PacketTooShort);
         }
@@ -277,10 +305,14 @@ impl Link {
             rtt: 0.0,
             last_inbound: now,
             last_outbound: now,
-            last_keepalive: 0,
-            stale_since: 0,
-            keepalive_interval: KEEPALIVE_INTERVAL_SECS,
-            stale_time: STALE_TIMEOUT_SECS,
+            last_keepalive: MonotonicInstant::default(),
+            request_started_at: now,
+            request_time_confirmed: false,
+            outbound_protocol_token: None,
+            request_dispatch_interface: None,
+            stale_since: None,
+            keepalive_interval: MonotonicDuration::from_secs(KEEPALIVE_INTERVAL_SECS),
+            stale_time: MonotonicDuration::from_secs(STALE_TIMEOUT_SECS),
             destination_hash: DestHash::ZERO,
             expected_hops: None,
             bound_interface: None,
@@ -349,6 +381,22 @@ impl Link {
         )
     }
 
+    /// Precise-clock variant of [`Self::new_initiator`].
+    pub fn new_initiator_at<R: RngCore + CryptoRng>(
+        dest_hash: DestHash,
+        our_ed25519_pub: &[u8; 32],
+        rng: &mut R,
+        now: MonotonicInstant,
+    ) -> (Self, [u8; 64 + LINK_MTU_SIZE]) {
+        Self::new_initiator_with_expected_hops_at(
+            dest_hash,
+            our_ed25519_pub,
+            crate::transport::PATHFINDER_M,
+            rng,
+            now,
+        )
+    }
+
     /// Create an initiator while atomically retaining its path height.
     pub(crate) fn new_initiator_with_expected_hops<R: RngCore + CryptoRng>(
         dest_hash: DestHash,
@@ -356,6 +404,22 @@ impl Link {
         expected_hops: u8,
         rng: &mut R,
         now: u64,
+    ) -> (Self, [u8; 64 + LINK_MTU_SIZE]) {
+        Self::new_initiator_with_expected_hops_at(
+            dest_hash,
+            our_ed25519_pub,
+            expected_hops,
+            rng,
+            MonotonicInstant::from_secs(now),
+        )
+    }
+
+    pub(crate) fn new_initiator_with_expected_hops_at<R: RngCore + CryptoRng>(
+        dest_hash: DestHash,
+        our_ed25519_pub: &[u8; 32],
+        expected_hops: u8,
+        rng: &mut R,
+        now: MonotonicInstant,
     ) -> (Self, [u8; 64 + LINK_MTU_SIZE]) {
         // Generate ephemeral X25519
         let our_secret = x25519_dalek::StaticSecret::random_from_rng(&mut *rng);
@@ -385,10 +449,14 @@ impl Link {
             rtt: 0.0,
             last_inbound: now,
             last_outbound: now,
-            last_keepalive: 0,
-            stale_since: 0,
-            keepalive_interval: KEEPALIVE_INTERVAL_SECS,
-            stale_time: STALE_TIMEOUT_SECS,
+            last_keepalive: MonotonicInstant::default(),
+            request_started_at: now,
+            request_time_confirmed: false,
+            outbound_protocol_token: None,
+            request_dispatch_interface: None,
+            stale_since: None,
+            keepalive_interval: MonotonicDuration::from_secs(KEEPALIVE_INTERVAL_SECS),
+            stale_time: MonotonicDuration::from_secs(STALE_TIMEOUT_SECS),
             destination_hash: dest_hash,
             expected_hops: Some(expected_hops),
             bound_interface: None,
@@ -495,28 +563,107 @@ impl Link {
     /// self.keepalive = max(min(rtt * (360/1.75), 360), 5)
     /// self.stale_time = self.keepalive * 2
     /// ```
-    pub fn update_keepalive(&mut self, rtt: f32) {
-        if rtt <= 0.0 {
-            return; // Don't update if RTT not measured
-        }
+    pub fn update_keepalive(&mut self, rtt: f64) {
         self.rtt = rtt;
-        let ka = (rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT)).clamp(KEEPALIVE_MIN, KEEPALIVE_MAX);
-        // Ensure at least 1 second to prevent zero-interval issues
-        self.keepalive_interval = (ka as u64).max(1);
-        self.stale_time = ((ka * STALE_FACTOR) as u64).max(2);
+        let ka = (rtt * (KEEPALIVE_MAX as f64 / KEEPALIVE_MAX_RTT as f64))
+            .clamp(KEEPALIVE_MIN as f64, KEEPALIVE_MAX as f64);
+        self.keepalive_interval = MonotonicDuration::from_seconds_f64(ka);
+        self.stale_time = self
+            .keepalive_interval
+            .saturating_mul(STALE_FACTOR as u64);
+    }
+
+    /// Immutable request timing origin, provisional or confirmed.
+    pub const fn request_started_at(&self) -> MonotonicInstant {
+        self.request_started_at
+    }
+
+    /// Whether a runtime dispatch edge replaced the provisional request time.
+    pub const fn request_time_confirmed(&self) -> bool {
+        self.request_time_confirmed
+    }
+
+    /// Elapsed request exchange time at `now` using the immutable origin.
+    pub fn request_elapsed_seconds(&self, now: MonotonicInstant) -> f64 {
+        now.saturating_duration_since(self.request_started_at)
+            .as_seconds_f64()
+    }
+
+    /// Confirm the request timing origin exactly once before activation.
+    pub(crate) fn assign_outbound_protocol_token(&mut self, token: NonZeroU64) -> bool {
+        if self.outbound_protocol_token.is_some()
+            || matches!(self.state, LinkState::Active | LinkState::Stale | LinkState::Closed)
+        {
+            return false;
+        }
+        self.outbound_protocol_token = Some(token);
+        true
+    }
+
+    pub(crate) const fn outbound_protocol_token(&self) -> Option<NonZeroU64> {
+        self.outbound_protocol_token
+    }
+
+    pub(crate) fn confirm_request_started_at(
+        &mut self,
+        token: NonZeroU64,
+        interface: u8,
+        at: MonotonicInstant,
+    ) -> bool {
+        if self.request_time_confirmed
+            || self.outbound_protocol_token != Some(token)
+            || matches!(self.state, LinkState::Active | LinkState::Stale | LinkState::Closed)
+        {
+            return false;
+        }
+        if self.role == LinkRole::Responder && self.bound_interface != Some(interface) {
+            return false;
+        }
+        self.request_started_at = at;
+        self.request_time_confirmed = true;
+        self.request_dispatch_interface = Some(interface);
+        self.outbound_protocol_token = None;
+        true
+    }
+
+    /// Interface whose first successful dispatch edge confirmed request timing.
+    pub const fn request_dispatch_interface(&self) -> Option<u8> {
+        self.request_dispatch_interface
+    }
+
+    /// Precise keepalive interval retained for Link scheduling.
+    pub fn keepalive_interval_seconds(&self) -> f64 {
+        self.keepalive_interval.as_seconds_f64()
+    }
+
+    /// Precise stale interval retained for Link scheduling.
+    pub fn stale_time_seconds(&self) -> f64 {
+        self.stale_time.as_seconds_f64()
+    }
+
+    /// Revival grace after an Active Link first transitions to Stale.
+    pub fn stale_grace(&self) -> MonotonicDuration {
+        MonotonicDuration::from_seconds_f64(
+            self.rtt * KEEPALIVE_TIMEOUT_FACTOR as f64 + STALE_GRACE as f64,
+        )
     }
 
     /// Activate the link (after RTT measurement completes).
     pub fn activate(&mut self, now: u64) {
+        self.activate_at(MonotonicInstant::from_secs(now));
+    }
+
+    /// Activate the link using a precise monotonic timestamp.
+    pub fn activate_at(&mut self, now: MonotonicInstant) {
         self.state = LinkState::Active;
         self.last_inbound = now;
-        self.stale_since = 0;
+        self.stale_since = None;
     }
 
     /// Mark the link as closed.
     pub fn close(&mut self) {
         self.state = LinkState::Closed;
-        self.stale_since = 0;
+        self.stale_since = None;
     }
 
     /// Check if the link is active.
@@ -555,11 +702,16 @@ impl Link {
 
     /// Update last inbound timestamp.
     pub fn touch_inbound(&mut self, now: u64) {
+        self.touch_inbound_at(MonotonicInstant::from_secs(now));
+    }
+
+    /// Update inbound liveness using a precise monotonic timestamp.
+    pub fn touch_inbound_at(&mut self, now: MonotonicInstant) {
         self.last_inbound = now;
         if self.state == LinkState::Stale {
             self.state = LinkState::Active;
         }
-        self.stale_since = 0;
+        self.stale_since = None;
     }
 
     /// Classify a conforming inbound keepalive without mutating Link state.
@@ -585,8 +737,16 @@ impl Link {
     /// Valid keepalives count as inbound Link activity and revive a stale Link.
     /// Invalid or wrong-role values do not mutate any liveness state.
     pub(crate) fn consume_keepalive(&mut self, payload: &[u8], now: u64) -> Option<bool> {
+        self.consume_keepalive_at(payload, MonotonicInstant::from_secs(now))
+    }
+
+    pub(crate) fn consume_keepalive_at(
+        &mut self,
+        payload: &[u8],
+        now: MonotonicInstant,
+    ) -> Option<bool> {
         let reply = self.classify_keepalive(payload)?;
-        self.touch_inbound(now);
+        self.touch_inbound_at(now);
         Some(reply)
     }
 
@@ -601,9 +761,19 @@ impl Link {
     }
 
     /// Record a keepalive after its raw packet has been built successfully.
-    pub(crate) fn note_keepalive_outbound(&mut self, now: u64) {
+    pub(crate) fn note_keepalive_outbound_at(&mut self, now: MonotonicInstant) {
         self.last_outbound = now;
         self.last_keepalive = now;
+    }
+
+    /// Record ordinary outbound Link traffic without altering request timing.
+    pub(crate) fn note_outbound_at(&mut self, now: MonotonicInstant) {
+        self.last_outbound = now;
+    }
+
+    /// Whole-second compatibility wrapper for [`Self::note_outbound_at`].
+    pub(crate) fn note_outbound(&mut self, now: u64) {
+        self.note_outbound_at(MonotonicInstant::from_secs(now));
     }
 
     /// Process a LINKCLOSE payload. Returns true if the link should be closed.
@@ -636,28 +806,39 @@ impl Link {
     /// complete interval since the previous probe. Ordinary outbound traffic
     /// deliberately does not postpone the probe.
     pub fn needs_keepalive(&self, now: u64) -> bool {
+        self.needs_keepalive_at(MonotonicInstant::from_secs(now))
+    }
+
+    /// Precise-clock variant of [`Self::needs_keepalive`].
+    pub fn needs_keepalive_at(&self, now: MonotonicInstant) -> bool {
         self.state == LinkState::Active
             && self.role == LinkRole::Initiator
-            && now.saturating_sub(self.last_inbound) >= self.keepalive_interval
-            && now.saturating_sub(self.last_keepalive) >= self.keepalive_interval
+            && now.saturating_duration_since(self.last_inbound) >= self.keepalive_interval
+            && now.saturating_duration_since(self.last_keepalive) >= self.keepalive_interval
     }
 
     /// Check for staleness. Returns true if the link should be closed.
     pub fn check_stale(&mut self, now: u64) -> bool {
-        let silence = now.saturating_sub(self.last_inbound);
+        self.check_stale_at(MonotonicInstant::from_secs(now))
+    }
+
+    /// Precise-clock variant of [`Self::check_stale`].
+    pub fn check_stale_at(&mut self, now: MonotonicInstant) -> bool {
+        let silence = now.saturating_duration_since(self.last_inbound);
         if self.state == LinkState::Active && silence >= self.stale_time {
             self.state = LinkState::Stale;
-            self.stale_since = now;
+            self.stale_since = Some(now);
             return false;
         }
         if self.state == LinkState::Stale {
-            if self.stale_since == 0 {
-                self.stale_since = now;
+            let Some(stale_since) = self.stale_since else {
+                self.stale_since = Some(now);
                 return false;
-            }
-            if now.saturating_sub(self.stale_since) >= STALE_GRACE {
+            };
+            let grace = self.stale_grace();
+            if now.saturating_duration_since(stale_since) >= grace {
                 self.state = LinkState::Closed;
-                self.stale_since = 0;
+                self.stale_since = None;
                 return true;
             }
         }
@@ -1088,23 +1269,30 @@ mod tests {
         let payload = [0xBBu8; 64];
         let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
-        link.activate(100);
+        let active_at = MonotonicInstant::from_secs(100);
+        link.activate_at(active_at);
 
         // Not stale yet
-        assert!(!link.check_stale(200));
+        assert!(!link.check_stale_at(MonotonicInstant::from_secs(200)));
         assert_eq!(link.state, LinkState::Active);
 
         // Remains active for the full two-keepalive stale interval.
-        assert!(!link.check_stale(100 + link.keepalive_interval + 1));
+        assert!(!link.check_stale_at(
+            active_at + link.keepalive_interval + MonotonicDuration::from_secs(1)
+        ));
         assert_eq!(link.state, LinkState::Active);
 
         // Goes stale at stale_time, then retains a five-second revival grace.
-        assert!(!link.check_stale(100 + link.stale_time));
+        let stale_at = active_at + link.stale_time;
+        assert!(!link.check_stale_at(stale_at));
         assert_eq!(link.state, LinkState::Stale);
-        assert!(!link.check_stale(100 + link.stale_time + STALE_GRACE - 1));
+        let grace = link.stale_grace();
+        assert!(!link.check_stale_at(
+            stale_at + grace - MonotonicDuration::from_micros(1)
+        ));
         assert_eq!(link.state, LinkState::Stale);
 
-        assert!(link.check_stale(100 + link.stale_time + STALE_GRACE));
+        assert!(link.check_stale_at(stale_at + grace));
         assert_eq!(link.state, LinkState::Closed);
     }
 
@@ -1114,16 +1302,21 @@ mod tests {
         let payload = [0xBBu8; 64];
         let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
-        link.activate(100);
+        let active_at = MonotonicInstant::from_secs(100);
+        link.activate_at(active_at);
 
         // A delayed watchdog must not consume the revival grace retroactively.
-        let transition_at = 100 + link.stale_time + 100;
-        assert!(!link.check_stale(transition_at));
+        let transition_at =
+            active_at + link.stale_time + MonotonicDuration::from_secs(100);
+        assert!(!link.check_stale_at(transition_at));
         assert_eq!(link.state, LinkState::Stale);
-        assert!(!link.check_stale(transition_at + STALE_GRACE - 1));
+        let grace = link.stale_grace();
+        assert!(!link.check_stale_at(
+            transition_at + grace - MonotonicDuration::from_micros(1)
+        ));
         assert_eq!(link.state, LinkState::Stale);
 
-        assert!(link.check_stale(transition_at + STALE_GRACE));
+        assert!(link.check_stale_at(transition_at + grace));
         assert_eq!(link.state, LinkState::Closed);
     }
 
@@ -1137,11 +1330,11 @@ mod tests {
 
         assert_eq!(responder.consume_keepalive(&[0xFF], 200), Some(true));
         assert_eq!(responder.handle_keepalive(&[0xFF], 201), Some(0xFE));
-        assert_eq!(responder.last_inbound, 201);
+        assert_eq!(responder.last_inbound.as_secs(), 201);
 
         for invalid in [&[][..], &[0xFE][..], &[0xFF, 0x00][..]] {
             assert_eq!(responder.consume_keepalive(invalid, 300), None);
-            assert_eq!(responder.last_inbound, 201);
+            assert_eq!(responder.last_inbound.as_secs(), 201);
         }
 
         let identity = Identity::from_seed(b"keepalive-role-initiator").unwrap();
@@ -1150,11 +1343,11 @@ mod tests {
             Link::new_initiator(dest_hash, identity.ed25519_pub(), &mut rng, 100);
         initiator.activate(100);
         assert_eq!(initiator.consume_keepalive(&[0xFE], 200), Some(false));
-        assert_eq!(initiator.last_inbound, 200);
+        assert_eq!(initiator.last_inbound.as_secs(), 200);
 
         for invalid in [&[][..], &[0xFF][..], &[0xFE, 0x00][..]] {
             assert_eq!(initiator.consume_keepalive(invalid, 300), None);
-            assert_eq!(initiator.last_inbound, 200);
+            assert_eq!(initiator.last_inbound.as_secs(), 200);
         }
     }
 
@@ -1203,7 +1396,7 @@ mod tests {
         assert_eq!(link.state, LinkState::Pending);
 
         assert_eq!(link.consume_keepalive(&[0xFE], 200), None);
-        assert_eq!(link.last_inbound, 100);
+        assert_eq!(link.last_inbound.as_secs(), 100);
     }
 
     #[test]
@@ -1284,9 +1477,9 @@ mod tests {
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
 
         link.update_keepalive(0.05);
-        // 0.05 * (360/1.75) ≈ 10.28, clamped to max(5, min(360, 10.28)) = 10
-        assert_eq!(link.keepalive_interval, 10);
-        assert_eq!(link.stale_time, 20);
+        // Preserve sub-second scheduling precision instead of truncating.
+        assert!((link.keepalive_interval_seconds() - 10.285_714).abs() < 0.000_001);
+        assert!((link.stale_time_seconds() - 20.571_428).abs() < 0.000_001);
         assert!((link.rtt - 0.05).abs() < 0.001);
     }
 
@@ -1300,8 +1493,8 @@ mod tests {
 
         link.update_keepalive(2.0);
         // 2.0 * (360/1.75) ≈ 411.4 → clamped to 360
-        assert_eq!(link.keepalive_interval, 360);
-        assert_eq!(link.stale_time, 720);
+        assert_eq!(link.keepalive_interval, MonotonicDuration::from_secs(360));
+        assert_eq!(link.stale_time, MonotonicDuration::from_secs(720));
     }
 
     #[test]
@@ -1313,9 +1506,8 @@ mod tests {
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
 
         link.update_keepalive(0.5);
-        // 0.5 * (360/1.75) ≈ 102.86 → 102 (truncated to u64)
-        assert_eq!(link.keepalive_interval, 102);
-        assert_eq!(link.stale_time, 205);
+        assert!((link.keepalive_interval_seconds() - 102.857_143).abs() < 0.000_001);
+        assert!((link.stale_time_seconds() - 205.714_286).abs() < 0.000_001);
     }
 
     #[test]
@@ -1328,23 +1520,22 @@ mod tests {
 
         link.update_keepalive(0.001);
         // 0.001 * (360/1.75) ≈ 0.206 → clamped to max(5, ...) = 5
-        assert_eq!(link.keepalive_interval, 5);
-        assert_eq!(link.stale_time, 10);
+        assert_eq!(link.keepalive_interval, MonotonicDuration::from_secs(5));
+        assert_eq!(link.stale_time, MonotonicDuration::from_secs(10));
     }
 
     #[test]
-    fn test_update_keepalive_zero_rtt_no_change() {
-        // RTT=0.0 → should not change defaults
+    fn test_update_keepalive_zero_rtt_uses_minimum_interval() {
+        // Zero is a valid RTT sample and still applies the five-second floor.
         let mut rng = rand_core::OsRng;
         let payload = [0xBBu8; 64];
         let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
 
-        let orig_ka = link.keepalive_interval;
-        let orig_stale = link.stale_time;
         link.update_keepalive(0.0);
-        assert_eq!(link.keepalive_interval, orig_ka);
-        assert_eq!(link.stale_time, orig_stale);
+        assert_eq!(link.rtt, 0.0);
+        assert_eq!(link.keepalive_interval, MonotonicDuration::from_secs(5));
+        assert_eq!(link.stale_time, MonotonicDuration::from_secs(10));
     }
 
     #[test]
@@ -1355,29 +1546,32 @@ mod tests {
         let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
         link.update_keepalive(0.05);
-        link.activate(100);
+        let active_at = MonotonicInstant::from_secs(100);
+        link.activate_at(active_at);
 
         // At 109 (9s elapsed) — should still be active
-        assert!(!link.check_stale(109));
+        assert!(!link.check_stale_at(MonotonicInstant::from_secs(109)));
         assert_eq!(link.state, LinkState::Active);
 
         // A Link stays active until stale_time (20 seconds), not one keepalive.
-        assert!(!link.check_stale(111));
+        assert!(!link.check_stale_at(MonotonicInstant::from_secs(111)));
         assert_eq!(link.state, LinkState::Active);
 
-        assert!(!link.check_stale(120));
+        let stale_at = active_at + link.stale_time;
+        assert!(!link.check_stale_at(stale_at));
         assert_eq!(link.state, LinkState::Stale);
 
         // Five seconds of grace allows a final keepalive response to revive it.
-        assert!(!link.check_stale(124));
-        link.touch_inbound(124);
+        assert!(!link.check_stale_at(stale_at + MonotonicDuration::from_secs(4)));
+        link.touch_inbound_at(stale_at + MonotonicDuration::from_secs(4));
         assert_eq!(link.state, LinkState::Active);
-        assert!(!link.check_stale(125));
+        assert!(!link.check_stale_at(stale_at + MonotonicDuration::from_secs(5)));
 
         // A later silence period closes at stale_time plus grace.
-        assert!(!link.check_stale(144));
+        let second_stale_at = stale_at + MonotonicDuration::from_secs(4) + link.stale_time;
+        assert!(!link.check_stale_at(second_stale_at));
         assert_eq!(link.state, LinkState::Stale);
-        assert!(link.check_stale(149));
+        assert!(link.check_stale_at(second_stale_at + link.stale_grace()));
         assert_eq!(link.state, LinkState::Closed);
     }
 
@@ -1389,19 +1583,23 @@ mod tests {
         let dest_hash = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
         let (mut link, _) = Link::new_initiator(dest_hash, identity.ed25519_pub(), &mut rng, 100);
         link.update_keepalive(0.05);
-        link.activate(100);
+        let active_at = MonotonicInstant::from_secs(100);
+        link.activate_at(active_at);
 
-        assert!(!link.needs_keepalive(109));
-        assert!(link.needs_keepalive(110));
+        assert!(!link.needs_keepalive_at(MonotonicInstant::from_secs(110)));
+        let due_at = active_at + link.keepalive_interval;
+        assert!(link.needs_keepalive_at(due_at));
 
         // Ordinary outbound data does not conceal inbound silence.
-        link.last_outbound = 109;
-        assert!(link.needs_keepalive(110));
+        link.last_outbound = MonotonicInstant::from_secs(109);
+        assert!(link.needs_keepalive_at(due_at));
 
         // A recorded probe rate-limits the next identical request.
-        link.note_keepalive_outbound(110);
-        assert!(!link.needs_keepalive(119));
-        assert!(link.needs_keepalive(120));
+        link.note_keepalive_outbound_at(due_at);
+        assert!(!link.needs_keepalive_at(
+            due_at + link.keepalive_interval - MonotonicDuration::from_micros(1)
+        ));
+        assert!(link.needs_keepalive_at(due_at + link.keepalive_interval));
 
         // Responders never initiate probes.
         let payload = [0xBBu8; 64];

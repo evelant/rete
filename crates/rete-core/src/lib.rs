@@ -32,6 +32,7 @@ pub mod ifac;
 pub mod msgpack;
 pub mod packet;
 pub mod token;
+pub mod time;
 
 pub use error::Error;
 pub use hash_types::{DestHash, IdentityHash, LinkId, PathHash, RequestId};
@@ -49,6 +50,7 @@ pub use packet::{
     CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, TRANSPORT_TYPE_BROADCAST, TRANSPORT_TYPE_TRANSPORT,
 };
 pub use token::Token;
+pub use time::{MonotonicDuration, MonotonicInstant};
 
 // ---------------------------------------------------------------------------
 // Protocol constants — must match Python reference exactly

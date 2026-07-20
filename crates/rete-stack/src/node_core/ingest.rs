@@ -32,6 +32,24 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         iface: u8,
         rng: &mut R,
     ) -> IngestOutcome {
+        self.handle_ingest_at(
+            raw,
+            now,
+            rete_core::MonotonicInstant::from_secs(now),
+            iface,
+            rng,
+        )
+    }
+
+    /// Process inbound bytes with a precise monotonic Link clock.
+    pub fn handle_ingest_at<R: RngCore + CryptoRng>(
+        &mut self,
+        raw: &[u8],
+        now: u64,
+        link_now: rete_core::MonotonicInstant,
+        iface: u8,
+        rng: &mut R,
+    ) -> IngestOutcome {
         let len = raw.len();
 
         // Local shared-instance links negotiate MTUs up to 262 KB.
@@ -51,11 +69,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         if len <= MTU {
             let mut pkt_buf = [0u8; MTU];
             pkt_buf[..len].copy_from_slice(raw);
-            self.dispatch_ingest(&mut pkt_buf[..len], now, iface, rng)
+            self.dispatch_ingest_at(&mut pkt_buf[..len], now, link_now, iface, rng)
         } else {
             let mut pkt_buf = vec![0u8; len];
             pkt_buf[..len].copy_from_slice(raw);
-            self.dispatch_ingest(&mut pkt_buf[..len], now, iface, rng)
+            self.dispatch_ingest_at(&mut pkt_buf[..len], now, link_now, iface, rng)
         }
     }
 
@@ -79,6 +97,30 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         R: RngCore + CryptoRng,
         T: ReceiptTerminalSink,
     {
+        self.handle_ingest_with_receipt_sink_at(
+            raw,
+            now,
+            rete_core::MonotonicInstant::from_secs(now),
+            iface,
+            rng,
+            sink,
+        )
+    }
+
+    /// Precise Link-clock variant of [`Self::handle_ingest_with_receipt_sink`].
+    pub fn handle_ingest_with_receipt_sink_at<R, T>(
+        &mut self,
+        raw: &[u8],
+        now: u64,
+        link_now: rete_core::MonotonicInstant,
+        iface: u8,
+        rng: &mut R,
+        sink: &mut T,
+    ) -> Result<IngestOutcome, ReceiptSinkFull>
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
         let len = raw.len();
         if len > MTU {
             return Ok(IngestOutcome::empty());
@@ -92,9 +134,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         pkt_buf[..len].copy_from_slice(raw);
         let result = self
             .transport
-            .ingest_on_with_receipt_sink(
+            .ingest_on_with_receipt_sink_at(
                 &mut pkt_buf[..len],
                 now,
+                link_now,
                 iface,
                 rng,
                 &self.identity,
@@ -103,22 +146,22 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
         match result {
             IngestResult::ProofReceived { .. } => Ok(IngestOutcome::empty()),
-            result => Ok(self.dispatch_ingest_result(result, now, rng)),
+            result => Ok(self.dispatch_ingest_result(result, now, link_now, rng)),
         }
     }
 
-    /// Dispatch a parsed packet buffer to the transport layer.
-    fn dispatch_ingest<R: RngCore + CryptoRng>(
+    fn dispatch_ingest_at<R: RngCore + CryptoRng>(
         &mut self,
         pkt_buf: &mut [u8],
         now: u64,
+        link_now: rete_core::MonotonicInstant,
         iface: u8,
         rng: &mut R,
     ) -> IngestOutcome {
         let result = self
             .transport
-            .ingest_on(pkt_buf, now, iface, rng, &self.identity);
-        self.dispatch_ingest_result(result, now, rng)
+            .ingest_on_at(pkt_buf, now, link_now, iface, rng, &self.identity);
+        self.dispatch_ingest_result(result, now, link_now, rng)
     }
 
     fn link_closed_outcome(
@@ -152,6 +195,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         &mut self,
         result: IngestResult<'_>,
         now: u64,
+        link_now: rete_core::MonotonicInstant,
         rng: &mut R,
     ) -> IngestOutcome {
         match result {
@@ -174,10 +218,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     let result = self.build_data_packet(&dest_hash, &msg, rng, now);
                     self.auto_reply = Some(msg);
                     if let Ok(pkt) = result {
-                        packets.push(OutboundPacket {
-                            data: pkt,
-                            routing: PacketRouting::SourceInterface,
-                        });
+                        packets.push(OutboundPacket::new(
+                            pkt,
+                            PacketRouting::SourceInterface,
+                        ));
                     }
                 }
 
@@ -272,27 +316,47 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             }
             IngestResult::Forward { raw, target, .. } => IngestOutcome {
                 events: vec![],
-                packets: vec![OutboundPacket {
-                    data: raw.to_vec(),
-                    routing: match target {
+                packets: vec![OutboundPacket::new(
+                    raw.to_vec(),
+                    match target {
                         ForwardTarget::ExactInterface(interface) => {
                             PacketRouting::ExactInterface(interface)
                         }
                         ForwardTarget::AllExceptSource => PacketRouting::AllExceptSource,
                     },
-                }],
+                )],
                 rejection: None,
             },
-            IngestResult::LinkRequestReceived { link_id, proof_raw } => IngestOutcome {
-                events: vec![NodeEvent::LinkEstablished { link_id }],
-                // LRPROOF is a synchronous response to the accepted request.
-                // Preserve SourceInterface provenance for proof telemetry.
-                packets: vec![OutboundPacket {
-                    data: proof_raw,
-                    routing: PacketRouting::SourceInterface,
-                }],
-                rejection: None,
-            },
+            IngestResult::LinkRequestReceived { link_id, proof_raw } => {
+                let Some(token) = self.allocate_outbound_protocol_token() else {
+                    self.transport.discard_unestablished_link(&link_id);
+                    return IngestOutcome::rejected(IngestRejection::ProtocolTokenExhausted {
+                        link_id,
+                    });
+                };
+                if !self.transport.assign_link_protocol_token(
+                    &link_id,
+                    rete_transport::LinkRole::Responder,
+                    token.0,
+                ) {
+                    self.transport.discard_unestablished_link(&link_id);
+                    return IngestOutcome::rejected(
+                        IngestRejection::ProtocolTokenAssignmentFailed { link_id },
+                    );
+                }
+                IngestOutcome {
+                    // A responder is not established until authenticated LRRTT.
+                    events: vec![],
+                    // LRPROOF is a synchronous response to the accepted request.
+                    // Preserve SourceInterface provenance for proof telemetry.
+                    packets: vec![OutboundPacket::new(
+                        proof_raw,
+                        PacketRouting::SourceInterface,
+                    )
+                    .with_protocol_token(token)],
+                    rejection: None,
+                }
+            }
             IngestResult::LinkEstablished { link_id } => {
                 let mut packets = Vec::new();
                 // Auto-send Python-compatible MessagePack float64 LRRTT if we
@@ -301,7 +365,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     .transport
                     .get_link(&link_id)
                     .filter(|link| link.role == rete_transport::LinkRole::Initiator)
-                    .map(|link| link.rtt as f64);
+                    .map(|link| link.rtt);
                 if let Some(rtt) = initiator_rtt {
                     if let Ok(pkt) = self
                         .transport
@@ -318,10 +382,23 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     rejection: None,
                 }
             }
+            IngestResult::LinkRttUpdated { link_id } => {
+                let rtt = self
+                    .transport
+                    .get_link(&link_id)
+                    .map(|link| link.rtt)
+                    .unwrap_or_default();
+                IngestOutcome {
+                    events: vec![NodeEvent::LinkRttUpdated { link_id, rtt }],
+                    packets: Vec::new(),
+                    rejection: None,
+                }
+            }
             IngestResult::Keepalive { link_id, reply } => {
                 let mut packets = Vec::new();
                 if reply {
-                    if let Ok(outbound) = self.build_owned_keepalive_outbound(&link_id, false, now)
+                    if let Ok(outbound) =
+                        self.build_owned_keepalive_outbound_at(&link_id, false, link_now)
                     {
                         packets.push(outbound);
                     }
@@ -445,10 +522,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 let packets = close_raw
                     .zip(interface)
                     .map(|(data, interface)| {
-                        vec![OutboundPacket {
+                        vec![OutboundPacket::new(
                             data,
-                            routing: PacketRouting::BoundInterface(interface),
-                        }]
+                            PacketRouting::BoundInterface(interface),
+                        )]
                     })
                     .unwrap_or_default();
                 self.link_closed_outcome(link_id, packets)
@@ -1011,9 +1088,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         response_packets
     }
 
-    fn prepare_tick<R: RngCore + CryptoRng>(
+    fn prepare_tick_at<R: RngCore + CryptoRng>(
         &mut self,
         now: u64,
+        link_now: rete_core::MonotonicInstant,
         rng: &mut R,
     ) -> Vec<OutboundPacket> {
         let mut packets = self.flush_announces(now, rng);
@@ -1029,8 +1107,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         // With dynamic keepalive on fast links, keepalive_interval can be as low
         // as 5s, which equals TICK_INTERVAL. Sending keepalives first ensures
         // they go out before the stale check.
-        for link_id in self.transport.pending_keepalive_link_ids(now) {
-            if let Ok(outbound) = self.build_owned_keepalive_outbound(&link_id, true, now) {
+        for link_id in self.transport.pending_keepalive_link_ids_at(link_now) {
+            if let Ok(outbound) =
+                self.build_owned_keepalive_outbound_at(&link_id, true, link_now)
+            {
                 packets.push(outbound);
             }
         }
@@ -1063,7 +1143,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         if shrink_window {
                             retried_links.push(link_id);
                         }
-                        packets.push(OutboundPacket { data, routing });
+                        packets.push(OutboundPacket::new(data, routing));
                     }
                 }
                 rete_transport::ChannelMaintenanceAction::Teardown(pending) => {
@@ -1094,8 +1174,30 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         R: RngCore + CryptoRng,
         T: ReceiptTerminalSink,
     {
-        let packets = self.prepare_tick(now, rng);
-        let result = self.transport.tick_with_receipt_sink(now, sink);
+        self.handle_tick_with_receipt_sink_at(
+            now,
+            rete_core::MonotonicInstant::from_secs(now),
+            rng,
+            sink,
+        )
+    }
+
+    /// Precise Link-clock variant of [`Self::handle_tick_with_receipt_sink`].
+    pub fn handle_tick_with_receipt_sink_at<R, T>(
+        &mut self,
+        now: u64,
+        link_now: rete_core::MonotonicInstant,
+        rng: &mut R,
+        sink: &mut T,
+    ) -> ReceiptSinkTickOutcome
+    where
+        R: RngCore + CryptoRng,
+        T: ReceiptTerminalSink,
+    {
+        let packets = self.prepare_tick_at(now, link_now, rng);
+        let result = self
+            .transport
+            .tick_with_receipt_sink_at(now, link_now, sink);
         let mut events = self.check_request_timeouts(now);
         events.push(NodeEvent::Tick {
             expired_paths: result.expired_paths,
@@ -1115,10 +1217,20 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
     /// Periodic maintenance: expire paths, collect pending announces, send keepalives.
     pub fn handle_tick<R: RngCore + CryptoRng>(&mut self, now: u64, rng: &mut R) -> IngestOutcome {
-        let packets = self.prepare_tick(now, rng);
+        self.handle_tick_at(now, rete_core::MonotonicInstant::from_secs(now), rng)
+    }
+
+    /// Precise Link-clock variant of [`Self::handle_tick`].
+    pub fn handle_tick_at<R: RngCore + CryptoRng>(
+        &mut self,
+        now: u64,
+        link_now: rete_core::MonotonicInstant,
+        rng: &mut R,
+    ) -> IngestOutcome {
+        let packets = self.prepare_tick_at(now, link_now, rng);
 
         // Now run tick: expire paths, check stale links, etc.
-        let result = self.transport.tick(now);
+        let result = self.transport.tick_at(now, link_now);
 
         // Check request timeouts
         let mut events = self.check_request_timeouts(now);

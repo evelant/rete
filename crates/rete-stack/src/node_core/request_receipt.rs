@@ -52,7 +52,8 @@ pub fn compute_request_timeout(rtt: f32) -> u64 {
     }
     let traffic_ms = rete_transport::link::compute_traffic_timeout_ms(rtt);
     let secs = (traffic_ms / 1000.0) as u64;
-    secs.max(MIN_REQUEST_TIMEOUT) + RESPONSE_GRACE_TIME
+    secs.max(MIN_REQUEST_TIMEOUT)
+        .saturating_add(RESPONSE_GRACE_TIME)
 }
 
 #[cfg(test)]
@@ -62,6 +63,11 @@ mod tests {
     #[test]
     fn default_timeout_when_rtt_zero() {
         assert_eq!(compute_request_timeout(0.0), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn infinite_rtt_saturates_without_overflow() {
+        assert_eq!(compute_request_timeout(f32::INFINITY), u64::MAX);
     }
 
     #[test]
