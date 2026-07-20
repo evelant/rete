@@ -5,8 +5,9 @@
 
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rete_core::{
-    DestHash, DestType, Identity, LinkId, Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE,
-    CONTEXT_LRPROOF, MTU, TRUNCATED_HASH_LEN,
+    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketBuilder,
+    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, MTU, TRANSPORT_TYPE_TRANSPORT,
+    TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
     compute_link_id, HeaplessStorage, IngestResult, Link, LinkState, LinkTableKind, Path,
@@ -82,6 +83,25 @@ fn build_link_request_from_payload_with(
         .build()
         .unwrap();
     buf[..n].to_vec()
+}
+
+fn wrap_header2(raw: &[u8], transport_id: IdentityHash) -> Vec<u8> {
+    let packet = Packet::parse(raw).unwrap();
+    let mut buf = [0u8; MTU];
+    let len = PacketBuilder::new(&mut buf)
+        .header_type(HeaderType::Header2)
+        .transport_type(TRANSPORT_TYPE_TRANSPORT)
+        .packet_type(packet.packet_type)
+        .dest_type(packet.dest_type)
+        .context_flag(packet.context_flag)
+        .hops(packet.hops)
+        .transport_id(transport_id.as_ref())
+        .destination_hash(packet.destination_hash)
+        .context(packet.context)
+        .payload(packet.payload)
+        .build()
+        .unwrap();
+    buf[..len].to_vec()
 }
 
 fn assert_local_link_request_rejected(dest_type: DestType, context: u8, payload_len: usize) {
@@ -220,6 +240,88 @@ fn link_request_local_creates_link() {
         other => panic!("expected LinkRequestReceived, got {:?}", other),
     }
     assert_eq!(t.link_count(), 1);
+}
+
+#[test]
+fn header2_local_link_request_uses_typed_owned_link_admission() {
+    let mut rng = rand::thread_rng();
+    let (mut transport, responder, destination) = make_responder(b"h2-local-responder");
+    let initiator = Identity::from_seed(b"h2-local-initiator").unwrap();
+    let request = build_link_request(&destination, &initiator, &mut rng);
+    let expected_id = compute_link_id(&request).unwrap();
+    let mut header2 = wrap_header2(&request, responder.hash());
+
+    assert!(matches!(
+        transport.ingest_on(&mut header2, 100, 3, &mut rng, &responder),
+        IngestResult::LinkRequestReceived { link_id, .. } if link_id == expected_id
+    ));
+    assert_eq!(transport.link_count(), 1);
+    assert_eq!(transport.relay_link_count(), 0);
+    assert_eq!(transport.reverse_count(), 0);
+}
+
+#[test]
+fn header2_owned_link_proof_and_data_reach_typed_dispatch() {
+    let mut rng = rand::thread_rng();
+    let (mut responder_transport, responder, destination) =
+        make_responder(b"h2-owned-link-responder");
+    let initiator = Identity::from_seed(b"h2-owned-link-initiator").unwrap();
+    let mut initiator_transport = TestTransport::new();
+    initiator_transport.register_identity(destination, responder.public_key(), 100);
+
+    let (request, link_id) = initiator_transport
+        .initiate_link(destination, &initiator, &mut rng, 100)
+        .unwrap();
+    let mut request = request;
+    let proof = match responder_transport.ingest(&mut request, 100, &mut rng, &responder) {
+        IngestResult::LinkRequestReceived { proof_raw, .. } => proof_raw,
+        other => panic!("expected local LINKREQUEST, got {other:?}"),
+    };
+
+    let mut header2_proof = wrap_header2(&proof, initiator.hash());
+    assert!(matches!(
+        initiator_transport.ingest_on(
+            &mut header2_proof,
+            101,
+            4,
+            &mut rng,
+            &initiator,
+        ),
+        IngestResult::LinkEstablished { link_id: id } if id == link_id
+    ));
+    assert_eq!(initiator_transport.reverse_count(), 0);
+
+    let lrrtt = initiator_transport
+        .build_lrrtt_packet(&link_id, b"h2-rtt", &mut rng)
+        .unwrap();
+    let mut header2_lrrtt = wrap_header2(&lrrtt, responder.hash());
+    assert!(matches!(
+        responder_transport.ingest_on(
+            &mut header2_lrrtt,
+            102,
+            5,
+            &mut rng,
+            &responder,
+        ),
+        IngestResult::LinkEstablished { link_id: id } if id == link_id
+    ));
+
+    let data = initiator_transport
+        .build_link_data_packet(&link_id, b"typed h2 link data", 0x00, &mut rng)
+        .unwrap();
+    let mut header2_data = wrap_header2(&data, responder.hash());
+    assert!(matches!(
+        responder_transport.ingest_on(
+            &mut header2_data,
+            103,
+            5,
+            &mut rng,
+            &responder,
+        ),
+        IngestResult::LinkData { link_id: id, data, .. }
+            if id == link_id && data == b"typed h2 link data"
+    ));
+    assert_eq!(responder_transport.reverse_count(), 0);
 }
 
 #[test]

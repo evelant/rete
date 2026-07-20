@@ -227,6 +227,40 @@ enum RelayLinkAdmission {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Header2Ownership {
+    Header1,
+    Announce,
+    Own,
+    Foreign,
+}
+
+fn header2_ownership(packet: &Packet<'_>, local_identity: IdentityHash) -> Header2Ownership {
+    if packet.header_type == HeaderType::Header1 {
+        Header2Ownership::Header1
+    } else if packet.packet_type == PacketType::Announce {
+        // Python RNS deliberately excludes ANNOUNCE from transport-id
+        // ownership filtering. Its transport header describes the learned
+        // path; it does not select a single transport instance as owner.
+        Header2Ownership::Announce
+    } else if packet
+        .transport_id
+        .is_some_and(|transport_id| IdentityHash::from_slice(transport_id) == local_identity)
+    {
+        Header2Ownership::Own
+    } else {
+        Header2Ownership::Foreign
+    }
+}
+
+fn normalize_owned_header2(raw: &mut [u8]) -> usize {
+    debug_assert!(raw.len() > 2 + 2 * TRUNCATED_HASH_LEN);
+    let len = raw.len();
+    raw[0] &= 0x0f;
+    raw.copy_within(2 + TRUNCATED_HASH_LEN..len, 2);
+    len - TRUNCATED_HASH_LEN
+}
+
 fn link_forward_interface(entry: &LinkTableEntry, source_iface: u8) -> Option<u8> {
     if entry.received_on == entry.outbound_to {
         (source_iface == entry.received_on).then_some(entry.received_on)
@@ -745,7 +779,11 @@ impl<S: TransportStorage> Transport<S> {
         self.ingest_on(raw, now, 0, rng, identity)
     }
 
-    fn proof_terminal_candidate(&self, raw: &[u8]) -> Option<ReceiptCandidate> {
+    fn proof_terminal_candidate(
+        &self,
+        raw: &[u8],
+        local_identity: IdentityHash,
+    ) -> Option<ReceiptCandidate> {
         let Ok(packet) = Packet::parse(raw) else {
             return None;
         };
@@ -753,17 +791,11 @@ impl<S: TransportStorage> Transport<S> {
             return None;
         }
 
-        // A HEADER_2 packet addressed to this transport identity is handled
-        // exclusively by the forwarding branch in `ingest_on`; it cannot
-        // terminate a local receipt even if its overloaded destination bytes
-        // collide with one of our local receipt keys.
-        if packet.header_type == HeaderType::Header2
-            && self.local_identity_hash.is_some_and(|local_id| {
-                packet
-                    .transport_id
-                    .is_some_and(|transport_id| IdentityHash::from_slice(transport_id) == local_id)
-            })
-        {
+        // Receipt preflight and normal ingress must agree on HEADER_2
+        // ownership. A proof for another transport instance cannot reserve
+        // our terminal capacity, while an own-targeted proof must reserve
+        // before typed dispatch can consume its receipt.
+        if header2_ownership(&packet, local_identity) == Header2Ownership::Foreign {
             return None;
         }
 
@@ -828,7 +860,8 @@ impl<S: TransportStorage> Transport<S> {
         R: RngCore + CryptoRng,
         T: ReceiptTerminalSink,
     {
-        let reservation = match self.proof_terminal_candidate(raw) {
+        let ingress_identity = self.local_identity_hash.unwrap_or_else(|| identity.hash());
+        let reservation = match self.proof_terminal_candidate(raw, ingress_identity) {
             Some(candidate) => Some((candidate, sink.try_reserve(candidate)?)),
             None => None,
         };
@@ -868,21 +901,36 @@ impl<S: TransportStorage> Transport<S> {
         rng: &mut R,
         identity: &Identity,
     ) -> IngestResult<'a> {
-        let len = raw.len();
-
-        // Lazy-init started_at on first ingest
-        if self.stats.started_at == 0 {
-            self.stats.started_at = now;
-        }
+        let mut len = raw.len();
 
         // Parse
         let pkt = match Packet::parse(raw) {
             Ok(p) => p,
             Err(_) => {
+                if self.stats.started_at == 0 {
+                    self.stats.started_at = now;
+                }
                 self.stats.packets_dropped_invalid += 1;
                 return IngestResult::Invalid;
             }
         };
+
+        let ingress_identity = self.local_identity_hash.unwrap_or_else(|| identity.hash());
+        let h2_ownership = header2_ownership(&pkt, ingress_identity);
+
+        // Match Python RNS packet_filter(): non-ANNOUNCE HEADER_2 traffic for
+        // another transport instance is ignored before packet-hash admission
+        // or any other observable transport mutation. IngestResult has no
+        // separate Ignored variant, so Invalid is the fail-closed action while
+        // statistics deliberately remain unchanged.
+        if h2_ownership == Header2Ownership::Foreign {
+            return IngestResult::Invalid;
+        }
+
+        // Lazy-init started_at on first admitted ingest.
+        if self.stats.started_at == 0 {
+            self.stats.started_at = now;
+        }
 
         self.stats.packets_received += 1;
 
@@ -918,214 +966,124 @@ impl<S: TransportStorage> Transport<S> {
             return IngestResult::Duplicate;
         }
 
-        // Check HEADER_2 forwarding
-        if pkt.header_type == HeaderType::Header2 {
-            if let Some(local_id) = self.local_identity_hash {
-                if let Some(tid) = pkt.transport_id {
-                    let tid_hash = IdentityHash::from_slice(tid);
+        // HEADER_2 has one narrow routing fast path. Local destinations,
+        // owned Links and receipts stay out of it by packet family and are
+        // normalized below for the same typed validators as HEADER_1.
+        if h2_ownership == Header2Ownership::Own {
+            let dest = DestHash::from_slice(pkt.destination_hash);
+            let is_remote_single_data = pkt.packet_type == PacketType::Data
+                && pkt.dest_type == DestType::Single
+                && !self.is_local_destination(&dest);
+            let is_remote_single_link_request = pkt.packet_type == PacketType::LinkRequest
+                && pkt.dest_type == DestType::Single
+                && !self.is_local_destination(&dest);
 
-                    if tid_hash == local_id {
-                        // LRPROOF is canonically emitted as HEADER_1 and has
-                        // stricter relay rules than ordinary link traffic.
-                        // In particular, Python excludes it from generic link
-                        // transport and validates its responder-side direction,
-                        // hop count, recalled identity and signature first.
-                        // Reject a targeted HEADER_2 form instead of allowing it
-                        // to bypass those checks through the generic H2 branch.
-                        if pkt.packet_type == PacketType::Proof
-                            && pkt.dest_type == DestType::Link
-                            && pkt.context == CONTEXT_LRPROOF
-                        {
+            if self.local_identity_hash.is_some()
+                && (is_remote_single_data || is_remote_single_link_request)
+            {
+                let is_link_request = is_remote_single_link_request;
+                let inbound_hops = pkt.hops.saturating_add(1);
+                let path_route = self
+                    .paths
+                    .get(&dest)
+                    .map(|path| (path.via, path.received_on, path.hops));
+
+                // A relayed LINKREQUEST may be emitted only after its complete
+                // bidirectional route has been retained. The packet hash has
+                // already entered the normal dedup window, matching owned-Link
+                // capacity rejection.
+                if is_link_request {
+                    let Some((_, Some(outbound_iface), remaining)) = path_route else {
+                        self.stats.packets_dropped_invalid += 1;
+                        return IngestResult::Invalid;
+                    };
+                    let lid = match compute_link_id(raw) {
+                        Ok(lid) => lid,
+                        Err(_) => {
                             self.stats.packets_dropped_invalid += 1;
                             return IngestResult::Invalid;
                         }
-
-                        let dest = DestHash::from_slice(pkt.destination_hash);
-                        let is_link_request = pkt.packet_type == PacketType::LinkRequest;
-                        let is_link_dest = pkt.dest_type == DestType::Link;
-                        let inbound_hops = pkt.hops.saturating_add(1);
-                        let path_route = self
-                            .paths
-                            .get(&dest)
-                            .map(|path| (path.via, path.received_on, path.hops));
-
-                        // A relayed LINKREQUEST may be emitted only after its
-                        // complete bidirectional route has been retained. The
-                        // packet hash has already entered the normal dedup
-                        // window, matching owned-Link capacity rejection.
-                        if is_link_request {
-                            let Some((_, Some(outbound_iface), remaining)) = path_route else {
-                                self.stats.packets_dropped_invalid += 1;
-                                return IngestResult::Invalid;
-                            };
-                            let lid = match compute_link_id(raw) {
-                                Ok(lid) => lid,
-                                Err(_) => {
-                                    self.stats.packets_dropped_invalid += 1;
-                                    return IngestResult::Invalid;
-                                }
-                            };
-                            let entry = LinkTableEntry {
-                                timestamp: now,
-                                received_on: iface,
-                                outbound_to: outbound_iface,
+                    };
+                    let entry = LinkTableEntry {
+                        timestamp: now,
+                        received_on: iface,
+                        outbound_to: outbound_iface,
+                        inbound_hops,
+                        outbound_hops: remaining,
+                        destination_hash: dest,
+                    };
+                    match self.admit_relay_link(lid, entry) {
+                        RelayLinkAdmission::Inserted => {
+                            relay_log!(
+                                "[relay] H2 LINKREQUEST link_table INSERT lid={} dest={} in_hops={} out_hops={} rcvd={} out={}",
+                                hex_short(lid.as_ref()),
+                                hex_short(dest.as_ref()),
                                 inbound_hops,
-                                outbound_hops: remaining,
-                                destination_hash: dest,
+                                remaining,
+                                iface,
+                                outbound_iface,
+                            );
+                        }
+                        RelayLinkAdmission::Existing => {
+                            return IngestResult::Duplicate;
+                        }
+                        RelayLinkAdmission::Full => {
+                            return IngestResult::LinkTableFull {
+                                link_id: lid,
+                                table: LinkTableKind::Relay,
                             };
-                            match self.admit_relay_link(lid, entry) {
-                                RelayLinkAdmission::Inserted => {
-                                    relay_log!(
-                                        "[relay] H2 LINKREQUEST link_table INSERT lid={} dest={} in_hops={} out_hops={} rcvd={} out={}",
-                                        hex_short(lid.as_ref()),
-                                        hex_short(dest.as_ref()),
-                                        inbound_hops,
-                                        remaining,
-                                        iface,
-                                        outbound_iface,
-                                    );
-                                }
-                                RelayLinkAdmission::Existing => {
-                                    return IngestResult::Duplicate;
-                                }
-                                RelayLinkAdmission::Full => {
-                                    return IngestResult::LinkTableFull {
-                                        link_id: lid,
-                                        table: LinkTableKind::Relay,
-                                    };
-                                }
-                            }
                         }
-
-                        // End pkt borrow on raw before mutating
-                        #[allow(clippy::drop_non_drop)]
-                        drop(pkt);
-
-                        // Store and emit hops AFTER increment to match Python
-                        // (Transport.py:1319 increments first, line 1488 stores).
-                        raw[1] = inbound_hops;
-                        let h2_result = match path_route {
-                            Some((Some(via), Some(outbound_iface), _)) => {
-                                relay_log!(
-                                    "[relay] H2 FWD via={} dest={} iface={}",
-                                    hex_short(via.as_ref()),
-                                    hex_short(dest.as_ref()),
-                                    iface,
-                                );
-                                raw[2..18].copy_from_slice(via.as_ref());
-                                if !is_link_request {
-                                    self.remember_reverse_route(
-                                        &pkt_hash,
-                                        now,
-                                        iface,
-                                        outbound_iface,
-                                    );
-                                }
-                                IngestResult::Forward {
-                                    raw: &raw[..len],
-                                    source_iface: iface,
-                                    target: ForwardTarget::ExactInterface(outbound_iface),
-                                }
-                            }
-                            Some((None, Some(outbound_iface), _)) => {
-                                relay_log!(
-                                    "[relay] H2->H1 FWD direct dest={} iface={} len={}->{}",
-                                    hex_short(dest.as_ref()),
-                                    iface,
-                                    len,
-                                    len - TRUNCATED_HASH_LEN,
-                                );
-                                let new_flags = raw[0] & 0x0F;
-                                raw[0] = new_flags;
-                                raw.copy_within(18..len, 2);
-                                if !is_link_request {
-                                    self.remember_reverse_route(
-                                        &pkt_hash,
-                                        now,
-                                        iface,
-                                        outbound_iface,
-                                    );
-                                }
-                                IngestResult::Forward {
-                                    raw: &raw[..len - TRUNCATED_HASH_LEN],
-                                    source_iface: iface,
-                                    target: ForwardTarget::ExactInterface(outbound_iface),
-                                }
-                            }
-                            Some((_, None, _)) => {
-                                relay_log!(
-                                    "[relay] H2 PATH WITHOUT INTERFACE dest={}",
-                                    hex_short(dest.as_ref()),
-                                );
-                                IngestResult::Invalid
-                            }
-                            None if is_link_dest => {
-                                // No path for this dest, but dest_type=Link:
-                                // route via link_table (dest = link_id).
-                                // This handles H2 link DATA, channel, keepalive,
-                                // etc. where the destination_hash is a link_id
-                                // (not in path_table).
-                                let dest_as_lid = LinkId::from_slice(dest.as_ref());
-                                if let Some(lte) = self.link_table.get_mut(&dest_as_lid) {
-                                    // Exact hop-count match (same as H1 link_table)
-                                    let hops = raw[1];
-                                    if let Some(outbound_iface) = link_forward_interface(lte, iface)
-                                        .filter(|_| link_hops_match(lte, iface, hops))
-                                    {
-                                        lte.timestamp = now;
-                                        relay_log!(
-                                            "[relay] H2 link_table FWD lid={} iface={} hops={}",
-                                            hex_short(dest.as_ref()),
-                                            iface,
-                                            hops,
-                                        );
-                                        // Convert H2→H1 and forward (link traffic
-                                        // goes directly to the link endpoint)
-                                        let new_flags = raw[0] & 0x0F;
-                                        raw[0] = new_flags;
-                                        raw.copy_within(18..len, 2);
-                                        self.remember_reverse_route(
-                                            &pkt_hash,
-                                            now,
-                                            iface,
-                                            outbound_iface,
-                                        );
-                                        IngestResult::Forward {
-                                            raw: &raw[..len - TRUNCATED_HASH_LEN],
-                                            source_iface: iface,
-                                            target: ForwardTarget::ExactInterface(outbound_iface),
-                                        }
-                                    } else {
-                                        relay_log!(
-                                            "[relay] H2 link_table HOP_EXCEED lid={} hops={}",
-                                            hex_short(dest.as_ref()),
-                                            raw[1],
-                                        );
-                                        IngestResult::Invalid
-                                    }
-                                } else {
-                                    relay_log!(
-                                        "[relay] H2 link_table MISS lid={}",
-                                        hex_short(dest.as_ref()),
-                                    );
-                                    IngestResult::Invalid
-                                }
-                            }
-                            None => {
-                                relay_log!("[relay] H2 NO_PATH dest={}", hex_short(dest.as_ref()),);
-                                IngestResult::Invalid
-                            }
-                        };
-                        match &h2_result {
-                            IngestResult::Forward { .. } => self.stats.packets_forwarded += 1,
-                            IngestResult::Invalid => self.stats.packets_dropped_invalid += 1,
-                            _ => {}
-                        }
-                        return h2_result;
                     }
                 }
+
+                #[allow(clippy::drop_non_drop)]
+                drop(pkt);
+
+                // Python increments before recording the relay route and
+                // emitting the forwarded packet.
+                raw[1] = inbound_hops;
+                let h2_result = match path_route {
+                    Some((Some(via), Some(outbound_iface), _)) => {
+                        raw[2..2 + TRUNCATED_HASH_LEN].copy_from_slice(via.as_ref());
+                        if !is_link_request {
+                            self.remember_reverse_route(&pkt_hash, now, iface, outbound_iface);
+                        }
+                        IngestResult::Forward {
+                            raw: &raw[..len],
+                            source_iface: iface,
+                            target: ForwardTarget::ExactInterface(outbound_iface),
+                        }
+                    }
+                    Some((None, Some(outbound_iface), _)) => {
+                        let forwarded_len = normalize_owned_header2(raw);
+                        if !is_link_request {
+                            self.remember_reverse_route(&pkt_hash, now, iface, outbound_iface);
+                        }
+                        IngestResult::Forward {
+                            raw: &raw[..forwarded_len],
+                            source_iface: iface,
+                            target: ForwardTarget::ExactInterface(outbound_iface),
+                        }
+                    }
+                    Some((_, None, _)) | None => IngestResult::Invalid,
+                };
+                match &h2_result {
+                    IngestResult::Forward { .. } => self.stats.packets_forwarded += 1,
+                    IngestResult::Invalid => self.stats.packets_dropped_invalid += 1,
+                    _ => {}
+                }
+                return h2_result;
             }
+
+            // Consume our transport hop before local/Link/proof dispatch. This
+            // admits HEADER_2 LRPROOF only through the ordinary direction,
+            // hop, identity and signature validators below.
+            #[allow(clippy::drop_non_drop)]
+            drop(pkt);
+            len = normalize_owned_header2(raw);
         }
+
+        let raw = &mut raw[..len];
 
         // Increment hops
         raw[1] = raw[1].saturating_add(1);
@@ -1222,6 +1180,20 @@ impl<S: TransportStorage> Transport<S> {
 
                 // Transport relay: if we're a transport node and this isn't
                 // our own destination, forward to the next hop.
+                if h2_ownership == Header2Ownership::Own && !self.is_local_destination(&dh) {
+                    // An own-targeted HEADER_2 packet reaches this point only
+                    // when it is outside the explicit DATA/SINGLE path-routing
+                    // family above. Do not silently broaden that relay surface
+                    // through HEADER_1 compatibility handling.
+                    self.stats.packets_dropped_invalid += 1;
+                    return IngestResult::Invalid;
+                }
+
+                // Intentional compatibility seam: unlike Python RNS 1.3.8,
+                // which gates arbitrary HEADER_1 path routing on local-client
+                // roles, Rete currently uses HEADER_1 ingress as its local
+                // origin injection surface. Preserve that product behavior
+                // until interface roles make local origin explicit.
                 if self.local_identity_hash.is_some() && !self.is_local_destination(&dh) {
                     if let Some(path) = self.paths.get(&dh) {
                         let Some(outbound_iface) = path.received_on else {
@@ -1480,6 +1452,9 @@ impl<S: TransportStorage> Transport<S> {
                         self.stats.packets_dropped_invalid += 1;
                         IngestResult::Invalid
                     }
+                } else if h2_ownership == Header2Ownership::Own {
+                    self.stats.packets_dropped_invalid += 1;
+                    IngestResult::Invalid
                 } else {
                     self.stats.packets_forwarded += 1;
                     IngestResult::Forward {
@@ -1504,9 +1479,22 @@ impl<S: TransportStorage> Transport<S> {
                     }
                     self.handle_link_request(raw, &dh, pkt.payload, now, rng, identity)
                 } else {
+                    if h2_ownership == Header2Ownership::Own {
+                        // Remote HEADER_2 LINKREQUEST/SINGLE was handled by
+                        // the narrow exact-path branch above. Remaining owned
+                        // forms must not inherit HEADER_1 propagation behavior.
+                        self.stats.packets_dropped_invalid += 1;
+                        return IngestResult::Invalid;
+                    }
+
                     // For HEADER_1 LINKREQUEST forwarding on a transport node:
                     // also create a link_table entry so link traffic can be
                     // routed bidirectionally (same as HEADER_2 handling above).
+                    //
+                    // This is the same intentional local-origin compatibility
+                    // seam as HEADER_1 DATA above. A later ingress-role patch
+                    // should distinguish local injection from arbitrary remote
+                    // ingress before narrowing it to Python's behavior.
                     if self.local_identity_hash.is_some() {
                         let Some(path) = self.paths.get(&dh) else {
                             self.stats.packets_dropped_invalid += 1;
@@ -1806,16 +1794,13 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_header2_proof_does_not_reserve_a_colliding_local_receipt() {
+    fn own_header2_receipt_proof_reserves_then_reaches_typed_dispatch() {
         let mut transport = TestTransport::new();
         let relay_hash = IdentityHash::from([0x11; TRUNCATED_HASH_LEN]);
-        let peer = Identity::from_seed(b"forwarded-proof-receipt-peer").unwrap();
+        let peer = Identity::from_seed(b"own-header2-receipt-peer").unwrap();
         let packet_hash = [0x5a; 32];
         let destination = DestHash::from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
         transport.set_local_identity(relay_hash);
-        let mut path = Path::direct(0);
-        path.received_on = Some(6);
-        assert!(transport.insert_path(destination, path));
         transport
             .register_receipt(packet_hash, peer.public_key(), 100, RECEIPT_TIMEOUT)
             .unwrap();
@@ -1835,7 +1820,30 @@ mod tests {
             .unwrap();
         let mut full_sink = crate::FixedReceiptTerminalSink::<0>::new();
         let mut rng = rand::thread_rng();
+        let original = forwarded[..forwarded_len].to_vec();
 
+        assert_eq!(
+            transport
+                .ingest_on_with_receipt_sink(
+                    &mut forwarded[..forwarded_len],
+                    101,
+                    3,
+                    &mut rng,
+                    &peer,
+                    &mut full_sink,
+                )
+                .unwrap_err(),
+            ReceiptSinkFull
+        );
+        assert_eq!(&forwarded[..forwarded_len], original.as_slice());
+        assert_eq!(transport.stats().started_at, 0);
+        assert_eq!(transport.stats().packets_received, 0);
+        assert_eq!(
+            transport.receipt_status(&packet_hash),
+            Some(crate::ReceiptStatus::Sent)
+        );
+
+        let mut sink = crate::FixedReceiptTerminalSink::<1>::new();
         let result = transport
             .ingest_on_with_receipt_sink(
                 &mut forwarded[..forwarded_len],
@@ -1843,18 +1851,65 @@ mod tests {
                 3,
                 &mut rng,
                 &peer,
-                &mut full_sink,
+                &mut sink,
             )
-            .expect("a relayed proof must not require local terminal capacity");
+            .expect("reserved own proof should reach typed validation");
 
         assert!(matches!(
             result,
-            IngestResult::Forward {
-                source_iface: 3,
-                target: ForwardTarget::ExactInterface(6),
-                ..
-            }
+            IngestResult::ProofReceived { packet_hash: hash } if hash == packet_hash
         ));
+        assert_eq!(transport.receipt_status(&packet_hash), None);
+        assert_eq!(sink.as_slice(), &[ReceiptTerminal::Delivered(packet_hash)]);
+        assert_eq!(transport.reverse_count(), 0);
+    }
+
+    #[test]
+    fn foreign_header2_proof_cannot_reserve_a_local_receipt() {
+        let mut transport = TestTransport::new();
+        let relay_hash = IdentityHash::from([0x11; TRUNCATED_HASH_LEN]);
+        let foreign_hash = IdentityHash::from([0x22; TRUNCATED_HASH_LEN]);
+        let peer = Identity::from_seed(b"foreign-header2-receipt-peer").unwrap();
+        let packet_hash = [0x6b; 32];
+        let destination = DestHash::from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
+        transport.set_local_identity(relay_hash);
+        transport
+            .register_receipt(packet_hash, peer.public_key(), 100, RECEIPT_TIMEOUT)
+            .unwrap();
+
+        let ordinary_proof = TestTransport::build_proof_packet(&peer, &packet_hash).unwrap();
+        let proof_payload = Packet::parse(&ordinary_proof).unwrap().payload.to_vec();
+        let mut foreign = [0u8; rete_core::MTU];
+        let foreign_len = PacketBuilder::new(&mut foreign)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(PacketType::Proof)
+            .dest_type(DestType::Single)
+            .transport_id(foreign_hash.as_ref())
+            .destination_hash(destination.as_ref())
+            .payload(&proof_payload)
+            .build()
+            .unwrap();
+        let original = foreign[..foreign_len].to_vec();
+        let mut full_sink = crate::FixedReceiptTerminalSink::<0>::new();
+        let mut rng = rand::thread_rng();
+
+        assert!(matches!(
+            transport
+                .ingest_on_with_receipt_sink(
+                    &mut foreign[..foreign_len],
+                    101,
+                    3,
+                    &mut rng,
+                    &peer,
+                    &mut full_sink,
+                )
+                .expect("foreign proof must not reserve terminal capacity"),
+            IngestResult::Invalid
+        ));
+        assert_eq!(&foreign[..foreign_len], original.as_slice());
+        assert_eq!(transport.stats().started_at, 0);
+        assert_eq!(transport.stats().packets_received, 0);
         assert_eq!(
             transport.receipt_status(&packet_hash),
             Some(crate::ReceiptStatus::Sent)
@@ -1977,6 +2032,29 @@ mod tests {
             .build()
             .unwrap();
         (buf, n)
+    }
+
+    fn wrap_header2(
+        raw: &[u8],
+        transport_id: &IdentityHash,
+        hops: u8,
+    ) -> ([u8; rete_core::MTU], usize) {
+        let packet = Packet::parse(raw).unwrap();
+        let mut buf = [0u8; rete_core::MTU];
+        let len = PacketBuilder::new(&mut buf)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(packet.packet_type)
+            .dest_type(packet.dest_type)
+            .context_flag(packet.context_flag)
+            .hops(hops)
+            .transport_id(transport_id.as_ref())
+            .destination_hash(packet.destination_hash)
+            .context(packet.context)
+            .payload(packet.payload)
+            .build()
+            .unwrap();
+        (buf, len)
     }
 
     /// Helper: set up a transport relay with a learned path for the destination.
@@ -2331,8 +2409,9 @@ mod tests {
 
         assert_eq!(transport.link_table.len(), 1);
 
-        // Step 2: Build a link DATA packet (HEADER_1, dest_type=Link, dest_hash=link_id)
-        // This simulates LRRTT or other link traffic from the initiator side.
+        // Step 2: Build link DATA and target this transport with HEADER_2.
+        // It must normalize into typed Link routing, not generic path/reverse
+        // handling.
         let mut data_buf = [0u8; rete_core::MTU];
         let data_len = PacketBuilder::new(&mut data_buf)
             .packet_type(PacketType::Data)
@@ -2342,17 +2421,23 @@ mod tests {
             .payload(&[0x42; 16])
             .build()
             .unwrap();
+        let (mut header2_data, header2_len) = wrap_header2(&data_buf[..data_len], &relay_hash, 0);
 
-        let result = transport.ingest_on(&mut data_buf[..data_len], 101, 0, &mut rng, &identity);
-
-        assert!(matches!(
-            result,
+        match transport.ingest_on(
+            &mut header2_data[..header2_len],
+            101,
+            0,
+            &mut rng,
+            &identity,
+        ) {
             IngestResult::Forward {
+                raw,
                 source_iface: 0,
                 target: ForwardTarget::ExactInterface(1),
-                ..
-            }
-        ));
+            } => assert_eq!(Packet::parse(raw).unwrap().header_type, HeaderType::Header1),
+            other => panic!("expected typed exact-interface Link forward, got {other:?}"),
+        }
+        assert_eq!(transport.reverse_count(), 0);
     }
 
     #[test]
@@ -2410,48 +2495,63 @@ mod tests {
     }
 
     #[test]
-    fn test_header2_lrproof_cannot_bypass_relay_validation() {
+    fn test_header2_lrproof_normalizes_into_strict_relay_validation() {
         let mut rng = rand_core::OsRng;
         let (mut transport, link_id, proof, identity) = make_relay_with_valid_lrproof(100);
-        let parsed = Packet::parse(&proof).unwrap();
-        let proof_payload = parsed.payload.to_vec();
         let relay_hash = IdentityHash::from([0x11u8; TRUNCATED_HASH_LEN]);
-        let mut header2_proof = [0u8; rete_core::MTU];
-        let proof_len = PacketBuilder::new(&mut header2_proof)
-            .header_type(HeaderType::Header2)
-            .transport_type(TRANSPORT_TYPE_TRANSPORT)
-            .packet_type(PacketType::Proof)
-            .dest_type(DestType::Link)
-            .transport_id(relay_hash.as_ref())
-            .destination_hash(link_id.as_ref())
-            .context(CONTEXT_LRPROOF)
-            .payload(&proof_payload)
-            .build()
-            .unwrap();
+        let (mut header2_proof, proof_len) = wrap_header2(&proof, &relay_hash, 0);
 
         let forwarded_before = transport.stats().packets_forwarded;
-        assert!(matches!(
-            transport.ingest_on(
-                &mut header2_proof[..proof_len],
-                500,
-                1,
-                &mut rng,
-                &identity,
-            ),
-            IngestResult::Invalid
-        ));
+        match transport.ingest_on(&mut header2_proof[..proof_len], 500, 1, &mut rng, &identity) {
+            IngestResult::Forward {
+                raw,
+                source_iface: 1,
+                target: ForwardTarget::ExactInterface(0),
+            } => {
+                let normalized = Packet::parse(raw).unwrap();
+                assert_eq!(normalized.header_type, HeaderType::Header1);
+                assert_eq!(normalized.packet_type, PacketType::Proof);
+                assert_eq!(normalized.dest_type, DestType::Link);
+                assert_eq!(normalized.context, CONTEXT_LRPROOF);
+            }
+            other => panic!("expected validated exact-interface LRPROOF forward, got {other:?}"),
+        }
         assert_eq!(
             transport.link_table.get(&link_id).unwrap().timestamp,
-            100,
-            "a HEADER_2 LRPROOF must not refresh the relay entry"
+            500,
+            "a validated HEADER_2 LRPROOF must refresh the relay entry"
         );
-        assert_eq!(transport.stats().packets_forwarded, forwarded_before);
-        assert_eq!(transport.stats().packets_dropped_invalid, 1);
+        assert_eq!(transport.stats().packets_forwarded, forwarded_before + 1);
+        assert_eq!(transport.stats().packets_dropped_invalid, 0);
         assert_eq!(
             transport.reverse_table.len(),
             0,
-            "a rejected HEADER_2 LRPROOF must not allocate reverse state"
+            "HEADER_2 LRPROOF must not allocate reverse state"
         );
+    }
+
+    #[test]
+    fn invalid_header2_lrproof_never_refreshes_or_allocates_reverse_state() {
+        let relay_hash = IdentityHash::from([0x11u8; TRUNCATED_HASH_LEN]);
+
+        for case in ["signature", "direction", "hops"] {
+            let mut rng = rand_core::OsRng;
+            let (mut transport, link_id, proof, identity) = make_relay_with_valid_lrproof(100);
+            let (mut header2, len) = wrap_header2(&proof, &relay_hash, u8::from(case == "hops"));
+            if case == "signature" {
+                header2[len - 1] ^= 0x80;
+            }
+            let iface = if case == "direction" { 0 } else { 1 };
+
+            assert!(matches!(
+                transport.ingest_on(&mut header2[..len], 500, iface, &mut rng, &identity),
+                IngestResult::Invalid
+            ));
+            assert_eq!(transport.link_table.get(&link_id).unwrap().timestamp, 100);
+            assert_eq!(transport.stats().packets_forwarded, 1);
+            assert_eq!(transport.stats().packets_dropped_invalid, 1);
+            assert_eq!(transport.reverse_count(), 0);
+        }
     }
 
     #[test]

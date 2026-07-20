@@ -23,6 +23,27 @@ fn build_header1_proof(dest_hash: &[u8; TRUNCATED_HASH_LEN], payload: &[u8]) -> 
     buf[..n].to_vec()
 }
 
+/// Build valid HEADER_2 PROOF raw bytes.
+fn build_header2_proof(
+    transport_id: &[u8; TRUNCATED_HASH_LEN],
+    dest_hash: &[u8; TRUNCATED_HASH_LEN],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = [0u8; MTU];
+    let n = PacketBuilder::new(&mut buf)
+        .header_type(HeaderType::Header2)
+        .transport_type(TRANSPORT_TYPE_TRANSPORT)
+        .packet_type(PacketType::Proof)
+        .dest_type(DestType::Single)
+        .transport_id(transport_id)
+        .destination_hash(dest_hash)
+        .context(0x00)
+        .payload(payload)
+        .build()
+        .unwrap();
+    buf[..n].to_vec()
+}
+
 /// Small transport suitable for tests.
 type TestTransport = Transport<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
 
@@ -122,10 +143,10 @@ fn transport_without_identity_never_forwards() {
         other => panic!("expected LocalData, got {:?}", other),
     }
 
-    // HEADER_2 with no local identity should fall through to normal processing
-    // (not forwarding, but local delivery) — matches Python RNS behavior
-    let tid = [0xBB; TRUNCATED_HASH_LEN];
-    let mut raw2 = build_header2_data(&tid, dest.as_bytes(), b"test");
+    // An own-targeted HEADER_2 packet must still reach local typed dispatch
+    // when transport mode is disabled. The active endpoint identity owns it.
+    let identity_hash = identity.hash();
+    let mut raw2 = build_header2_data(identity_hash.as_bytes(), dest.as_bytes(), b"test");
     match t.ingest(&mut raw2, 100, &mut rng, &identity) {
         IngestResult::LocalData {
             dest_hash, payload, ..
@@ -297,25 +318,61 @@ fn snapshot_round_trip_does_not_restore_or_advertise_unbound_paths() {
 }
 
 #[test]
-fn header2_data_other_transport_id_falls_through() {
-    // HEADER_2 DATA with non-matching transport_id should NOT be dropped.
-    // It falls through to normal processing (local delivery if destination
-    // is registered), matching Python RNS behavior.
-    let (mut t, _local_hash) = make_relay_transport(b"relay-node");
-    let mut rng = rand::thread_rng();
-    let identity = Identity::from_seed(b"test-identity").unwrap();
-    let other_tid = [0xFFu8; TRUNCATED_HASH_LEN]; // not our identity
-    let dest = DestHash::from([0xCCu8; TRUNCATED_HASH_LEN]);
-    t.add_local_destination(dest);
-    let mut raw = build_header2_data(&other_tid, dest.as_bytes(), b"not for relay");
-    match t.ingest(&mut raw, 100, &mut rng, &identity) {
-        IngestResult::LocalData {
-            dest_hash, payload, ..
-        } => {
-            assert_eq!(dest_hash, dest);
-            assert_eq!(payload, b"not for relay");
+fn foreign_header2_families_drop_before_state_dedup_or_raw_mutation() {
+    let identity = Identity::from_seed(b"foreign-h2-filter-identity").unwrap();
+    let local_hash = IdentityHash::from([0x11; TRUNCATED_HASH_LEN]);
+    let other_hash = IdentityHash::from([0xff; TRUNCATED_HASH_LEN]);
+    let destination = DestHash::from([0xcc; TRUNCATED_HASH_LEN]);
+
+    for (packet_type, dest_type, context) in [
+        (PacketType::Data, DestType::Single, 0x00),
+        (PacketType::Data, DestType::Link, 0x00),
+        (PacketType::LinkRequest, DestType::Single, 0x00),
+        (PacketType::Proof, DestType::Single, 0x00),
+        (PacketType::Proof, DestType::Link, 0xff),
+    ] {
+        let mut transport = TestTransport::new();
+        transport.set_local_identity(local_hash);
+        transport.add_local_destination(destination);
+        insert_path_on(&mut transport, destination, None, 1, 1, 7);
+
+        let payload = if packet_type == PacketType::LinkRequest {
+            vec![0x42; 64]
+        } else {
+            vec![0x24; 96]
+        };
+        let mut raw = vec![0u8; MTU];
+        let len = PacketBuilder::new(&mut raw)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(packet_type)
+            .dest_type(dest_type)
+            .transport_id(other_hash.as_ref())
+            .destination_hash(destination.as_ref())
+            .context(context)
+            .payload(&payload)
+            .build()
+            .unwrap();
+        raw.truncate(len);
+        let original = raw.clone();
+        let mut rng = rand::thread_rng();
+
+        for now in [100, 101] {
+            assert!(matches!(
+                transport.ingest_on(&mut raw, now, 3, &mut rng, &identity),
+                IngestResult::Invalid
+            ));
+            assert_eq!(raw, original, "foreign HEADER_2 raw bytes changed");
         }
-        other => panic!("expected LocalData, got {:?}", other),
+
+        assert_eq!(transport.stats().started_at, 0);
+        assert_eq!(transport.stats().packets_received, 0);
+        assert_eq!(transport.stats().packets_forwarded, 0);
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
+        assert_eq!(transport.stats().packets_dropped_invalid, 0);
+        assert_eq!(transport.path_count(), 1);
+        assert_eq!(transport.reverse_count(), 0);
+        assert_eq!(transport.relay_link_count(), 0);
     }
 }
 
@@ -333,8 +390,14 @@ fn header2_forward_multihop() {
     insert_path(&mut t, dest, Some(next_hop), 3, 100);
 
     let mut raw = build_header2_data(local_hash.as_bytes(), dest.as_bytes(), b"multihop");
-    match t.ingest(&mut raw, 100, &mut rng, &identity) {
-        IngestResult::Forward { raw: fwd, .. } => {
+    match t.ingest_on(&mut raw, 100, 4, &mut rng, &identity) {
+        IngestResult::Forward {
+            raw: fwd,
+            source_iface,
+            target,
+        } => {
+            assert_eq!(source_iface, 4);
+            assert_eq!(target, ForwardTarget::ExactInterface(1));
             // Should still be HEADER_2
             let pkt = Packet::parse(fwd).unwrap();
             assert_eq!(pkt.header_type, HeaderType::Header2);
@@ -357,8 +420,14 @@ fn header2_forward_lasthop() {
     insert_path(&mut t, dest, None, 1, 100);
 
     let mut raw = build_header2_data(local_hash.as_bytes(), dest.as_bytes(), b"last hop");
-    match t.ingest(&mut raw, 100, &mut rng, &identity) {
-        IngestResult::Forward { raw: fwd, .. } => {
+    match t.ingest_on(&mut raw, 100, 4, &mut rng, &identity) {
+        IngestResult::Forward {
+            raw: fwd,
+            source_iface,
+            target,
+        } => {
+            assert_eq!(source_iface, 4);
+            assert_eq!(target, ForwardTarget::ExactInterface(1));
             let pkt = Packet::parse(fwd).unwrap();
             // Should be converted to HEADER_1
             assert_eq!(pkt.header_type, HeaderType::Header1);
@@ -909,23 +978,19 @@ fn self_announce_no_retransmission() {
 }
 
 #[test]
-fn foreign_announce_still_accepted() {
+fn header2_announce_ignores_transport_ownership_and_reaches_validation() {
     let announcer = Identity::from_seed(b"foreign-node").unwrap();
     let local = Identity::from_seed(b"local-node").unwrap();
-    let mut t = TestTransport::new();
     let mut rng = rand::thread_rng();
-    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let local_transport = local.hash();
+    let foreign_transport = IdentityHash::from([0xee; TRUNCATED_HASH_LEN]);
 
-    // Register local destination
     let mut name_buf = [0u8; 128];
     let expanded = rete_core::expand_name("testapp", &["aspect1"], &mut name_buf).unwrap();
-    let local_hash = local.hash();
-    let local_dest = rete_core::destination_hash(expanded, Some(&local_hash));
-    t.add_local_destination(local_dest);
+    let local_dest = rete_core::destination_hash(expanded, Some(&local.hash()));
 
-    // Create announce from a different identity
-    let mut buf = [0u8; MTU];
-    let n = TestTransport::create_announce(
+    let mut announce = [0u8; MTU];
+    let announce_len = TestTransport::create_announce(
         &announcer,
         "testapp",
         &["aspect1"],
@@ -933,14 +998,36 @@ fn foreign_announce_still_accepted() {
         None,
         &mut rng,
         1000,
-        &mut buf,
+        &mut announce,
     )
     .unwrap();
+    let parsed = Packet::parse(&announce[..announce_len]).unwrap();
 
-    let mut pkt = buf[..n].to_vec();
-    match t.ingest(&mut pkt, 1000, &mut rng, &identity) {
-        IngestResult::AnnounceReceived { .. } => {} // expected
-        other => panic!("expected AnnounceReceived, got {:?}", other),
+    for transport_id in [local_transport, foreign_transport] {
+        let mut transport = TestTransport::new();
+        transport.set_local_identity(local_transport);
+        transport.add_local_destination(local_dest);
+
+        let mut header2 = [0u8; MTU];
+        let header2_len = PacketBuilder::new(&mut header2)
+            .header_type(HeaderType::Header2)
+            .transport_type(TRANSPORT_TYPE_TRANSPORT)
+            .packet_type(PacketType::Announce)
+            .dest_type(parsed.dest_type)
+            .context_flag(parsed.context_flag)
+            .hops(parsed.hops)
+            .transport_id(transport_id.as_ref())
+            .destination_hash(parsed.destination_hash)
+            .context(parsed.context)
+            .payload(parsed.payload)
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            transport.ingest_on(&mut header2[..header2_len], 1000, 3, &mut rng, &local,),
+            IngestResult::AnnounceReceived { .. }
+        ));
+        assert_eq!(transport.stats().announces_received, 1);
     }
 }
 
@@ -968,19 +1055,22 @@ fn proof_routed_via_reverse_table() {
     // Truncated packet hash is the dest_hash field of the PROOF
     let trunc: [u8; TRUNCATED_HASH_LEN] = pkt_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
 
-    // Now ingest a PROOF with dest_hash = truncated packet hash
-    let mut proof = build_header1_proof(&trunc, b"proof-payload");
+    // An own-targeted HEADER_2 PROOF must normalize into typed reverse
+    // routing; it is not ordinary destination-path traffic.
+    let mut proof = build_header2_proof(local_hash.as_bytes(), &trunc, b"proof-payload");
     match t.ingest_on(&mut proof, 101, 1, &mut rng, &identity) {
         IngestResult::Forward {
+            raw,
             source_iface,
             target,
-            ..
         } => {
             assert_eq!(source_iface, 1);
             assert_eq!(target, ForwardTarget::ExactInterface(0));
+            assert_eq!(Packet::parse(raw).unwrap().header_type, HeaderType::Header1);
         }
         other => panic!("expected Forward for PROOF, got {:?}", other),
     }
+    assert_eq!(t.reverse_count(), 0);
 }
 
 #[test]
