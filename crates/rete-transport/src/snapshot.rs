@@ -1,9 +1,13 @@
-//! Path table persistence — snapshot save/load for restart recovery.
+//! Transport snapshot persistence for restart recovery.
 //!
-//! `Transport::save_snapshot()` captures learned routes and cached identities
-//! into a portable `Snapshot` struct.  `Transport::load_snapshot()` restores
-//! them after a power cycle.  All structs derive `serde::{Serialize, Deserialize}`
-//! when the optional `serde` feature is enabled.
+//! `Transport::save_snapshot()` captures learned path observations and cached
+//! identities into a portable `Snapshot` struct. `Transport::load_snapshot()`
+//! currently restores identities only: path observations refer to transient
+//! interface indices and cannot safely become active routes after a power
+//! cycle. They remain in the format for compatibility and future explicit
+//! rebinding to stable interface identities. All structs derive
+//! `serde::{Serialize, Deserialize}` when the optional `serde` feature is
+//! enabled.
 
 extern crate alloc;
 
@@ -25,7 +29,10 @@ pub enum SnapshotDetail {
     Full,
 }
 
-/// A persisted path entry.
+/// A persisted path observation.
+///
+/// This entry is not activated by `Transport::load_snapshot()` until snapshots
+/// can identify and explicitly rebind the interface on which it was learned.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PathEntry {
@@ -53,7 +60,10 @@ pub struct IdentityEntry {
 pub struct Snapshot {
     /// Format version for forward compatibility.
     pub version: u8,
+    /// Saved observations retained for compatibility and future rebinding.
+    /// They are not restored as active routes by `Transport::load_snapshot()`.
     pub paths: Vec<PathEntry>,
+    /// Identities that can be safely restored without an interface binding.
     pub identities: Vec<IdentityEntry>,
 }
 

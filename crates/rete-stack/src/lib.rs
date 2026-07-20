@@ -323,15 +323,19 @@ pub use rete_transport::{
 
 /// Dispatch outbound packets to a single interface.
 ///
-/// Skips `AllExceptSource` packets — the only interface IS the source,
-/// so forwarded packets must not be sent back where they came from.
+/// Interface zero is the sole interface. Exact targets other than zero and
+/// `AllExceptSource` packets are therefore dropped fail-closed.
 #[cfg(feature = "alloc")]
 pub async fn dispatch_single<I: ReteInterface>(iface: &mut I, packets: &[OutboundPacket]) {
     for pkt in packets {
-        if pkt.routing == PacketRouting::AllExceptSource {
-            continue;
+        match pkt.routing {
+            PacketRouting::SourceInterface
+            | PacketRouting::ExactInterface(0)
+            | PacketRouting::All => {
+                let _ = iface.send(&pkt.data).await;
+            }
+            PacketRouting::ExactInterface(_) | PacketRouting::AllExceptSource => {}
         }
-        let _ = iface.send(&pkt.data).await;
     }
 }
 
@@ -339,6 +343,7 @@ pub async fn dispatch_single<I: ReteInterface>(iface: &mut I, packets: &[Outboun
 ///
 /// Routes packets based on [`PacketRouting`]:
 /// - `SourceInterface` -- send on interface `source_iface` only
+/// - `ExactInterface` -- send on that exact interface only
 /// - `AllExceptSource` -- send on the other interface
 /// - `All` -- send on both
 #[cfg(feature = "alloc")]
@@ -351,6 +356,15 @@ pub async fn dispatch_dual<I0: ReteInterface, I1: ReteInterface>(
     for pkt in packets {
         match pkt.routing {
             PacketRouting::SourceInterface => match source_iface {
+                0 => {
+                    let _ = iface0.send(&pkt.data).await;
+                }
+                1 => {
+                    let _ = iface1.send(&pkt.data).await;
+                }
+                _ => {}
+            },
+            PacketRouting::ExactInterface(interface) => match interface {
                 0 => {
                     let _ = iface0.send(&pkt.data).await;
                 }

@@ -297,8 +297,8 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// Validate an LRPROOF payload at a relay node.
     ///
     /// Matches Python `Transport.py` relay behavior: validates the responder's
-    /// signature before forwarding. Returns true if valid or if validation is
-    /// not possible (identity unknown).
+    /// signature before forwarding. Identity lookup and reconstruction are
+    /// handled by the caller and fail closed before this method is invoked.
     pub(super) fn validate_lrproof_relay(
         &self,
         proof_payload: &[u8],

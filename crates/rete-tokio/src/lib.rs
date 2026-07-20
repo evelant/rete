@@ -657,7 +657,9 @@ impl TokioNode {
 /// ([`InterfaceSlot::Hub`]) slots. For Hub slots, `source_client` enables
 /// per-client routing: `SourceInterface` sends only to the originating client,
 /// and `AllExceptSource` broadcasts to all Hub clients except the originator
-/// (instead of skipping the entire slot).
+/// (instead of skipping the entire slot). `ExactInterface` sends to the named
+/// slot; if that is the source Hub slot, it relays to the other clients while
+/// excluding the originating client. A Direct source slot is still sent to.
 pub async fn dispatch(
     slots: &[InterfaceSlot],
     packets: &[OutboundPacket],
@@ -669,6 +671,15 @@ pub async fn dispatch(
             PacketRouting::SourceInterface => {
                 if let Some(slot) = slots.get(source_iface as usize) {
                     slot.send_to_source(&pkt.data, source_client).await;
+                }
+            }
+            PacketRouting::ExactInterface(interface) => {
+                if let Some(slot) = slots.get(interface as usize) {
+                    if interface == source_iface && matches!(slot, InterfaceSlot::Hub(_)) {
+                        slot.send_except_source(&pkt.data, source_client).await;
+                    } else {
+                        slot.send_packet(&pkt.data).await;
+                    }
                 }
             }
             PacketRouting::AllExceptSource => {

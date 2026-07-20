@@ -130,6 +130,8 @@ pub struct RequestHandler {
 pub enum PacketRouting {
     /// Send only on the interface the inbound packet arrived on.
     SourceInterface,
+    /// Send only on one exact interface selected by Reticulum routing state.
+    ExactInterface(u8),
     /// Send on all interfaces except the source.
     AllExceptSource,
     /// Send on all interfaces.
@@ -1270,7 +1272,8 @@ mod tests {
         let local_hash = core.identity.hash();
         let dest = DestHash::from([0xCC; TRUNCATED_HASH_LEN]);
         let next_hop = IdentityHash::from([0xDD; TRUNCATED_HASH_LEN]);
-        let path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+        let mut path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+        path.received_on = Some(1);
         core.transport.insert_path(dest, path);
 
         // Build HEADER_2 DATA addressed through us
@@ -1293,7 +1296,7 @@ mod tests {
             "forward should not produce an event"
         );
         assert_eq!(outcome.packets.len(), 1);
-        assert_eq!(outcome.packets[0].routing, PacketRouting::AllExceptSource);
+        assert_eq!(outcome.packets[0].routing, PacketRouting::ExactInterface(1));
     }
 
     #[test]
@@ -2625,6 +2628,9 @@ mod tests {
         node_b
             .register_peer(&id_c, "testapp", &["aspect1"], 100)
             .unwrap();
+        let mut b_to_c = rete_transport::Path::direct(100);
+        b_to_c.received_on = Some(1);
+        node_b.transport.insert_path(c_dest, b_to_c);
 
         // -----------------------------------------------------------------
         // Step 5: Link handshake: A → B → C → B → A
@@ -2657,7 +2663,10 @@ mod tests {
             1,
             "relay B should forward exactly one packet"
         );
-        assert_eq!(b_outcome.packets[0].routing, PacketRouting::AllExceptSource);
+        assert_eq!(
+            b_outcome.packets[0].routing,
+            PacketRouting::ExactInterface(1)
+        );
 
         let forwarded_lr = &b_outcome.packets[0].data;
 
@@ -2856,6 +2865,9 @@ mod tests {
         node_b
             .register_peer(&id_a, "testapp", &["aspect1"], 100)
             .unwrap();
+        let mut b_to_a = rete_transport::Path::direct(100);
+        b_to_a.received_on = Some(1);
+        node_b.transport.insert_path(a_dest, b_to_a);
 
         // --- Handshake: C → B → A → B → C ---
 

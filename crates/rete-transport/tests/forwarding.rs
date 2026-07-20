@@ -2,11 +2,12 @@
 //! reverse table, and announce replay detection.
 
 use rete_core::{
-    DestHash, IdentityHash, LinkId,
-    DestType, HeaderType, Identity, Packet, PacketBuilder, PacketType, MTU,
-    TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
+    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketBuilder,
+    PacketType, MTU, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
-use rete_transport::{IngestResult, Path, Transport, REVERSE_TIMEOUT};
+use rete_transport::{
+    ForwardTarget, IngestResult, Path, SnapshotDetail, Transport, REVERSE_TIMEOUT,
+};
 
 /// Build valid HEADER_1 PROOF raw bytes.
 fn build_header1_proof(dest_hash: &[u8; TRUNCATED_HASH_LEN], payload: &[u8]) -> Vec<u8> {
@@ -81,13 +82,26 @@ fn insert_path(
     hops: u8,
     now: u64,
 ) {
-    let path = match via {
+    insert_path_on(transport, dest, via, hops, now, 1);
+}
+
+/// Manually insert a path learned on a specific interface.
+fn insert_path_on(
+    transport: &mut TestTransport,
+    dest: DestHash,
+    via: Option<IdentityHash>,
+    hops: u8,
+    now: u64,
+    received_on: u8,
+) {
+    let mut path = match via {
         Some(v) => Path::via_repeater(v, hops, now),
         None => Path {
             hops,
             ..Path::direct(now)
         },
     };
+    path.received_on = Some(received_on);
     transport.insert_path(dest, path);
 }
 
@@ -157,6 +171,129 @@ fn header1_data_local_delivery() {
         }
         other => panic!("expected LocalData, got {:?}", other),
     }
+}
+
+#[test]
+fn header1_data_uses_exact_cross_interface_path() {
+    let (mut transport, _) = make_relay_transport(b"relay-h1-cross-interface");
+    let mut rng = rand::thread_rng();
+    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let destination = DestHash::from([0xA1; TRUNCATED_HASH_LEN]);
+    insert_path_on(&mut transport, destination, None, 1, 100, 7);
+
+    let mut raw = build_header1_data(destination.as_bytes(), b"cross-interface");
+    let packet_hash = Packet::parse(&raw).unwrap().compute_hash();
+    match transport.ingest_on(&mut raw, 100, 3, &mut rng, &identity) {
+        IngestResult::Forward {
+            source_iface,
+            target,
+            ..
+        } => {
+            assert_eq!(source_iface, 3);
+            assert_eq!(target, ForwardTarget::ExactInterface(7));
+        }
+        other => panic!("expected exact-interface Forward, got {other:?}"),
+    }
+
+    let truncated: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+    let reverse = transport.get_reverse(&truncated).unwrap();
+    assert_eq!(reverse.received_on, 3);
+    assert_eq!(reverse.forwarded_to, 7);
+}
+
+#[test]
+fn header1_data_can_relay_on_the_same_exact_interface() {
+    let (mut transport, _) = make_relay_transport(b"relay-h1-same-interface");
+    let mut rng = rand::thread_rng();
+    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let destination = DestHash::from([0xA2; TRUNCATED_HASH_LEN]);
+    insert_path_on(&mut transport, destination, None, 1, 100, 3);
+
+    let mut raw = build_header1_data(destination.as_bytes(), b"same-interface");
+    match transport.ingest_on(&mut raw, 100, 3, &mut rng, &identity) {
+        IngestResult::Forward {
+            source_iface,
+            target,
+            ..
+        } => {
+            assert_eq!(source_iface, 3);
+            assert_eq!(target, ForwardTarget::ExactInterface(3));
+        }
+        other => panic!("expected same-interface Forward, got {other:?}"),
+    }
+}
+
+#[test]
+fn header1_data_without_an_exact_path_target_fails_closed() {
+    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let destination = DestHash::from([0xA3; TRUNCATED_HASH_LEN]);
+
+    for has_path_without_interface in [false, true] {
+        let (mut transport, _) = make_relay_transport(b"relay-h1-no-exact-target");
+        if has_path_without_interface {
+            transport.insert_path(destination, Path::direct(100));
+        }
+        let mut rng = rand::thread_rng();
+        let mut raw = build_header1_data(destination.as_bytes(), b"no-exact-target");
+
+        assert!(matches!(
+            transport.ingest_on(&mut raw, 100, 3, &mut rng, &identity),
+            IngestResult::Invalid
+        ));
+        assert_eq!(transport.reverse_count(), 0);
+        assert_eq!(transport.stats().packets_forwarded, 0);
+        assert_eq!(transport.stats().packets_dropped_invalid, 1);
+    }
+}
+
+#[test]
+fn snapshot_round_trip_does_not_restore_or_advertise_unbound_paths() {
+    let peer = Identity::from_seed(b"snapshot-unbound-peer").unwrap();
+    let destination = DestHash::from([0xA4; TRUNCATED_HASH_LEN]);
+    let mut source = TestTransport::new();
+    source.register_identity(destination, peer.public_key(), 100);
+    let mut live_path = Path::via_repeater(IdentityHash::from([0xB4; TRUNCATED_HASH_LEN]), 3, 100);
+    live_path.received_on = Some(5);
+    live_path.announce_raw = Some(vec![0x01, 0x02, 0x03]);
+    source.insert_path(destination, live_path);
+
+    let snapshot = source.save_snapshot(SnapshotDetail::Standard);
+    assert_eq!(
+        snapshot.paths.len(),
+        1,
+        "the observation remains persistable"
+    );
+
+    let (mut restored, _) = make_relay_transport(b"snapshot-unbound-restored");
+    restored.load_snapshot(&snapshot);
+
+    assert_eq!(restored.path_count(), 0);
+    assert!(restored.get_path(&destination).is_none());
+    assert!(restored.cached_announces().is_empty());
+    assert_eq!(
+        restored.recall_identity(&destination),
+        Some(&peer.public_key())
+    );
+
+    let mut rng = rand::thread_rng();
+    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let mut request = TestTransport::build_path_request(&destination);
+    assert!(matches!(
+        restored.ingest_on(&mut request, 101, 2, &mut rng, &identity),
+        IngestResult::PathRequestForward { .. }
+    ));
+    assert_eq!(
+        restored.announce_count(),
+        0,
+        "an unbound persisted path must not answer a path request"
+    );
+
+    let mut data = build_header1_data(destination.as_bytes(), b"must-not-forward");
+    assert!(matches!(
+        restored.ingest_on(&mut data, 102, 2, &mut rng, &identity),
+        IngestResult::Invalid
+    ));
+    assert_eq!(restored.reverse_count(), 0);
 }
 
 #[test]
@@ -236,15 +373,28 @@ fn header2_forward_lasthop() {
 }
 
 #[test]
-fn header2_forward_no_path() {
-    let (mut t, local_hash) = make_relay_transport(b"relay-node");
-    let mut rng = rand::thread_rng();
+fn header2_forward_without_usable_path_counts_invalid() {
     let identity = Identity::from_seed(b"test-identity").unwrap();
-    let dest = DestHash::from([0xEEu8; TRUNCATED_HASH_LEN]); // no path to this
-    let mut raw = build_header2_data(local_hash.as_bytes(), dest.as_bytes(), b"nowhere");
-    match t.ingest(&mut raw, 100, &mut rng, &identity) {
-        IngestResult::Invalid => {} // expected
-        other => panic!("expected Invalid, got {:?}", other),
+    let destination = DestHash::from([0xEEu8; TRUNCATED_HASH_LEN]);
+
+    for has_path_without_interface in [false, true] {
+        let (mut transport, local_hash) = make_relay_transport(b"relay-h2-no-usable-path");
+        if has_path_without_interface {
+            transport.insert_path(destination, Path::direct(100));
+        }
+        let mut rng = rand::thread_rng();
+        let mut raw = build_header2_data(
+            local_hash.as_bytes(),
+            destination.as_bytes(),
+            b"nowhere",
+        );
+
+        assert!(matches!(
+            transport.ingest(&mut raw, 100, &mut rng, &identity),
+            IngestResult::Invalid
+        ));
+        assert_eq!(transport.stats().packets_dropped_invalid, 1);
+        assert_eq!(transport.reverse_count(), 0);
     }
 }
 
@@ -820,8 +970,15 @@ fn proof_routed_via_reverse_table() {
 
     // Now ingest a PROOF with dest_hash = truncated packet hash
     let mut proof = build_header1_proof(&trunc, b"proof-payload");
-    match t.ingest(&mut proof, 101, &mut rng, &identity) {
-        IngestResult::Forward { .. } => {} // routed via reverse table
+    match t.ingest_on(&mut proof, 101, 1, &mut rng, &identity) {
+        IngestResult::Forward {
+            source_iface,
+            target,
+            ..
+        } => {
+            assert_eq!(source_iface, 1);
+            assert_eq!(target, ForwardTarget::ExactInterface(0));
+        }
         other => panic!("expected Forward for PROOF, got {:?}", other),
     }
 }
@@ -842,13 +999,58 @@ fn proof_consumes_reverse_entry() {
 
     let trunc: [u8; TRUNCATED_HASH_LEN] = pkt_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
     let mut proof = build_header1_proof(&trunc, b"proof");
-    let _ = t.ingest(&mut proof, 101, &mut rng, &identity);
+    let _ = t.ingest_on(&mut proof, 101, 1, &mut rng, &identity);
 
     assert_eq!(
         t.reverse_count(),
         0,
         "proof routing should consume (pop) the reverse entry"
     );
+}
+
+#[test]
+fn proof_on_wrong_interface_fails_closed_and_consumes_reverse_entry() {
+    let (mut transport, local_hash) = make_relay_transport(b"relay-proof-wrong-interface");
+    let mut rng = rand::thread_rng();
+    let identity = Identity::from_seed(b"test-identity").unwrap();
+    let destination = DestHash::from([0xCE; TRUNCATED_HASH_LEN]);
+    let next_hop = IdentityHash::from([0xDF; TRUNCATED_HASH_LEN]);
+    insert_path_on(&mut transport, destination, Some(next_hop), 3, 100, 7);
+
+    let mut data = build_header2_data(
+        local_hash.as_bytes(),
+        destination.as_bytes(),
+        b"wrong-interface-proof",
+    );
+    let packet_hash = Packet::parse(&data).unwrap().compute_hash();
+    assert!(matches!(
+        transport.ingest_on(&mut data, 100, 3, &mut rng, &identity),
+        IngestResult::Forward {
+            target: ForwardTarget::ExactInterface(7),
+            ..
+        }
+    ));
+    assert_eq!(transport.reverse_count(), 1);
+
+    let truncated: [u8; TRUNCATED_HASH_LEN] = packet_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+    let mut wrong_side = build_header1_proof(&truncated, b"wrong-side");
+    assert!(matches!(
+        transport.ingest_on(&mut wrong_side, 101, 6, &mut rng, &identity),
+        IngestResult::Invalid
+    ));
+    assert_eq!(
+        transport.reverse_count(),
+        0,
+        "a wrong-side proof must still consume Reticulum's one-shot reverse route"
+    );
+
+    // A distinct proof packet on the correct interface cannot reuse the
+    // consumed route.
+    let mut retry = build_header1_proof(&truncated, b"correct-side-after-consume");
+    assert!(matches!(
+        transport.ingest_on(&mut retry, 102, 7, &mut rng, &identity),
+        IngestResult::Invalid
+    ));
 }
 
 #[test]
@@ -874,8 +1076,15 @@ fn proof_without_transport_passes_through() {
     let some_hash = [0xAA; TRUNCATED_HASH_LEN];
 
     let mut proof = build_header1_proof(&some_hash, b"passthrough proof");
-    match t.ingest(&mut proof, 100, &mut rng, &identity) {
-        IngestResult::Forward { .. } => {} // generic forward
+    match t.ingest_on(&mut proof, 100, 4, &mut rng, &identity) {
+        IngestResult::Forward {
+            source_iface,
+            target,
+            ..
+        } => {
+            assert_eq!(source_iface, 4);
+            assert_eq!(target, ForwardTarget::AllExceptSource);
+        }
         other => panic!("expected Forward, got {:?}", other),
     }
 }
@@ -1080,8 +1289,12 @@ fn lrproof_relay_forwards_valid_signature() {
     let (mut relay, _link_id, _dest_hash, proof_pkt) = setup_relay_with_lrproof();
 
     let mut proof_raw = proof_pkt;
-    match relay.ingest(&mut proof_raw, 101, &mut rng, &identity) {
-        IngestResult::Forward { .. } => {} // valid LRPROOF forwarded
+    match relay.ingest_on(&mut proof_raw, 101, 1, &mut rng, &identity) {
+        IngestResult::Forward {
+            source_iface: 1,
+            target: ForwardTarget::ExactInterface(0),
+            ..
+        } => {} // valid LRPROOF forwarded toward the initiator
         other => panic!("expected Forward for valid LRPROOF, got {:?}", other),
     }
 }
@@ -1109,14 +1322,14 @@ fn lrproof_relay_rejects_invalid_signature() {
         .unwrap();
 
     let mut proof_raw = proof_buf[..proof_len].to_vec();
-    match relay.ingest(&mut proof_raw, 101, &mut rng, &identity) {
+    match relay.ingest_on(&mut proof_raw, 101, 1, &mut rng, &identity) {
         IngestResult::Invalid => {} // invalid signature rejected
         other => panic!("expected Invalid for bad LRPROOF, got {:?}", other),
     }
 }
 
 #[test]
-fn lrproof_relay_forwards_when_identity_unknown() {
+fn lrproof_relay_rejects_when_identity_unknown() {
     let mut rng = rand::thread_rng();
     let identity = Identity::from_seed(b"test-identity").unwrap();
 
@@ -1170,10 +1383,11 @@ fn lrproof_relay_forwards_when_identity_unknown() {
         .build()
         .unwrap();
 
-    // Should still forward (identity unknown, can't validate)
+    // The relay cannot authenticate the responder without its recalled
+    // identity, so it must fail closed.
     let mut proof_raw = proof_buf[..proof_len].to_vec();
-    match relay.ingest(&mut proof_raw, 101, &mut rng, &identity) {
-        IngestResult::Forward { .. } => {} // forwarded without validation
-        other => panic!("expected Forward when identity unknown, got {:?}", other),
+    match relay.ingest_on(&mut proof_raw, 101, 1, &mut rng, &identity) {
+        IngestResult::Invalid => {}
+        other => panic!("expected Invalid when identity unknown, got {:?}", other),
     }
 }

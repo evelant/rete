@@ -16,7 +16,8 @@ use rete_core::{
     DestType, HeaderType, Packet, PacketBuilder, PacketType, MTU,
     TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
-use rete_tokio::{InboundMsg, InterfaceSlot, TokioNode};
+use rete_stack::{OutboundPacket, PacketRouting};
+use rete_tokio::{dispatch, ClientHub, InboundMsg, InterfaceSlot, TokioNode};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -98,6 +99,62 @@ async fn run_multi_with_inbound(
 // ---------------------------------------------------------------------------
 
 #[test]
+fn exact_interface_dispatch_targets_named_slot_and_drops_unknown() {
+    big_stack_test(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (tx0, mut rx0) = tokio::sync::mpsc::channel(4);
+                let (tx1, mut rx1) = tokio::sync::mpsc::channel(4);
+                let slots = vec![InterfaceSlot::Direct(tx0), InterfaceSlot::Direct(tx1)];
+
+                let same_interface = [OutboundPacket {
+                    data: b"same-interface".to_vec(),
+                    routing: PacketRouting::ExactInterface(0),
+                }];
+                dispatch(&slots, &same_interface, 0, None).await;
+                assert_eq!(rx0.try_recv().unwrap(), b"same-interface");
+                assert!(rx1.try_recv().is_err());
+
+                let unknown_interface = [OutboundPacket {
+                    data: b"unknown-interface".to_vec(),
+                    routing: PacketRouting::ExactInterface(9),
+                }];
+                dispatch(&slots, &unknown_interface, 0, None).await;
+                assert!(rx0.try_recv().is_err());
+                assert!(rx1.try_recv().is_err());
+            });
+    });
+}
+
+#[test]
+fn exact_interface_same_hub_slot_excludes_only_source_client() {
+    big_stack_test(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = ClientHub::new(4);
+                let (source_client, mut source_rx) = hub.register().await;
+                let (_peer_client, mut peer_rx) = hub.register().await;
+                let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
+                let packets = [OutboundPacket {
+                    data: b"same-hub-relay".to_vec(),
+                    routing: PacketRouting::ExactInterface(0),
+                }];
+
+                dispatch(&slots, &packets, 0, Some(source_client)).await;
+
+                assert!(source_rx.try_recv().is_err());
+                assert_eq!(peer_rx.try_recv().unwrap(), b"same-hub-relay");
+            });
+    });
+}
+
+#[test]
 fn forward_excludes_source_interface() {
     big_stack_test(|| {
         tokio::runtime::Builder::new_current_thread()
@@ -112,7 +169,8 @@ fn forward_excludes_source_interface() {
                 let dest = rete_core::DestHash::from([0xCC; TRUNCATED_HASH_LEN]);
                 let next_hop = rete_core::IdentityHash::from([0xDD; TRUNCATED_HASH_LEN]);
 
-                let path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+                let mut path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+                path.received_on = Some(1);
                 node.core.transport.insert_path(dest, path);
 
                 let data = build_header2_data(local_hash.as_bytes(), dest.as_bytes(), b"forward test");
@@ -228,7 +286,8 @@ fn proof_routed_to_correct_interface() {
                 let dest = rete_core::DestHash::from([0xCC; TRUNCATED_HASH_LEN]);
                 let next_hop = rete_core::IdentityHash::from([0xDD; TRUNCATED_HASH_LEN]);
 
-                let path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+                let mut path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+                path.received_on = Some(2);
                 node.core.transport.insert_path(dest, path);
 
                 // Forward a DATA on iface 1 to create reverse entry

@@ -173,23 +173,15 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         }
     }
 
-    /// Restore paths and identities from a previously saved [`Snapshot`].
+    /// Restore identities from a previously saved [`Snapshot`].
     ///
-    /// Entries that would overflow the tables are silently dropped.
+    /// Persisted paths are observations tied to transient interface indices.
+    /// Until snapshots carry a stable interface identity and the runtime can
+    /// explicitly rebind it, restoring those paths would make this node
+    /// advertise routes it cannot forward on. They therefore remain inactive
+    /// and must be learned again after restart. Identity entries that would
+    /// overflow the table are silently dropped.
     pub fn load_snapshot(&mut self, snap: &snapshot::Snapshot) {
-        for pe in &snap.paths {
-            let path = Path {
-                via: pe.via,
-                learned_at: pe.learned_at,
-                last_accessed: pe.last_accessed,
-                last_snr: pe.last_snr,
-                hops: pe.hops,
-                announce_raw: pe.announce_raw.clone(),
-                interface_mode: crate::path::InterfaceMode::Default,
-                received_on: None,
-            };
-            self.insert_path(pe.dest_hash, path);
-        }
         for ie in &snap.identities {
             self.insert_identity(ie.dest_hash, ie.pub_key);
         }

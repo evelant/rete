@@ -9,7 +9,7 @@ use rete_core::{
     TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
-    IngestResult, PATH_REQUEST_DEST, ReceiptSinkFull, ReceiptTerminalSink,
+    ForwardTarget, IngestResult, PATH_REQUEST_DEST, ReceiptSinkFull, ReceiptTerminalSink,
 };
 
 use crate::destination::DestinationType;
@@ -228,11 +228,16 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     packets,
                 }
             }
-            IngestResult::Forward { raw, .. } => IngestOutcome {
+            IngestResult::Forward { raw, target, .. } => IngestOutcome {
                 events: vec![],
                 packets: vec![OutboundPacket {
                     data: raw.to_vec(),
-                    routing: PacketRouting::AllExceptSource,
+                    routing: match target {
+                        ForwardTarget::ExactInterface(interface) => {
+                            PacketRouting::ExactInterface(interface)
+                        }
+                        ForwardTarget::AllExceptSource => PacketRouting::AllExceptSource,
+                    },
                 }],
             },
             IngestResult::LinkRequestReceived { link_id, proof_raw } => IngestOutcome {

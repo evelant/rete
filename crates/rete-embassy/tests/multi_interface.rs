@@ -1,7 +1,7 @@
 //! Multi-interface tests for EmbassyNode.
 //!
 //! Mirrors the four tests in `rete-tokio/tests/multi_interface.rs`:
-//! - forward_excludes_source_interface
+//! - forward_uses_path_selected_interface
 //! - announce_sent_on_all_interfaces
 //! - local_data_not_forwarded
 //! - proof_routed_to_correct_interface
@@ -20,7 +20,7 @@ use rete_core::{
     TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
 use rete_embassy::EmbassyNode;
-use rete_stack::{dispatch_dual, OutboundPacket, PacketRouting, ReteInterface};
+use rete_stack::{dispatch_dual, dispatch_single, OutboundPacket, PacketRouting, ReteInterface};
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -153,6 +153,55 @@ fn dispatch_dual_source_interface_routes_to_source_only() {
 }
 
 #[test]
+fn dispatch_dual_exact_interface_can_route_back_to_source_slot() {
+    block_on(async {
+        let mut iface0 = MockInterface::new();
+        let mut iface1 = MockInterface::new();
+        let packets = vec![OutboundPacket {
+            data: b"same-interface-relay".to_vec(),
+            routing: PacketRouting::ExactInterface(0),
+        }];
+
+        dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
+
+        assert_eq!(iface0.outbound, vec![b"same-interface-relay".to_vec()]);
+        assert!(iface1.outbound.is_empty());
+    });
+}
+
+#[test]
+fn dispatch_dual_unknown_exact_interface_drops_packet() {
+    block_on(async {
+        let mut iface0 = MockInterface::new();
+        let mut iface1 = MockInterface::new();
+        let packets = vec![OutboundPacket {
+            data: b"unknown-interface".to_vec(),
+            routing: PacketRouting::ExactInterface(9),
+        }];
+
+        dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
+
+        assert!(iface0.outbound.is_empty());
+        assert!(iface1.outbound.is_empty());
+    });
+}
+
+#[test]
+fn dispatch_single_unknown_exact_interface_drops_packet() {
+    block_on(async {
+        let mut iface = MockInterface::new();
+        let packets = vec![OutboundPacket {
+            data: b"unknown-interface".to_vec(),
+            routing: PacketRouting::ExactInterface(1),
+        }];
+
+        dispatch_single(&mut iface, &packets).await;
+
+        assert!(iface.outbound.is_empty());
+    });
+}
+
+#[test]
 fn dispatch_dual_all_except_source_excludes_source() {
     block_on(async {
         let mut iface0 = MockInterface::new();
@@ -192,7 +241,7 @@ fn dispatch_dual_all_sends_to_both() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn forward_excludes_source_interface() {
+fn forward_uses_path_selected_interface() {
     let mut node = make_node(b"multi-embassy-1");
     let mut rng = rand::thread_rng();
     node.core.enable_transport();
@@ -201,7 +250,8 @@ fn forward_excludes_source_interface() {
     let dest = rete_core::DestHash::from([0xCC; TRUNCATED_HASH_LEN]);
     let next_hop = rete_core::IdentityHash::from([0xDD; TRUNCATED_HASH_LEN]);
 
-    let path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+    let mut path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+    path.received_on = Some(1);
     node.core.transport.insert_path(dest, path);
 
     // Bootstrap
@@ -210,6 +260,8 @@ fn forward_excludes_source_interface() {
     // Header2 DATA arriving on iface 0, addressed through this node as transport
     let data = build_header2_data(local_hash.as_bytes(), dest.as_bytes(), b"forward test");
     let outcome = node.core.handle_ingest(&data, 1001, 0, &mut rng);
+    assert_eq!(outcome.packets.len(), 1);
+    assert_eq!(outcome.packets[0].routing, PacketRouting::ExactInterface(1));
 
     // Dispatch the resulting packets across two mock interfaces
     block_on(async {
@@ -341,7 +393,8 @@ fn proof_routed_to_correct_interface() {
     let dest = rete_core::DestHash::from([0xCC; TRUNCATED_HASH_LEN]);
     let next_hop = rete_core::IdentityHash::from([0xDD; TRUNCATED_HASH_LEN]);
 
-    let path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+    let mut path = rete_transport::Path::via_repeater(next_hop, 3, 100);
+    path.received_on = Some(0);
     node.core.transport.insert_path(dest, path);
 
     // Bootstrap
@@ -368,6 +421,8 @@ fn proof_routed_to_correct_interface() {
     let proof = proof_buf[..proof_len].to_vec();
 
     let outcome = node.core.handle_ingest(&proof, 1002, 0, &mut rng);
+    assert_eq!(outcome.packets.len(), 1);
+    assert_eq!(outcome.packets[0].routing, PacketRouting::ExactInterface(1));
 
     block_on(async {
         let mut iface0 = MockInterface::new();
