@@ -681,6 +681,23 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         })
     }
 
+    /// Build a keepalive only after its authoritative Link route is known.
+    ///
+    /// Keepalive construction commits the probe timestamp, so routing must be
+    /// preflighted and carried into the infallible `OutboundPacket` formation.
+    pub(super) fn build_owned_keepalive_outbound(
+        &mut self,
+        link_id: &LinkId,
+        request: bool,
+        now: u64,
+    ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
+        let data = self
+            .transport
+            .build_keepalive_packet(link_id, request, now)?;
+        Ok(OutboundPacket { data, routing })
+    }
+
     /// Recover the Link ID from an internally queued Link packet and apply its
     /// retained interface binding. The transport's resource queue currently
     /// exposes raw bytes; malformed, non-Link, missing-Link and unbound-Link
@@ -1901,32 +1918,163 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn node_core_tick_sends_keepalives() {
-        let (mut init, _resp, link_id) = two_core_handshake();
+    fn node_core_keepalive_roundtrip_is_internal_and_bound() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
         let mut rng = rand::thread_rng();
 
-        let ka_interval = init
-            .transport
-            .get_link(&link_id)
-            .unwrap()
-            .keepalive_interval;
+        let init_link = init.transport.get_link(&link_id).unwrap();
+        let ka_interval = init_link.keepalive_interval;
+        let activated_at = init_link.last_inbound;
 
-        // Tick with time well past half keepalive interval
-        let outcome = init.handle_tick(101 + ka_interval / 2 + 1, &mut rng);
-        let has_keepalive = outcome.packets.iter().any(|p| {
-            rete_core::Packet::parse(&p.data)
-                .map(|pkt| pkt.context == rete_core::CONTEXT_KEEPALIVE)
-                .unwrap_or(false)
-        });
-        assert!(has_keepalive, "tick should produce keepalive packet");
-        assert!(outcome
+        let early = init.handle_tick(activated_at + ka_interval - 1, &mut rng);
+        assert!(early.packets.iter().all(|packet| {
+            Packet::parse(&packet.data)
+                .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
+        }));
+
+        let request = init.handle_tick(activated_at + ka_interval, &mut rng);
+        let requests: Vec<_> = request
             .packets
             .iter()
             .filter(|packet| {
                 Packet::parse(&packet.data)
                     .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_KEEPALIVE)
             })
-            .all(|packet| packet.routing == PacketRouting::BoundInterface(0)));
+            .collect();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].routing, PacketRouting::BoundInterface(0));
+        assert_eq!(requests[0].data.len(), 20);
+        assert_eq!(Packet::parse(&requests[0].data).unwrap().payload, &[0xFF]);
+
+        let response =
+            resp.handle_ingest(&requests[0].data, activated_at + ka_interval, 0, &mut rng);
+        assert!(
+            response.events.is_empty(),
+            "keepalive request is not app data"
+        );
+        assert_eq!(response.packets.len(), 1);
+        assert_eq!(
+            response.packets[0].routing,
+            PacketRouting::BoundInterface(0)
+        );
+        assert_eq!(response.packets[0].data.len(), 20);
+        assert_eq!(
+            Packet::parse(&response.packets[0].data).unwrap().payload,
+            &[0xFE]
+        );
+
+        let consumed = init.handle_ingest(
+            &response.packets[0].data,
+            activated_at + ka_interval + 1,
+            0,
+            &mut rng,
+        );
+        assert!(
+            consumed.events.is_empty(),
+            "keepalive response is not app data"
+        );
+        assert!(consumed.packets.is_empty(), "responses are never answered");
+
+        // A responder does not originate an FF request at its own interval.
+        let resp_link = resp.transport.get_link(&link_id).unwrap();
+        let responder_due = resp_link.last_inbound + resp_link.keepalive_interval;
+        let responder_tick = resp.handle_tick(responder_due, &mut rng);
+        assert!(responder_tick.packets.iter().all(|packet| {
+            Packet::parse(&packet.data)
+                .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
+        }));
+    }
+
+    #[test]
+    fn due_keepalive_without_bound_interface_does_not_commit_probe() {
+        let mut core = make_core(b"unbound-keepalive");
+        let mut rng = rand::thread_rng();
+        let destination = DestHash::from([0xAA; TRUNCATED_HASH_LEN]);
+        let (_, link_id) = core
+            .initiate_link(destination, 100, &mut rng)
+            .expect("initial Link request should build");
+
+        // Model an active Link whose handshake never established an
+        // authoritative interface binding. This must fail closed at routing.
+        let (due_at, previous_keepalive) = {
+            let link = core.transport.get_link_mut(&link_id).unwrap();
+            link.activate(100);
+            assert_eq!(link.bound_interface(), None);
+            (100 + link.keepalive_interval, link.last_keepalive)
+        };
+
+        let outcome = core.handle_tick(due_at, &mut rng);
+        assert!(outcome.packets.iter().all(|packet| {
+            Packet::parse(&packet.data)
+                .is_ok_and(|parsed| parsed.context != rete_core::CONTEXT_KEEPALIVE)
+        }));
+
+        let link = core.transport.get_link(&link_id).unwrap();
+        assert_eq!(link.last_keepalive, previous_keepalive);
+        assert!(link.needs_keepalive(due_at));
+    }
+
+    #[test]
+    fn delayed_keepalive_response_revives_stale_initiator_during_grace() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let link = init.transport.get_link(&link_id).unwrap();
+        let last_inbound = link.last_inbound;
+        let keepalive_interval = link.keepalive_interval;
+        let stale_time = link.stale_time;
+        let stale_at = last_inbound + stale_time;
+
+        let first_probe = init.handle_tick(last_inbound + keepalive_interval, &mut rng);
+        assert!(first_probe.packets.iter().any(|packet| {
+            Packet::parse(&packet.data).is_ok_and(|parsed| {
+                parsed.context == rete_core::CONTEXT_KEEPALIVE && parsed.payload == [0xFF]
+            })
+        }));
+
+        // prepare_tick emits the final initiator probe before tick transitions
+        // the Link into the five-second Stale revival window.
+        let stale = init.handle_tick(stale_at, &mut rng);
+        assert_eq!(
+            init.transport.get_link(&link_id).unwrap().state,
+            rete_transport::LinkState::Stale
+        );
+        let request = stale
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_KEEPALIVE)
+            })
+            .expect("stale transition must include the final keepalive request");
+        assert_eq!(request.routing, PacketRouting::BoundInterface(0));
+        assert_eq!(Packet::parse(&request.data).unwrap().payload, &[0xFF]);
+
+        let response = resp.handle_ingest(&request.data, stale_at, 0, &mut rng);
+        assert!(response.events.is_empty());
+        assert_eq!(response.packets.len(), 1);
+
+        let reply_at = stale_at + rete_transport::STALE_GRACE - 1;
+        let revived = init.handle_ingest(&response.packets[0].data, reply_at, 0, &mut rng);
+        assert!(revived.events.is_empty());
+        assert!(revived.packets.is_empty());
+        assert_eq!(
+            init.transport.get_link(&link_id).unwrap().state,
+            rete_transport::LinkState::Active
+        );
+        assert_eq!(
+            init.transport.get_link(&link_id).unwrap().last_inbound,
+            reply_at
+        );
+
+        let after_old_deadline = init.handle_tick(stale_at + rete_transport::STALE_GRACE, &mut rng);
+        assert!(matches!(
+            after_old_deadline.events.last(),
+            Some(NodeEvent::Tick {
+                closed_links: 0,
+                ..
+            })
+        ));
+        assert!(init.transport.get_link(&link_id).is_some());
     }
 
     // -----------------------------------------------------------------------

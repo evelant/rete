@@ -1,6 +1,6 @@
 //! Link lifecycle, handshake, keepalives, close.
 
-use crate::link::{compute_link_id, Link};
+use crate::link::{compute_link_id, Link, LinkRole};
 use crate::storage::StorageMap;
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
@@ -147,22 +147,40 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         Self::build_link_packet(link, link_id, rtt_bytes, CONTEXT_LRRTT, rng)
     }
 
-    /// Build a keepalive request/response packet for a link.
+    /// Build an unencrypted keepalive request/response packet for a link.
     ///
-    /// Allows sending on both Active and Stale links — a keepalive response
-    /// to a Stale link can revive it when the peer receives it and responds.
-    pub fn build_keepalive_packet<R: RngCore + CryptoRng>(
+    /// Python RNS special-cases keepalives in `Packet.pack()`: the wire payload
+    /// is exactly one byte (`0xFF` request or `0xFE` response), without a Token.
+    /// Successful construction updates Link outbound and keepalive timestamps.
+    pub fn build_keepalive_packet(
         &mut self,
         link_id: &LinkId,
         request: bool,
-        rng: &mut R,
+        now: u64,
     ) -> Result<alloc::vec::Vec<u8>, SendError> {
         let link = self.links.get(link_id).ok_or(SendError::LinkNotFound)?;
-        if !link.is_active() && link.state != crate::link::LinkState::Stale {
+        if !link.is_active() {
             return Err(SendError::LinkNotActive);
         }
+        if request != (link.role == LinkRole::Initiator) {
+            return Err(SendError::KeepaliveRoleMismatch);
+        }
         let payload: &[u8] = if request { &[0xFF] } else { &[0xFE] };
-        Self::build_link_packet(link, link_id, payload, CONTEXT_KEEPALIVE, rng)
+        let mut pkt_buf = [0u8; rete_core::MTU];
+        let pkt_len = PacketBuilder::new(&mut pkt_buf)
+            .packet_type(PacketType::Data)
+            .dest_type(DestType::Link)
+            .destination_hash(link_id.as_ref())
+            .context(CONTEXT_KEEPALIVE)
+            .payload(payload)
+            .build()
+            .map_err(SendError::PacketBuild)?;
+        let packet = pkt_buf[..pkt_len].to_vec();
+        self.links
+            .get_mut(link_id)
+            .expect("keepalive Link cannot disappear during synchronous construction")
+            .note_keepalive_outbound(now);
+        Ok(packet)
     }
 
     /// Encrypt plaintext and build a link DATA packet. Shared by all link packet builders.
@@ -415,6 +433,26 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         pkt_hash: [u8; 32],
         rng: &mut R,
     ) -> IngestResult<'a> {
+        // Python RNS keepalives are the only ordinary Link DATA context that is
+        // deliberately not encrypted. Handle the exact role-specific byte before
+        // the generic Token path. Invalid bytes never touch Link liveness state.
+        if context == CONTEXT_KEEPALIVE {
+            let link = match self.links.get_mut(link_id) {
+                Some(link) => link,
+                None => return IngestResult::Invalid,
+            };
+            return match link.consume_keepalive(ciphertext, now) {
+                Some(reply) => IngestResult::Keepalive {
+                    link_id: *link_id,
+                    reply,
+                },
+                None => {
+                    self.stats.packets_dropped_invalid += 1;
+                    IngestResult::Invalid
+                }
+            };
+        }
+
         // For resource contexts, decrypt first in a sub-scope to release the link
         // borrow, then handle resources using self.resources separately.
         if matches!(
@@ -431,13 +469,15 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             // All other resource contexts (ADV, REQ, HMU, PRF, ICL, RCL) ARE link-encrypted.
             if context == CONTEXT_RESOURCE {
                 // Pass raw ciphertext payload directly (no link decryption).
-                // Still need to verify link is active and touch inbound.
+                // Resource parts retain Python's Link-level liveness behavior:
+                // an attached-interface packet may revive Stale before the
+                // resource layer applies its per-part hash matching.
                 {
                     let link = match self.links.get_mut(link_id) {
                         Some(l) => l,
                         None => return IngestResult::Invalid,
                     };
-                    if !link.is_active() {
+                    if !link.accepts_inbound() {
                         return IngestResult::Invalid;
                     }
                     link.touch_inbound(now);
@@ -453,12 +493,14 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                     Some(l) => l,
                     None => return IngestResult::Invalid,
                 };
-                if !link.is_active() {
+                if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
-                link.touch_inbound(now);
                 match link.decrypt(ciphertext, &mut dec_buf) {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        link.touch_inbound(now);
+                        n
+                    }
                     Err(_) => {
                         self.stats.crypto_failures += 1;
                         return IngestResult::Invalid;
@@ -497,17 +539,6 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 self.stats.links_established += 1;
                 IngestResult::LinkEstablished { link_id: *link_id }
             }
-            CONTEXT_KEEPALIVE => {
-                if let Some(response_byte) = link.handle_keepalive(&dec_buf[..dec_len], now) {
-                    IngestResult::LinkData {
-                        link_id: *link_id,
-                        data: alloc::vec![response_byte],
-                        context: CONTEXT_KEEPALIVE,
-                    }
-                } else {
-                    IngestResult::Duplicate
-                }
-            }
             CONTEXT_LINKCLOSE => {
                 let lid = *link_id;
                 if link.handle_close(&dec_buf[..dec_len]) {
@@ -519,7 +550,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 }
             }
             CONTEXT_CHANNEL => {
-                if !link.is_active() {
+                if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
                 link.touch_inbound(now);
@@ -546,7 +577,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 }
             }
             CONTEXT_REQUEST => {
-                if !link.is_active() {
+                if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
                 link.touch_inbound(now);
@@ -567,7 +598,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 }
             }
             CONTEXT_RESPONSE => {
-                if !link.is_active() {
+                if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
                 link.touch_inbound(now);
@@ -582,7 +613,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             }
             _ => {
                 // Regular link data — only this branch allocates
-                if !link.is_active() {
+                if !link.accepts_inbound() {
                     return IngestResult::Invalid;
                 }
                 link.touch_inbound(now);
@@ -704,29 +735,31 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     // Keepalive generation
     // -----------------------------------------------------------------------
 
+    /// Return locally owned initiator Links whose next keepalive is due.
+    ///
+    /// This query does not mutate Link timers. Callers that also own interface
+    /// routing can therefore preflight an authoritative route before packet
+    /// construction commits the keepalive timestamp.
+    pub fn pending_keepalive_link_ids(&self, now: u64) -> alloc::vec::Vec<LinkId> {
+        self.links
+            .iter()
+            .filter_map(|(link_id, link)| link.needs_keepalive(now).then_some(*link_id))
+            .collect()
+    }
+
     /// Build keepalive request packets for links that need them.
     ///
-    /// Iterates active links and generates a keepalive request for each
-    /// that has been idle for more than half the keepalive interval.
-    /// Updates `last_outbound` on each link that gets a keepalive.
+    /// Iterates active initiator links and generates a keepalive request after
+    /// one complete keepalive interval of inbound silence.
     pub fn build_pending_keepalives<R: RngCore + CryptoRng>(
         &mut self,
         now: u64,
-        rng: &mut R,
+        _rng: &mut R,
     ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-        let mut need_ka = alloc::vec::Vec::<LinkId>::new();
-        for (lid, link) in self.links.iter() {
-            if link.needs_keepalive(now) {
-                need_ka.push(*lid);
-            }
-        }
-
+        let need_ka = self.pending_keepalive_link_ids(now);
         let mut packets = alloc::vec::Vec::new();
         for lid in need_ka {
-            if let Ok(pkt) = self.build_keepalive_packet(&lid, true, rng) {
-                if let Some(link) = self.links.get_mut(&lid) {
-                    link.last_outbound = now;
-                }
+            if let Ok(pkt) = self.build_keepalive_packet(&lid, true, now) {
                 packets.push(pkt);
             }
         }

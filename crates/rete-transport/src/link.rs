@@ -117,6 +117,18 @@ pub struct Link {
     pub last_inbound: u64,
     /// Last outbound timestamp.
     pub last_outbound: u64,
+    /// Last outbound keepalive timestamp.
+    ///
+    /// Keepalives are deterministic on the wire, so this is tracked separately
+    /// from ordinary outbound traffic. Python RNS schedules probes from inbound
+    /// silence and the previous probe, not from arbitrary outbound data.
+    pub last_keepalive: u64,
+    /// Timestamp at which the watchdog actually transitioned this Link to Stale.
+    ///
+    /// The revival grace starts at the transition/final-probe time, not at the
+    /// nominal `last_inbound + stale_time` deadline. This matters when watchdog
+    /// ticks are delayed. Zero is the compact inactive sentinel.
+    stale_since: u64,
     /// Keepalive interval in seconds.
     pub keepalive_interval: u64,
     /// Stale timeout = keepalive × 2.
@@ -235,6 +247,8 @@ impl Link {
             rtt: 0.0,
             last_inbound: now,
             last_outbound: now,
+            last_keepalive: 0,
+            stale_since: 0,
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: DestHash::ZERO,
@@ -318,6 +332,8 @@ impl Link {
             rtt: 0.0,
             last_inbound: now,
             last_outbound: now,
+            last_keepalive: 0,
+            stale_since: 0,
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: dest_hash,
@@ -440,16 +456,23 @@ impl Link {
     pub fn activate(&mut self, now: u64) {
         self.state = LinkState::Active;
         self.last_inbound = now;
+        self.stale_since = 0;
     }
 
     /// Mark the link as closed.
     pub fn close(&mut self) {
         self.state = LinkState::Closed;
+        self.stale_since = 0;
     }
 
     /// Check if the link is active.
     pub fn is_active(&self) -> bool {
         self.state == LinkState::Active
+    }
+
+    /// Whether authenticated inbound Link traffic may revive this session.
+    pub(crate) fn accepts_inbound(&self) -> bool {
+        self.state == LinkState::Active || self.state == LinkState::Stale
     }
 
     /// Access the channel (if initialized).
@@ -482,19 +505,51 @@ impl Link {
         if self.state == LinkState::Stale {
             self.state = LinkState::Active;
         }
+        self.stale_since = 0;
     }
 
-    /// Process an inbound keepalive payload.
+    /// Classify a conforming inbound keepalive without mutating Link state.
     ///
-    /// Returns `Some(response)` if a keepalive response should be sent.
-    /// Keepalive request = 0xFF, response = 0xFE.
-    pub fn handle_keepalive(&mut self, payload: &[u8], now: u64) -> Option<u8> {
-        self.touch_inbound(now);
-        if payload.first() == Some(&0xFF) {
-            Some(0xFE) // respond to request
-        } else {
-            None // 0xFE response, no action needed
+    /// Python RNS initiators send the exact one-byte request `0xFF`; responders
+    /// send the exact one-byte response `0xFE`. Reversing those roles or adding
+    /// any bytes is invalid. `Some(true)` means a response must be emitted,
+    /// `Some(false)` means a response was consumed, and `None` means invalid.
+    pub(crate) fn classify_keepalive(&self, payload: &[u8]) -> Option<bool> {
+        if !self.accepts_inbound() {
+            return None;
         }
+
+        match (self.role, payload) {
+            (LinkRole::Responder, [0xFF]) => Some(true),
+            (LinkRole::Initiator, [0xFE]) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Process a conforming inbound keepalive with role-aware outcome.
+    ///
+    /// Valid keepalives count as inbound Link activity and revive a stale Link.
+    /// Invalid or wrong-role values do not mutate any liveness state.
+    pub(crate) fn consume_keepalive(&mut self, payload: &[u8], now: u64) -> Option<bool> {
+        let reply = self.classify_keepalive(payload)?;
+        self.touch_inbound(now);
+        Some(reply)
+    }
+
+    /// Process an inbound keepalive and return the legacy response byte shape.
+    ///
+    /// This preserves the public Link API while applying strict role and exact
+    /// payload validation. A valid initiator-side `0xFE` response is consumed
+    /// and returns `None`, as did the previous API; transport dispatch uses the
+    /// role-aware internal result above to distinguish it from rejection.
+    pub fn handle_keepalive(&mut self, payload: &[u8], now: u64) -> Option<u8> {
+        self.consume_keepalive(payload, now)?.then_some(0xFE)
+    }
+
+    /// Record a keepalive after its raw packet has been built successfully.
+    pub(crate) fn note_keepalive_outbound(&mut self, now: u64) {
+        self.last_outbound = now;
+        self.last_keepalive = now;
     }
 
     /// Process a LINKCLOSE payload. Returns true if the link should be closed.
@@ -504,7 +559,7 @@ impl Link {
         if decrypted_payload.len() >= TRUNCATED_HASH_LEN
             && decrypted_payload[..TRUNCATED_HASH_LEN] == *self.link_id.as_bytes()
         {
-            self.state = LinkState::Closed;
+            self.close();
             true
         } else {
             false
@@ -522,25 +577,35 @@ impl Link {
 
     /// Whether a keepalive should be sent proactively.
     ///
-    /// Returns true if the link is active (or stale) and half the keepalive
-    /// interval has elapsed since our last outbound packet. Also sends
-    /// keepalives on stale links to attempt revival.
+    /// Only an active initiator sends probes. A probe is due after one complete
+    /// keepalive interval without inbound traffic, and no more often than one
+    /// complete interval since the previous probe. Ordinary outbound traffic
+    /// deliberately does not postpone the probe.
     pub fn needs_keepalive(&self, now: u64) -> bool {
-        (self.state == LinkState::Active || self.state == LinkState::Stale)
-            && now.saturating_sub(self.last_outbound) > self.keepalive_interval / 2
+        self.state == LinkState::Active
+            && self.role == LinkRole::Initiator
+            && now.saturating_sub(self.last_inbound) >= self.keepalive_interval
+            && now.saturating_sub(self.last_keepalive) >= self.keepalive_interval
     }
 
     /// Check for staleness. Returns true if the link should be closed.
     pub fn check_stale(&mut self, now: u64) -> bool {
-        if self.state == LinkState::Active
-            && now.saturating_sub(self.last_inbound) > self.keepalive_interval
-        {
+        let silence = now.saturating_sub(self.last_inbound);
+        if self.state == LinkState::Active && silence >= self.stale_time {
             self.state = LinkState::Stale;
+            self.stale_since = now;
+            return false;
         }
-        if self.state == LinkState::Stale && now.saturating_sub(self.last_inbound) > self.stale_time
-        {
-            self.state = LinkState::Closed;
-            return true;
+        if self.state == LinkState::Stale {
+            if self.stale_since == 0 {
+                self.stale_since = now;
+                return false;
+            }
+            if now.saturating_sub(self.stale_since) >= STALE_GRACE {
+                self.state = LinkState::Closed;
+                self.stale_since = 0;
+                return true;
+            }
         }
         false
     }
@@ -582,6 +647,8 @@ pub fn compute_resource_sdu(mtu: usize) -> usize {
 ///
 /// Returns `(keepalive_interval_s, stale_time_s)` as floats.
 /// Python: `max(KEEPALIVE_MIN, min(KEEPALIVE_MAX, rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT)))`
+/// and `stale_time = keepalive * STALE_FACTOR`. The watchdog's revival grace
+/// is separate from `stale_time`.
 pub fn compute_keepalive(rtt: f32) -> (f32, f32) {
     let keepalive = if rtt <= 0.0 {
         KEEPALIVE_MIN
@@ -589,7 +656,7 @@ pub fn compute_keepalive(rtt: f32) -> (f32, f32) {
         let ka = rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT);
         ka.clamp(KEEPALIVE_MIN, KEEPALIVE_MAX)
     };
-    let stale = keepalive * STALE_FACTOR + STALE_GRACE as f32;
+    let stale = keepalive * STALE_FACTOR;
     (keepalive, stale)
 }
 
@@ -968,30 +1035,68 @@ mod tests {
         assert!(!link.check_stale(200));
         assert_eq!(link.state, LinkState::Active);
 
-        // Goes stale after keepalive_interval
+        // Remains active for the full two-keepalive stale interval.
         assert!(!link.check_stale(100 + link.keepalive_interval + 1));
+        assert_eq!(link.state, LinkState::Active);
+
+        // Goes stale at stale_time, then retains a five-second revival grace.
+        assert!(!link.check_stale(100 + link.stale_time));
+        assert_eq!(link.state, LinkState::Stale);
+        assert!(!link.check_stale(100 + link.stale_time + STALE_GRACE - 1));
         assert_eq!(link.state, LinkState::Stale);
 
-        // Closed after stale_time
-        assert!(link.check_stale(100 + link.stale_time + 1));
+        assert!(link.check_stale(100 + link.stale_time + STALE_GRACE));
         assert_eq!(link.state, LinkState::Closed);
     }
 
     #[test]
-    fn keepalive_request_response() {
+    fn delayed_stale_check_starts_full_grace_at_transition() {
         let mut rng = rand_core::OsRng;
         let payload = [0xBBu8; 64];
         let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
         let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
         link.activate(100);
 
-        // Receive keepalive request (0xFF) → should respond with 0xFE
-        let response = link.handle_keepalive(&[0xFF], 200);
-        assert_eq!(response, Some(0xFE));
+        // A delayed watchdog must not consume the revival grace retroactively.
+        let transition_at = 100 + link.stale_time + 100;
+        assert!(!link.check_stale(transition_at));
+        assert_eq!(link.state, LinkState::Stale);
+        assert!(!link.check_stale(transition_at + STALE_GRACE - 1));
+        assert_eq!(link.state, LinkState::Stale);
 
-        // Receive keepalive response (0xFE) → no response needed
-        let response = link.handle_keepalive(&[0xFE], 200);
-        assert_eq!(response, None);
+        assert!(link.check_stale(transition_at + STALE_GRACE));
+        assert_eq!(link.state, LinkState::Closed);
+    }
+
+    #[test]
+    fn keepalive_payloads_are_exact_and_role_specific() {
+        let mut rng = rand_core::OsRng;
+        let payload = [0xBBu8; 64];
+        let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
+        let mut responder = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
+        responder.activate(100);
+
+        assert_eq!(responder.consume_keepalive(&[0xFF], 200), Some(true));
+        assert_eq!(responder.handle_keepalive(&[0xFF], 201), Some(0xFE));
+        assert_eq!(responder.last_inbound, 201);
+
+        for invalid in [&[][..], &[0xFE][..], &[0xFF, 0x00][..]] {
+            assert_eq!(responder.consume_keepalive(invalid, 300), None);
+            assert_eq!(responder.last_inbound, 201);
+        }
+
+        let identity = Identity::from_seed(b"keepalive-role-initiator").unwrap();
+        let dest_hash = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
+        let (mut initiator, _) =
+            Link::new_initiator(dest_hash, identity.ed25519_pub(), &mut rng, 100);
+        initiator.activate(100);
+        assert_eq!(initiator.consume_keepalive(&[0xFE], 200), Some(false));
+        assert_eq!(initiator.last_inbound, 200);
+
+        for invalid in [&[][..], &[0xFF][..], &[0xFE, 0x00][..]] {
+            assert_eq!(initiator.consume_keepalive(invalid, 300), None);
+            assert_eq!(initiator.last_inbound, 200);
+        }
     }
 
     #[test]
@@ -1028,8 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_keepalive_on_pending_link() {
-        // handle_keepalive on a non-active (Pending) link should still work.
+    fn keepalive_on_pending_link_is_rejected_without_liveness_mutation() {
         let mut rng = rand_core::OsRng;
         let identity = Identity::from_seed(b"keepalive-pending").unwrap();
         let dest_hash = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
@@ -1039,15 +1143,8 @@ mod tests {
 
         assert_eq!(link.state, LinkState::Pending);
 
-        // handle_keepalive on a Pending link — should not panic and should respond
-        let response = link.handle_keepalive(&[0xFF], 200);
-        assert_eq!(
-            response,
-            Some(0xFE),
-            "should respond to keepalive request even when Pending"
-        );
-        // touch_inbound doesn't change Pending to Active (it only revives Stale)
-        assert_eq!(link.last_inbound, 200);
+        assert_eq!(link.consume_keepalive(&[0xFE], 200), None);
+        assert_eq!(link.last_inbound, 100);
     }
 
     #[test]
@@ -1205,31 +1302,55 @@ mod tests {
         assert!(!link.check_stale(109));
         assert_eq!(link.state, LinkState::Active);
 
-        // At 111 (11s elapsed, > keepalive_interval=10) — should be stale
+        // A Link stays active until stale_time (20 seconds), not one keepalive.
         assert!(!link.check_stale(111));
+        assert_eq!(link.state, LinkState::Active);
+
+        assert!(!link.check_stale(120));
         assert_eq!(link.state, LinkState::Stale);
 
-        // At 121 (21s elapsed, > stale_time=20) — should be closed
-        assert!(link.check_stale(121));
+        // Five seconds of grace allows a final keepalive response to revive it.
+        assert!(!link.check_stale(124));
+        link.touch_inbound(124);
+        assert_eq!(link.state, LinkState::Active);
+        assert!(!link.check_stale(125));
+
+        // A later silence period closes at stale_time plus grace.
+        assert!(!link.check_stale(144));
+        assert_eq!(link.state, LinkState::Stale);
+        assert!(link.check_stale(149));
         assert_eq!(link.state, LinkState::Closed);
     }
 
     #[test]
     fn test_needs_keepalive_with_dynamic_keepalive() {
-        // After update_keepalive(0.05), needs_keepalive triggers at ~5s not 180s
+        // After update_keepalive(0.05), initiators probe after the full 10s.
         let mut rng = rand_core::OsRng;
-        let payload = [0xBBu8; 64];
-        let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
-        let mut link = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
+        let identity = Identity::from_seed(b"keepalive-schedule-initiator").unwrap();
+        let dest_hash = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
+        let (mut link, _) = Link::new_initiator(dest_hash, identity.ed25519_pub(), &mut rng, 100);
         link.update_keepalive(0.05);
         link.activate(100);
 
-        // keepalive_interval=10, half=5
-        // At 104 (4s since last_outbound=100) — not yet
-        assert!(!link.needs_keepalive(104));
+        assert!(!link.needs_keepalive(109));
+        assert!(link.needs_keepalive(110));
 
-        // At 106 (6s since last_outbound=100, > 5) — should need keepalive
-        assert!(link.needs_keepalive(106));
+        // Ordinary outbound data does not conceal inbound silence.
+        link.last_outbound = 109;
+        assert!(link.needs_keepalive(110));
+
+        // A recorded probe rate-limits the next identical request.
+        link.note_keepalive_outbound(110);
+        assert!(!link.needs_keepalive(119));
+        assert!(link.needs_keepalive(120));
+
+        // Responders never initiate probes.
+        let payload = [0xBBu8; 64];
+        let link_id = LinkId::from([0x11u8; TRUNCATED_HASH_LEN]);
+        let mut responder = Link::from_request(link_id, &payload, &mut rng, 100).unwrap();
+        responder.update_keepalive(0.05);
+        responder.activate(100);
+        assert!(!responder.needs_keepalive(1_000));
     }
 
     #[test]

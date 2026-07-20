@@ -289,20 +289,27 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     rejection: None,
                 }
             }
+            IngestResult::Keepalive { link_id, reply } => {
+                let mut packets = Vec::new();
+                if reply {
+                    if let Ok(outbound) = self.build_owned_keepalive_outbound(&link_id, false, now)
+                    {
+                        packets.push(outbound);
+                    }
+                }
+                IngestOutcome {
+                    // Keepalive traffic is consumed entirely by the Link
+                    // lifecycle and never reaches application-facing events.
+                    events: Vec::new(),
+                    packets,
+                    rejection: None,
+                }
+            }
             IngestResult::LinkData {
                 link_id,
                 data,
                 context,
             } => {
-                let mut packets = Vec::new();
-                // If this is a keepalive request, send the response back
-                if context == rete_core::CONTEXT_KEEPALIVE {
-                    if let Ok(pkt) = self.transport.build_keepalive_packet(&link_id, false, rng) {
-                        if let Ok(outbound) = self.owned_link_outbound(&link_id, pkt) {
-                            packets.push(outbound);
-                        }
-                    }
-                }
                 // Handle LINKIDENTIFY: validate and emit LinkIdentified event
                 if context == rete_core::CONTEXT_LINKIDENTIFY && data.len() >= 128 {
                     let mut pub_key = [0u8; 64];
@@ -320,7 +327,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                     identity_hash: id_hash,
                                     public_key: pub_key,
                                 }],
-                                packets,
+                                packets: Vec::new(),
                                 rejection: None,
                             };
                         }
@@ -332,7 +339,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         data,
                         context,
                     }],
-                    packets,
+                    packets: Vec::new(),
                     rejection: None,
                 }
             }
@@ -996,8 +1003,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         // With dynamic keepalive on fast links, keepalive_interval can be as low
         // as 5s, which equals TICK_INTERVAL. Sending keepalives first ensures
         // they go out before the stale check.
-        for ka in self.transport.build_pending_keepalives(now, rng) {
-            if let Some(outbound) = self.route_owned_link_raw(ka) {
+        for link_id in self.transport.pending_keepalive_link_ids(now) {
+            if let Ok(outbound) = self.build_owned_keepalive_outbound(&link_id, true, now) {
                 packets.push(outbound);
             }
         }

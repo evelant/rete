@@ -38,7 +38,7 @@ pub use dedup::DedupWindow;
 pub use link::{
     compute_establishment_timeout, compute_keepalive, compute_link_id, compute_link_mdu,
     compute_resource_sdu, compute_traffic_timeout_ms, signalling_bytes, Link, LinkRole, LinkState,
-    TeardownReason, LINK_MDU, LINK_MTU_SIZE,
+    TeardownReason, LINK_MDU, LINK_MTU_SIZE, STALE_GRACE,
 };
 pub use path::{InterfaceMode, Path, PATH_EXPIRES_AP, PATH_EXPIRES_ROAMING};
 pub use receipt::{

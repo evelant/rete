@@ -38,8 +38,8 @@ use crate::resource::Resource;
 use crate::storage::{StorageMap, TransportStorage};
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, DestHash, DestType, HeaderType, Identity,
-    IdentityHash, LinkId, Packet, PacketType, TRUNCATED_HASH_LEN,
+    DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketType,
+    CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_NONE, CONTEXT_RESOURCE_PRF, TRUNCATED_HASH_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,6 +118,8 @@ pub enum SendError {
     LinkNotFound,
     /// Link exists but is not in Active state (still Pending/Handshake/Stale/Closed).
     LinkNotActive,
+    /// A keepalive request/response was requested by the wrong Link role.
+    KeepaliveRoleMismatch,
     /// A locally owned Link packet has no authoritative runtime interface.
     LinkInterfaceUnknown,
     /// Channel send window is full (back-pressure).
@@ -145,6 +147,9 @@ impl core::fmt::Display for SendError {
             SendError::LinkTableFull => write!(f, "owned link table full"),
             SendError::LinkNotFound => write!(f, "link not found"),
             SendError::LinkNotActive => write!(f, "link not active"),
+            SendError::KeepaliveRoleMismatch => {
+                write!(f, "keepalive packet does not match local link role")
+            }
             SendError::LinkInterfaceUnknown => write!(f, "link interface is not bound"),
             SendError::WindowFull => write!(f, "channel window full"),
             SendError::ReceiptTableFull => write!(f, "packet receipt table full"),
@@ -396,7 +401,18 @@ pub enum IngestResult<'a> {
         /// The link_id.
         link_id: LinkId,
     },
-    /// Decrypted data received on an active link.
+    /// A valid protocol keepalive was consumed internally.
+    ///
+    /// Keepalives are Link lifecycle traffic and must never surface as
+    /// application data. `reply` is true only when this endpoint is the
+    /// responder and must emit the unencrypted `0xFE` response.
+    Keepalive {
+        /// The Link that consumed the keepalive.
+        link_id: LinkId,
+        /// Whether a response packet must be emitted.
+        reply: bool,
+    },
+    /// Decrypted data received on an active or successfully revived link.
     LinkData {
         /// The link_id.
         link_id: LinkId,
@@ -1027,6 +1043,18 @@ impl<S: TransportStorage> Transport<S> {
         // Compute packet hash for dedup
         let pkt_hash = pkt.compute_hash();
 
+        // Conforming keepalives are deterministic unencrypted packets, so every
+        // request (and every response) for one Link has the same hash. Python RNS
+        // exempts them from packet filtering. Classify before dedup but mutate no
+        // Link state here; the bound-interface gate above has already run.
+        let is_valid_owned_keepalive = pkt.packet_type == PacketType::Data
+            && pkt.dest_type == DestType::Link
+            && pkt.context == CONTEXT_KEEPALIVE
+            && self
+                .links
+                .get(&LinkId::from_slice(pkt.destination_hash))
+                .is_some_and(|link| link.classify_keepalive(pkt.payload).is_some());
+
         // Dedup check.
         //
         // Skip dedup for link-type traffic on the local Hub interface
@@ -1045,7 +1073,7 @@ impl<S: TransportStorage> Transport<S> {
             && !self
                 .links
                 .contains_key(&LinkId::from_slice(pkt.destination_hash));
-        if !is_foreign_link_transit && self.is_duplicate(&pkt_hash) {
+        if !is_foreign_link_transit && !is_valid_owned_keepalive && self.is_duplicate(&pkt_hash) {
             relay_log!(
                 "[relay] DEDUP pkt_hash={} type={:?} dest_type={:?}",
                 hex_short(&pkt_hash),
@@ -3251,13 +3279,47 @@ mod tests {
 
         let stale_time = transport.get_link(&link_id).unwrap().stale_time;
 
-        // tick before stale_time — link should remain
+        // At stale_time the link enters Stale but remains retained for revival.
         let result = transport.tick(now + stale_time);
         assert_eq!(result.closed_links, 0);
         assert_eq!(transport.link_count(), 1);
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().state,
+            crate::link::LinkState::Stale
+        );
 
-        // tick after stale_time — link should be closed and removed
-        let result = transport.tick(now + stale_time + 1);
+        let result = transport.tick(now + stale_time + crate::link::STALE_GRACE - 1);
+        assert_eq!(result.closed_links, 0);
+        assert_eq!(transport.link_count(), 1);
+
+        // Python RNS 1.3.8's watchdog gives the final probe five seconds.
+        let result = transport.tick(now + stale_time + crate::link::STALE_GRACE);
+        assert_eq!(result.closed_links, 1);
+        assert_eq!(transport.link_count(), 0);
+    }
+
+    #[test]
+    fn test_late_tick_retains_stale_link_for_full_transition_grace() {
+        let now = 1000u64;
+        let (mut transport, link_id, _) = make_transport_with_active_link(now);
+        let stale_time = transport.get_link(&link_id).unwrap().stale_time;
+        let transition_at = now + stale_time + 100;
+
+        // Even though the nominal stale deadline is long past, this first
+        // watchdog observation starts (rather than consumes) the grace window.
+        let result = transport.tick(transition_at);
+        assert_eq!(result.closed_links, 0);
+        assert_eq!(transport.link_count(), 1);
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().state,
+            crate::link::LinkState::Stale
+        );
+
+        let result = transport.tick(transition_at + crate::link::STALE_GRACE - 1);
+        assert_eq!(result.closed_links, 0);
+        assert_eq!(transport.link_count(), 1);
+
+        let result = transport.tick(transition_at + crate::link::STALE_GRACE);
         assert_eq!(result.closed_links, 1);
         assert_eq!(transport.link_count(), 0);
     }
@@ -3270,8 +3332,11 @@ mod tests {
 
         let keepalive_interval = transport.get_link(&link_id).unwrap().keepalive_interval;
 
-        // At now + keepalive/2 + 1, the link should need a keepalive
-        let ka_time = now + keepalive_interval / 2 + 1;
+        // A full interval of inbound silence is required.
+        assert!(transport
+            .build_pending_keepalives(now + keepalive_interval - 1, &mut rng)
+            .is_empty());
+        let ka_time = now + keepalive_interval;
         let packets = transport.build_pending_keepalives(ka_time, &mut rng);
         assert!(
             !packets.is_empty(),
@@ -3284,34 +3349,85 @@ mod tests {
             link.last_outbound, ka_time,
             "last_outbound should be updated to keepalive time"
         );
+        assert_eq!(link.last_keepalive, ka_time);
     }
 
     #[test]
-    fn test_build_keepalive_request_vs_response() {
-        let now = 1000u64;
-        let (mut transport, link_id, _) = make_transport_with_active_link(now);
+    fn python_1_3_8_keepalive_wire_vectors_are_exact() {
+        use sha2::{Digest, Sha256};
+
+        let link_id = LinkId::from([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ]);
+        let identity = Identity::from_seed(b"python-keepalive-vector").unwrap();
+        let destination = DestHash::from([0xAA; TRUNCATED_HASH_LEN]);
         let mut rng = rand_core::OsRng;
+        let (mut link, _) =
+            Link::new_initiator(destination, identity.ed25519_pub(), &mut rng, 0);
+        link.set_link_id(link_id);
+        link.activate(0);
+        link.bound_interface = Some(0);
+        let mut transport = TestTransport::new();
+        assert!(transport.links.insert(link_id, link).is_ok());
 
-        // Build a keepalive request
         let request_raw = transport
-            .build_keepalive_packet(&link_id, true, &mut rng)
+            .build_keepalive_packet(&link_id, true, 100)
             .expect("should build keepalive request");
-
-        // Build a keepalive response
+        assert_eq!(
+            transport.build_keepalive_packet(&link_id, false, 100),
+            Err(SendError::KeepaliveRoleMismatch)
+        );
+        transport.get_link_mut(&link_id).unwrap().role = crate::link::LinkRole::Responder;
         let response_raw = transport
-            .build_keepalive_packet(&link_id, false, &mut rng)
+            .build_keepalive_packet(&link_id, false, 101)
             .expect("should build keepalive response");
+        assert_eq!(
+            transport.build_keepalive_packet(&link_id, true, 101),
+            Err(SendError::KeepaliveRoleMismatch)
+        );
 
-        // Parse both and verify they are CONTEXT_KEEPALIVE link packets
-        let req_pkt = rete_core::Packet::parse(&request_raw).expect("should parse request");
+        assert_eq!(
+            hex::encode(&request_raw),
+            "0c00000102030405060708090a0b0c0d0e0ffaff"
+        );
+        assert_eq!(
+            hex::encode(&response_raw),
+            "0c00000102030405060708090a0b0c0d0e0ffafe"
+        );
+        assert_eq!(request_raw.len(), 20);
+        assert_eq!(response_raw.len(), 20);
+
+        let req_pkt = Packet::parse(&request_raw).expect("should parse request");
         assert_eq!(req_pkt.dest_type, DestType::Link);
         assert_eq!(req_pkt.context, CONTEXT_KEEPALIVE);
         assert_eq!(req_pkt.destination_hash, link_id.as_ref());
+        assert_eq!(req_pkt.payload, &[0xFF]);
 
-        let resp_pkt = rete_core::Packet::parse(&response_raw).expect("should parse response");
+        let resp_pkt = Packet::parse(&response_raw).expect("should parse response");
         assert_eq!(resp_pkt.dest_type, DestType::Link);
         assert_eq!(resp_pkt.context, CONTEXT_KEEPALIVE);
         assert_eq!(resp_pkt.destination_hash, link_id.as_ref());
+        assert_eq!(resp_pkt.payload, &[0xFE]);
+
+        // These are RNS packet hashes, not SHA-256(raw). Packet hashing masks
+        // header/transport bits and omits the hop byte.
+        assert_eq!(
+            hex::encode(req_pkt.compute_hash()),
+            "3d973d3383729c255f74ee75aca2ae85af9247a25a46f9a3c066b1fd4a1c8437"
+        );
+        assert_eq!(
+            hex::encode(resp_pkt.compute_hash()),
+            "fe935be6791ba9fd2a49692d20f587c98719feff40ec27832719d61f749634ba"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&request_raw)),
+            "e3a8d6f805de1e27e26af23e34bf18a47dc986d43185ad59ecbbbb0b1f6a38fb"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&response_raw)),
+            "8b3618e403c7868f0548dbb5d86b004e29b3ce378f1bc04492265baca91344bd"
+        );
     }
 
     #[test]

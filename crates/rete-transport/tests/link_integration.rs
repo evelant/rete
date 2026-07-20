@@ -6,7 +6,7 @@
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rete_core::{
     DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketBuilder,
-    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, MTU, TRANSPORT_TYPE_TRANSPORT,
+    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT,
     TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
@@ -510,7 +510,7 @@ fn bidirectional_link_data() {
 
 #[test]
 fn keepalive_request_response() {
-    let (mut init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let (mut init_t, init_id, mut resp_t, resp_id, link_id) = full_handshake();
     let mut rng = rand::thread_rng();
 
     // Activate responder
@@ -521,17 +521,139 @@ fn keepalive_request_response() {
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
 
     // Initiator sends keepalive request
-    let ka = init_t
-        .build_keepalive_packet(&link_id, true, &mut rng)
+    let ka = init_t.build_keepalive_packet(&link_id, true, 200).unwrap();
+    assert_eq!(ka.len(), 20, "keepalives must not carry Token overhead");
+    let mut ka_buf = ka.clone();
+    assert!(matches!(
+        resp_t.ingest(&mut ka_buf, 200, &mut rng, &resp_id),
+        IngestResult::Keepalive {
+            link_id: id,
+            reply: true,
+        } if id == link_id
+    ));
+
+    let response = resp_t.build_keepalive_packet(&link_id, false, 201).unwrap();
+    assert_eq!(response.len(), 20);
+    let mut response_buf = response.clone();
+    assert!(matches!(
+        init_t.ingest(&mut response_buf, 201, &mut rng, &init_id),
+        IngestResult::Keepalive {
+            link_id: id,
+            reply: false,
+        } if id == link_id
+    ));
+
+    // Identical deterministic requests bypass dedup and continue advancing
+    // responder liveness, as required by Python RNS packet_filter().
+    let mut repeated = ka;
+    assert!(matches!(
+        resp_t.ingest(&mut repeated, 202, &mut rng, &resp_id),
+        IngestResult::Keepalive { reply: true, .. }
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, 202);
+    assert_eq!(resp_t.stats().packets_dropped_dedup, 0);
+
+    let mut repeated_response = response;
+    assert!(matches!(
+        init_t.ingest(&mut repeated_response, 203, &mut rng, &init_id),
+        IngestResult::Keepalive { reply: false, .. }
+    ));
+    assert_eq!(init_t.get_link(&link_id).unwrap().last_inbound, 203);
+    assert_eq!(init_t.stats().packets_dropped_dedup, 0);
+}
+
+#[test]
+fn keepalive_wrong_interface_does_not_poison_correct_copy() {
+    let (mut init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let lrrtt = init_t
+        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
         .unwrap();
-    let mut ka_buf = ka;
-    match resp_t.ingest(&mut ka_buf, 200, &mut rng, &resp_id) {
-        IngestResult::LinkData { data, context, .. } => {
-            assert_eq!(context, CONTEXT_KEEPALIVE);
-            assert_eq!(data, &[0xFE]); // response byte
-        }
-        other => panic!("expected LinkData with keepalive response, got {:?}", other),
-    }
+    let mut lrrtt_buf = lrrtt;
+    let _ = resp_t.ingest_on(&mut lrrtt_buf, 102, 0, &mut rng, &resp_id);
+
+    let request = init_t.build_keepalive_packet(&link_id, true, 200).unwrap();
+    let initial_inbound = resp_t.get_link(&link_id).unwrap().last_inbound;
+
+    let mut wrong = request.clone();
+    assert!(matches!(
+        resp_t.ingest_on(&mut wrong, 201, 7, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, initial_inbound);
+    assert_eq!(resp_t.stats().packets_dropped_dedup, 0);
+
+    let mut correct = request;
+    assert!(matches!(
+        resp_t.ingest_on(&mut correct, 202, 0, &mut rng, &resp_id),
+        IngestResult::Keepalive { reply: true, .. }
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, 202);
+    assert_eq!(resp_t.stats().packets_dropped_dedup, 0);
+}
+
+#[test]
+fn malformed_wrong_role_and_legacy_encrypted_keepalives_do_not_refresh_liveness() {
+    let (mut init_t, init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let lrrtt = init_t
+        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .unwrap();
+    let mut lrrtt_buf = lrrtt;
+    let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
+
+    let responder_inbound = resp_t.get_link(&link_id).unwrap().last_inbound;
+    let mut wrong_role = resp_t.build_keepalive_packet(&link_id, false, 200).unwrap();
+    assert!(matches!(
+        resp_t.ingest(&mut wrong_role, 201, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, responder_inbound);
+
+    let mut malformed_buf = [0u8; MTU];
+    let malformed_len = PacketBuilder::new(&mut malformed_buf)
+        .packet_type(PacketType::Data)
+        .dest_type(DestType::Link)
+        .destination_hash(link_id.as_ref())
+        .context(CONTEXT_KEEPALIVE)
+        .payload(&[0xFF, 0x00])
+        .build()
+        .unwrap();
+    assert!(matches!(
+        resp_t.ingest(
+            &mut malformed_buf[..malformed_len],
+            202,
+            &mut rng,
+            &resp_id,
+        ),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, responder_inbound);
+
+    // This reproduces Rete's legacy behavior: context KEEPALIVE sent through
+    // the generic Token-encrypted Link packet builder. Python RNS cannot parse
+    // it as a keepalive, and the parity path must reject it without decryption.
+    let mut encrypted = init_t
+        .build_link_data_packet(&link_id, &[0xFF], CONTEXT_KEEPALIVE, &mut rng)
+        .unwrap();
+    assert!(encrypted.len() > 20);
+    let crypto_failures = resp_t.stats().crypto_failures;
+    assert!(matches!(
+        resp_t.ingest(&mut encrypted, 203, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().last_inbound, responder_inbound);
+    assert_eq!(resp_t.stats().crypto_failures, crypto_failures);
+
+    let initiator_inbound = init_t.get_link(&link_id).unwrap().last_inbound;
+    let mut initiator_request = init_t.build_keepalive_packet(&link_id, true, 204).unwrap();
+    assert!(matches!(
+        init_t.ingest(&mut initiator_request, 205, &mut rng, &init_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(init_t.get_link(&link_id).unwrap().last_inbound, initiator_inbound);
 }
 
 #[test]
@@ -579,10 +701,69 @@ fn link_stale_in_tick() {
     assert_eq!(link.state, LinkState::Active);
     let stale_time = link.stale_time;
 
-    // Tick well past stale time
-    let result = resp_t.tick(102 + stale_time + 1);
+    // Stale begins at two keepalive intervals, with five seconds to revive.
+    let result = resp_t.tick(102 + stale_time);
+    assert_eq!(result.closed_links, 0);
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
+
+    let result = resp_t.tick(102 + stale_time + rete_transport::STALE_GRACE);
     assert_eq!(result.closed_links, 1);
     assert_eq!(resp_t.link_count(), 0);
+}
+
+#[test]
+fn authenticated_link_data_revives_stale_link_during_grace() {
+    let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let lrrtt = init_t
+        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .unwrap();
+    let mut lrrtt_buf = lrrtt;
+    let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
+
+    let last_inbound = resp_t.get_link(&link_id).unwrap().last_inbound;
+    let stale_at = last_inbound + resp_t.get_link(&link_id).unwrap().stale_time;
+    let result = resp_t.tick(stale_at);
+    assert_eq!(result.closed_links, 0);
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
+
+    // Authentication failure during grace must not refresh or revive the Link.
+    let mut corrupt = init_t
+        .build_link_data_packet(&link_id, b"corrupt", CONTEXT_NONE, &mut rng)
+        .unwrap();
+    *corrupt.last_mut().unwrap() ^= 0x01;
+    assert!(matches!(
+        resp_t.ingest(&mut corrupt, stale_at + 1, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Stale);
+    assert_eq!(
+        resp_t.get_link(&link_id).unwrap().last_inbound,
+        last_inbound
+    );
+
+    let mut valid = init_t
+        .build_link_data_packet(&link_id, b"revive", CONTEXT_NONE, &mut rng)
+        .unwrap();
+    assert!(matches!(
+        resp_t.ingest(&mut valid, stale_at + 2, &mut rng, &resp_id),
+        IngestResult::LinkData {
+            link_id: id,
+            data,
+            context,
+        } if id == link_id && data == b"revive" && context == CONTEXT_NONE
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Active);
+    assert_eq!(
+        resp_t.get_link(&link_id).unwrap().last_inbound,
+        stale_at + 2
+    );
+
+    // The old stale-transition deadline no longer applies after revival.
+    let result = resp_t.tick(stale_at + rete_transport::STALE_GRACE);
+    assert_eq!(result.closed_links, 0);
+    assert_eq!(resp_t.link_count(), 1);
 }
 
 #[test]
@@ -1013,7 +1194,7 @@ fn capacity_rejection_is_deduplicated_but_a_fresh_request_can_retry() {
 
 #[test]
 fn transport_keepalive_sent_when_due() {
-    let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let (mut init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
     let mut rng = rand::thread_rng();
 
     // Activate responder via LRRTT
@@ -1023,15 +1204,22 @@ fn transport_keepalive_sent_when_due() {
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
 
-    let link = resp_t.get_link(&link_id).unwrap();
+    let link = init_t.get_link(&link_id).unwrap();
     let ka_interval = link.keepalive_interval;
+    let activated_at = link.last_inbound;
 
     // Not due yet
-    let keepalives = resp_t.build_pending_keepalives(102, &mut rng);
+    let keepalives = init_t.build_pending_keepalives(activated_at, &mut rng);
     assert!(keepalives.is_empty(), "no keepalive should be needed yet");
 
-    // Advance past half keepalive interval
-    let keepalives = resp_t.build_pending_keepalives(102 + ka_interval / 2 + 1, &mut rng);
+    let keepalives = init_t.build_pending_keepalives(activated_at + ka_interval - 1, &mut rng);
+    assert!(
+        keepalives.is_empty(),
+        "half-interval probes are not RNS-compatible"
+    );
+
+    // Initiator probes after a full interval of inbound silence.
+    let keepalives = init_t.build_pending_keepalives(activated_at + ka_interval, &mut rng);
     assert_eq!(keepalives.len(), 1, "should produce one keepalive");
 
     // Verify it's a parseable packet
@@ -1039,6 +1227,24 @@ fn transport_keepalive_sent_when_due() {
     assert_eq!(parsed.packet_type, PacketType::Data);
     assert_eq!(parsed.dest_type, DestType::Link);
     assert_eq!(parsed.context, CONTEXT_KEEPALIVE);
+    assert_eq!(parsed.payload, &[0xFF]);
+    assert_eq!(keepalives[0].len(), 20);
+
+    // The previous probe rate-limits deterministic retries for a full interval.
+    assert!(init_t
+        .build_pending_keepalives(activated_at + 2 * ka_interval - 1, &mut rng)
+        .is_empty());
+    assert_eq!(
+        init_t
+            .build_pending_keepalives(activated_at + 2 * ka_interval, &mut rng)
+            .len(),
+        1
+    );
+
+    // Responders never initiate requests, even after long silence.
+    assert!(resp_t
+        .build_pending_keepalives(activated_at + 100 * ka_interval, &mut rng)
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------

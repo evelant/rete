@@ -128,8 +128,8 @@ def main():
             min(keepalive_max, rtt * (keepalive_max / keepalive_max_rtt)),
         )
 
-        # Stale time: keepalive * STALE_FACTOR + STALE_GRACE
-        stale_time = keepalive_interval * stale_factor + stale_grace
+        # Link.stale_time excludes the watchdog's separate STALE_GRACE wait.
+        stale_time = keepalive_interval * stale_factor
 
         # Traffic timeout: max(TRAFFIC_TIMEOUT_MIN_MS, rtt * 1000 * TRAFFIC_TIMEOUT_FACTOR)
         traffic_timeout = max(

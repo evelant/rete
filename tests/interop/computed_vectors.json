@@ -65,49 +65,49 @@
     {
       "rtt": 0.01,
       "keepalive_interval_s": 5,
-      "stale_time_s": 15,
+      "stale_time_s": 10,
       "traffic_timeout_ms": 60.0
     },
     {
       "rtt": 0.05,
       "keepalive_interval_s": 10.285714285714286,
-      "stale_time_s": 25.571428571428573,
+      "stale_time_s": 20.571428571428573,
       "traffic_timeout_ms": 300.0
     },
     {
       "rtt": 0.18,
       "keepalive_interval_s": 37.02857142857143,
-      "stale_time_s": 79.05714285714286,
+      "stale_time_s": 74.05714285714286,
       "traffic_timeout_ms": 1080.0
     },
     {
       "rtt": 0.5,
       "keepalive_interval_s": 102.85714285714286,
-      "stale_time_s": 210.71428571428572,
+      "stale_time_s": 205.71428571428572,
       "traffic_timeout_ms": 3000.0
     },
     {
       "rtt": 0.75,
       "keepalive_interval_s": 154.28571428571428,
-      "stale_time_s": 313.57142857142856,
+      "stale_time_s": 308.57142857142856,
       "traffic_timeout_ms": 4500.0
     },
     {
       "rtt": 1.0,
       "keepalive_interval_s": 205.71428571428572,
-      "stale_time_s": 416.42857142857144,
+      "stale_time_s": 411.42857142857144,
       "traffic_timeout_ms": 6000.0
     },
     {
       "rtt": 1.5,
       "keepalive_interval_s": 308.57142857142856,
-      "stale_time_s": 622.1428571428571,
+      "stale_time_s": 617.1428571428571,
       "traffic_timeout_ms": 9000.0
     },
     {
       "rtt": 2.0,
       "keepalive_interval_s": 360,
-      "stale_time_s": 725,
+      "stale_time_s": 720,
       "traffic_timeout_ms": 12000.0
     }
   ],
