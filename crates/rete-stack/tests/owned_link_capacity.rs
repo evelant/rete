@@ -1,6 +1,6 @@
 use rand::{rngs::StdRng, SeedableRng};
 use rete_core::{DestType, Identity, PacketBuilder, PacketType, MTU};
-use rete_stack::NodeCore;
+use rete_stack::{IngestRejection, LinkTableKind, NodeCore};
 use rete_transport::{HeaplessStorage, Link};
 
 type TwoLinkNodeCore = NodeCore<HeaplessStorage<64, 16, 128, 2>>;
@@ -46,4 +46,12 @@ fn node_core_link_capacity_emits_no_event_or_proof() {
     let outcome = core.handle_ingest(&third, 102, 0, &mut rng);
     assert!(outcome.events.is_empty());
     assert!(outcome.packets.is_empty());
+    let third_id = rete_transport::compute_link_id(&third).unwrap();
+    assert_eq!(
+        outcome.rejection,
+        Some(IngestRejection::LinkTableFull {
+            link_id: third_id,
+            table: LinkTableKind::Owned,
+        })
+    );
 }

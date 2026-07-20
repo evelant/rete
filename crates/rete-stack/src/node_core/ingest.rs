@@ -16,7 +16,8 @@ use crate::destination::DestinationType;
 use crate::{NodeEvent, ProofStrategy, RequestFailReason, ResourceStrategy};
 
 use super::{
-    IngestOutcome, NodeCore, OutboundPacket, PacketRouting, ReceiptSinkTickOutcome, SplitRecvEntry,
+    IngestOutcome, IngestRejection, NodeCore, OutboundPacket, PacketRouting,
+    ReceiptSinkTickOutcome, SplitRecvEntry,
 };
 
 impl<S: rete_transport::TransportStorage> NodeCore<S> {
@@ -167,6 +168,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         app_data: app_data.map(|d| d.to_vec()),
                     }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::LocalData {
@@ -226,6 +228,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         payload: decrypted,
                     }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::Forward { raw, target, .. } => IngestOutcome {
@@ -239,6 +242,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         ForwardTarget::AllExceptSource => PacketRouting::AllExceptSource,
                     },
                 }],
+                rejection: None,
             },
             IngestResult::LinkRequestReceived { link_id, proof_raw } => IngestOutcome {
                 events: vec![NodeEvent::LinkEstablished { link_id }],
@@ -246,6 +250,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     data: proof_raw,
                     routing: PacketRouting::SourceInterface,
                 }],
+                rejection: None,
             },
             IngestResult::LinkEstablished { link_id } => {
                 let mut packets = Vec::new();
@@ -265,6 +270,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 IngestOutcome {
                     events: vec![NodeEvent::LinkEstablished { link_id }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::LinkData {
@@ -297,6 +303,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                     public_key: pub_key,
                                 }],
                                 packets,
+                                rejection: None,
                             };
                         }
                     }
@@ -308,6 +315,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         context,
                     }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::ChannelMessages {
@@ -327,6 +335,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     .link_proof_outbound(&packet_hash, &link_id)
                     .into_iter()
                     .collect(),
+                rejection: None,
             },
             IngestResult::RequestReceived {
                 link_id,
@@ -351,6 +360,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         data,
                     }],
                     packets: response_packets,
+                    rejection: None,
                 }
             }
             IngestResult::ResponseReceived {
@@ -367,6 +377,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         data,
                     }],
                     packets: Vec::new(),
+                    rejection: None,
                 }
             }
             IngestResult::LinkClosed { link_id } => {
@@ -388,11 +399,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 IngestOutcome {
                     events,
                     packets: Vec::new(),
+                    rejection: None,
                 }
             }
             IngestResult::ProofReceived { packet_hash } => IngestOutcome {
                 events: vec![NodeEvent::ProofReceived { packet_hash }],
                 packets: Vec::new(),
+                rejection: None,
             },
             IngestResult::Buffered {
                 packet_hash,
@@ -404,6 +417,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     .link_proof_outbound(&packet_hash, &link_id)
                     .into_iter()
                     .collect(),
+                rejection: None,
             },
             IngestResult::ResourceOffered {
                 link_id,
@@ -477,6 +491,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         total_size,
                     }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::ResourceProgress {
@@ -535,6 +550,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                     resource_hash,
                                 }],
                                 packets: core::mem::take(&mut $packets),
+                                rejection: None,
                             };
                         }};
                     }
@@ -639,6 +655,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                 total: split_total,
                             }],
                             packets,
+                            rejection: None,
                         };
                     } else if split_total > 1 && split_index == split_total {
                         // Final split segment: concatenate all buffered data
@@ -659,6 +676,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                 data: full_data,
                             }],
                             packets,
+                            rejection: None,
                         };
                     }
 
@@ -675,6 +693,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                     data: resp_data,
                                 }],
                                 packets,
+                                rejection: None,
                             };
                         }
                     }
@@ -701,6 +720,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                                     data: req_data,
                                 }],
                                 packets,
+                                rejection: None,
                             };
                         }
                     }
@@ -711,6 +731,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             data: plaintext,
                         }],
                         packets,
+                        rejection: None,
                     };
                 }
                 // Not all parts received yet — drain resource outbound
@@ -756,7 +777,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         total,
                     });
                 }
-                IngestOutcome { events, packets }
+                IngestOutcome {
+                    events,
+                    packets,
+                    rejection: None,
+                }
             }
             IngestResult::ResourceComplete {
                 link_id,
@@ -776,6 +801,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         data,
                     }],
                     packets,
+                    rejection: None,
                 }
             }
             IngestResult::ResourceFailed {
@@ -807,7 +833,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         true
                     }
                 });
-                IngestOutcome { events, packets }
+                IngestOutcome {
+                    events,
+                    packets,
+                    rejection: None,
+                }
             }
             IngestResult::ResourceRejected {
                 link_id,
@@ -820,6 +850,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         resource_hash,
                     }],
                     packets: Vec::new(),
+                    rejection: None,
                 }
             }
             IngestResult::PathRequestForward { payload } => {
@@ -837,15 +868,32 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     Ok(n) => IngestOutcome {
                         events: vec![],
                         packets: vec![OutboundPacket::broadcast(buf[..n].to_vec())],
+                        rejection: None,
                     },
                     Err(_) => IngestOutcome::empty(),
                 }
             }
-            IngestResult::ReverseTableFull { .. }
-            | IngestResult::ReverseRouteConflict { .. } => IngestOutcome::empty(),
-            IngestResult::LinkTableFull { .. }
-            | IngestResult::Duplicate
-            | IngestResult::Invalid => {
+            IngestResult::ReverseTableFull { truncated_hash } => IngestOutcome::rejected(
+                IngestRejection::ReverseTableFull { truncated_hash },
+            ),
+            IngestResult::ReverseRouteConflict { truncated_hash } => IngestOutcome::rejected(
+                IngestRejection::ReverseRouteConflict { truncated_hash },
+            ),
+            IngestResult::LinkTableFull { link_id, table } => {
+                // Preserve the pre-existing behavior of releasing unrelated
+                // resource packets while exposing the Link admission failure.
+                IngestOutcome {
+                    events: vec![],
+                    packets: self
+                        .transport
+                        .drain_resource_outbound()
+                        .into_iter()
+                        .map(OutboundPacket::broadcast)
+                        .collect(),
+                    rejection: Some(IngestRejection::LinkTableFull { link_id, table }),
+                }
+            }
+            IngestResult::Duplicate | IngestResult::Invalid => {
                 // Drain any resource outbound packets that may have been queued
                 let resource_pkts = self.transport.drain_resource_outbound();
                 if resource_pkts.is_empty() {
@@ -857,6 +905,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             .into_iter()
                             .map(OutboundPacket::broadcast)
                             .collect(),
+                        rejection: None,
                     }
                 }
             }
@@ -998,7 +1047,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         });
 
         ReceiptSinkTickOutcome {
-            outcome: IngestOutcome { events, packets },
+            outcome: IngestOutcome {
+                events,
+                packets,
+                rejection: None,
+            },
             failed_receipts: result.failed_receipts,
             receipt_notifications_deferred: result.receipt_notifications_deferred,
         }
@@ -1023,7 +1076,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             closed_links: result.closed_links,
         });
 
-        IngestOutcome { events, packets }
+        IngestOutcome {
+            events,
+            packets,
+            rejection: None,
+        }
     }
 
     /// Check pending requests for timeout and return timeout events.

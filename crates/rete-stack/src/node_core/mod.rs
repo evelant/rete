@@ -23,7 +23,9 @@ use rete_core::{
     DestHash, DestType, Identity, IdentityHash, LinkId, MTU, Packet, PacketBuilder, PacketType,
     PathHash, RequestId, TRUNCATED_HASH_LEN,
 };
-use rete_transport::{RECEIPT_TIMEOUT, ReceiptRegistrationError, SendError, Transport};
+use rete_transport::{
+    LinkTableKind, RECEIPT_TIMEOUT, ReceiptRegistrationError, SendError, Transport,
+};
 
 use alloc::boxed::Box;
 
@@ -196,6 +198,34 @@ pub struct PreparedDataPacketRef<'a> {
 // IngestOutcome
 // ---------------------------------------------------------------------------
 
+/// A stateful transport admission failure observed while processing ingress.
+///
+/// These failures are non-wire outcomes: the rejected packet produces no
+/// application event or outbound packet attributable to that ingress, while
+/// callers retain enough typed detail for diagnostics and capacity handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestRejection {
+    /// A valid LINKREQUEST could not be retained in a bounded Link table.
+    LinkTableFull {
+        /// Link ID whose admission failed.
+        link_id: LinkId,
+        /// Owned or relayed Link table that rejected the request.
+        table: LinkTableKind,
+    },
+    /// A transported DATA packet could not retain a reverse route because the
+    /// bounded reverse table is full.
+    ReverseTableFull {
+        /// Truncated packet hash used as the reverse-table key.
+        truncated_hash: [u8; TRUNCATED_HASH_LEN],
+    },
+    /// A transported DATA packet's truncated hash is already bound to a
+    /// different reverse route.
+    ReverseRouteConflict {
+        /// Truncated packet hash whose retained route conflicts.
+        truncated_hash: [u8; TRUNCATED_HASH_LEN],
+    },
+}
+
 /// Result of processing an inbound packet or tick through NodeCore.
 #[derive(Debug)]
 pub struct IngestOutcome {
@@ -203,6 +233,9 @@ pub struct IngestOutcome {
     pub events: Vec<NodeEvent>,
     /// Packets to send out.
     pub packets: Vec<OutboundPacket>,
+    /// Typed stateful admission failure. Ordinary, duplicate, malformed,
+    /// and tick outcomes carry `None`.
+    pub rejection: Option<IngestRejection>,
 }
 
 /// Result of periodic maintenance when DATA receipt terminals are written to
@@ -224,6 +257,16 @@ impl IngestOutcome {
         IngestOutcome {
             events: Vec::new(),
             packets: Vec::new(),
+            rejection: None,
+        }
+    }
+
+    /// Empty non-wire outcome carrying a typed ingress rejection.
+    pub(super) fn rejected(rejection: IngestRejection) -> Self {
+        IngestOutcome {
+            events: Vec::new(),
+            packets: Vec::new(),
+            rejection: Some(rejection),
         }
     }
 
@@ -1302,6 +1345,7 @@ mod tests {
         );
         assert_eq!(outcome.packets.len(), 1);
         assert_eq!(outcome.packets[0].routing, PacketRouting::ExactInterface(1));
+        assert_eq!(outcome.rejection, None);
     }
 
     #[test]
@@ -1362,6 +1406,13 @@ mod tests {
         let rejected = core.handle_ingest(&overflow[..overflow_len], 102, 5, &mut rng);
         assert!(rejected.events.is_empty());
         assert!(rejected.packets.is_empty());
+        assert_eq!(
+            rejected.rejection,
+            Some(IngestRejection::LinkTableFull {
+                link_id: overflow_id,
+                table: rete_transport::LinkTableKind::Relay,
+            })
+        );
         assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
         assert_eq!(core.transport.relay_link_count(), 2);
         assert_eq!(core.transport.get_relay_link(&first_id), Some(&retained));
@@ -1419,6 +1470,12 @@ mod tests {
         let rejected = core.handle_ingest(&overflow, 102, 5, &mut rng);
         assert!(rejected.events.is_empty());
         assert!(rejected.packets.is_empty());
+        assert_eq!(
+            rejected.rejection,
+            Some(IngestRejection::ReverseTableFull {
+                truncated_hash: overflow_key,
+            })
+        );
         assert_eq!(core.transport.reverse_count(), 2);
         assert!(core.transport.get_reverse(&overflow_key).is_none());
         assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
@@ -1431,6 +1488,7 @@ mod tests {
         let retry = core.handle_ingest(&overflow, 103, 5, &mut rng);
         assert!(retry.events.is_empty());
         assert!(retry.packets.is_empty());
+        assert_eq!(retry.rejection, None);
         assert_eq!(
             core.transport.stats().packets_dropped_dedup,
             dedup_before + 1,
@@ -1488,6 +1546,12 @@ mod tests {
         let rejected = core.handle_ingest(&original, 102, 6, &mut rng);
         assert!(rejected.events.is_empty());
         assert!(rejected.packets.is_empty());
+        assert_eq!(
+            rejected.rejection,
+            Some(IngestRejection::ReverseRouteConflict {
+                truncated_hash: reverse_key,
+            })
+        );
         assert_eq!(core.transport.get_reverse(&reverse_key), Some(&retained));
         assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
         assert_eq!(
@@ -1502,6 +1566,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         let mut outcome = core.handle_tick(1000, &mut rng);
+        assert_eq!(outcome.rejection, None);
         match outcome.event() {
             Some(NodeEvent::Tick { expired_paths, .. }) => {
                 assert_eq!(expired_paths, 0);
@@ -2064,6 +2129,7 @@ mod tests {
 
         let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::default();
         let deferred = sender.handle_tick_with_receipt_sink(131, &mut rng, &mut full_sink);
+        assert_eq!(deferred.outcome.rejection, None);
         assert_eq!(deferred.failed_receipts, 0);
         assert!(deferred.receipt_notifications_deferred);
         assert_eq!(sender.transport.receipt_count(), 1);
@@ -2071,6 +2137,7 @@ mod tests {
         let mut available_sink = RecordingReceiptSink::default();
         let completed =
             sender.handle_tick_with_receipt_sink(132, &mut rng, &mut available_sink);
+        assert_eq!(completed.outcome.rejection, None);
         assert_eq!(completed.failed_receipts, 1);
         assert!(!completed.receipt_notifications_deferred);
         assert_eq!(

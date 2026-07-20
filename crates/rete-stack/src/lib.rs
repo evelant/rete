@@ -309,16 +309,17 @@ pub use node_core::ratchet::{InMemoryRatchetStore, RatchetStore};
 pub use node_core::request_receipt::{PendingRequest, RequestStatus};
 #[cfg(feature = "alloc")]
 pub use node_core::{
-    EmbeddedNodeCore, IngestOutcome, NodeCore, NodeHooks, NodeStats, OutboundPacket, PacketRouting,
-    PreparedDataPacket, PreparedDataPacketRef, ReceiptSinkTickOutcome, ReceiptToken,
-    RequestCallback, RequestContext, RequestHandler, RequestPolicy, ResponseCompressionPolicy,
-    handler_fn,
+    EmbeddedNodeCore, IngestOutcome, IngestRejection, NodeCore, NodeHooks, NodeStats,
+    OutboundPacket, PacketRouting, PreparedDataPacket, PreparedDataPacketRef,
+    ReceiptSinkTickOutcome, ReceiptToken, RequestCallback, RequestContext, RequestHandler,
+    RequestPolicy, ResponseCompressionPolicy, handler_fn,
 };
 
 #[cfg(feature = "alloc")]
 pub use rete_transport::{
     FixedReceiptTerminalReservation, FixedReceiptTerminalSink, ReceiptCandidate, ReceiptKind,
-    ReceiptSinkFull, ReceiptTerminal, ReceiptTerminalReservation, ReceiptTerminalSink, SendError,
+    LinkTableKind, ReceiptSinkFull, ReceiptTerminal, ReceiptTerminalReservation,
+    ReceiptTerminalSink, SendError,
 };
 
 /// Dispatch outbound packets to a single interface.
