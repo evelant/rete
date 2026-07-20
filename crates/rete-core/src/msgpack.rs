@@ -342,44 +342,156 @@ pub fn read_uint(data: &[u8], pos: &mut usize) -> Result<u64, MsgpackError> {
     }
 }
 
-/// Read a msgpack float64 value. Also accepts float32 (promoted to f64) and
-/// integer types (cast to f64) for compatibility with Python msgpack timestamps.
+/// Read one msgpack numeric value as `f64`.
+///
+/// This accepts the same scalar numeric families that Python's bundled
+/// `umsgpack.unpackb()` can return to numeric protocol consumers: float32,
+/// float64, every signed and unsigned integer representation, and booleans.
+/// Signed values are converted with their sign intact. Only the first object
+/// is consumed; callers that intentionally mirror `unpackb()` may ignore any
+/// trailing bytes by not checking `pos` against `data.len()`.
 pub fn read_float64(data: &[u8], pos: &mut usize) -> Result<f64, MsgpackError> {
     if *pos >= data.len() {
         return Err(MsgpackError::Truncated);
     }
     let b = data[*pos];
     *pos += 1;
-    if b == 0xcb {
-        // float64
-        if *pos + 8 > data.len() {
-            return Err(MsgpackError::Truncated);
-        }
-        let bytes = [
-            data[*pos],
-            data[*pos + 1],
-            data[*pos + 2],
-            data[*pos + 3],
-            data[*pos + 4],
-            data[*pos + 5],
-            data[*pos + 6],
-            data[*pos + 7],
-        ];
-        *pos += 8;
-        Ok(f64::from_be_bytes(bytes))
-    } else if b == 0xca {
+    match b {
+        // positive fixint
+        0x00..=0x7f => Ok(b as f64),
+        // booleans are ints for Python comparison purposes
+        0xc2 => Ok(0.0),
+        0xc3 => Ok(1.0),
         // float32
-        if *pos + 4 > data.len() {
-            return Err(MsgpackError::Truncated);
+        0xca => {
+            if *pos + 4 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let bytes = [data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]];
+            *pos += 4;
+            Ok(f32::from_be_bytes(bytes) as f64)
         }
-        let bytes = [data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]];
-        *pos += 4;
-        Ok(f32::from_be_bytes(bytes) as f64)
-    } else {
-        // Fall back to reading an integer (Python sometimes encodes timestamps as int)
-        *pos -= 1;
-        let v = read_uint(data, pos).map_err(|_| MsgpackError::ExpectedFloat)?;
-        Ok(v as f64)
+        // float64
+        0xcb => {
+            if *pos + 8 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let bytes = [
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
+            ];
+            *pos += 8;
+            Ok(f64::from_be_bytes(bytes))
+        }
+        // uint8
+        0xcc => {
+            if *pos >= data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = data[*pos];
+            *pos += 1;
+            Ok(value as f64)
+        }
+        // uint16
+        0xcd => {
+            if *pos + 2 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = u16::from_be_bytes([data[*pos], data[*pos + 1]]);
+            *pos += 2;
+            Ok(value as f64)
+        }
+        // uint32
+        0xce => {
+            if *pos + 4 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = u32::from_be_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+            ]);
+            *pos += 4;
+            Ok(value as f64)
+        }
+        // uint64
+        0xcf => {
+            if *pos + 8 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = u64::from_be_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
+            ]);
+            *pos += 8;
+            Ok(value as f64)
+        }
+        // int8
+        0xd0 => {
+            if *pos >= data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = data[*pos] as i8;
+            *pos += 1;
+            Ok(value as f64)
+        }
+        // int16
+        0xd1 => {
+            if *pos + 2 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = i16::from_be_bytes([data[*pos], data[*pos + 1]]);
+            *pos += 2;
+            Ok(value as f64)
+        }
+        // int32
+        0xd2 => {
+            if *pos + 4 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = i32::from_be_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+            ]);
+            *pos += 4;
+            Ok(value as f64)
+        }
+        // int64
+        0xd3 => {
+            if *pos + 8 > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let value = i64::from_be_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
+            ]);
+            *pos += 8;
+            Ok(value as f64)
+        }
+        // negative fixint (-32 to -1)
+        0xe0..=0xff => Ok((b as i8) as f64),
+        _ => Err(MsgpackError::ExpectedFloat),
     }
 }
 
@@ -835,6 +947,67 @@ mod tests {
         let data = [42]; // positive fixint
         let mut pos = 0;
         assert_eq!(read_float64(&data, &mut pos).unwrap(), 42.0);
+    }
+
+    #[test]
+    fn test_read_float64_accepts_python_numeric_scalar_families() {
+        let cases: &[(&[u8], f64)] = &[
+            (&[0xc2], 0.0),
+            (&[0xc3], 1.0),
+            (&[0x7f], 127.0),
+            (&[0xff], -1.0),
+            (&[0xcc, 0x80], 128.0),
+            (&[0xcd, 0x80, 0x00], 32768.0),
+            (&[0xce, 0x80, 0x00, 0x00, 0x00], 2_147_483_648.0),
+            (
+                &[0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                u64::MAX as f64,
+            ),
+            (&[0xd0, 0x80], -128.0),
+            (&[0xd1, 0x80, 0x00], -32768.0),
+            (&[0xd2, 0x80, 0x00, 0x00, 0x00], -2_147_483_648.0),
+            (
+                &[0xd3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                i64::MIN as f64,
+            ),
+        ];
+
+        for (data, expected) in cases {
+            let mut pos = 0;
+            assert_eq!(read_float64(data, &mut pos).unwrap(), *expected);
+            assert_eq!(pos, data.len());
+        }
+    }
+
+    #[test]
+    fn test_read_float64_consumes_only_first_object() {
+        let mut data = vec![0xcb];
+        data.extend_from_slice(&3.25f64.to_be_bytes());
+        data.extend_from_slice(&[0xc1, 0xff]);
+        let mut pos = 0;
+
+        assert_eq!(read_float64(&data, &mut pos).unwrap(), 3.25);
+        assert_eq!(pos, 9);
+    }
+
+    #[test]
+    fn test_read_float64_preserves_nan_and_rejects_non_numeric_values() {
+        let mut nan = vec![0xcb];
+        nan.extend_from_slice(&f64::NAN.to_be_bytes());
+        let mut pos = 0;
+        assert!(read_float64(&nan, &mut pos).unwrap().is_nan());
+
+        let mut pos = 0;
+        assert_eq!(
+            read_float64(&[0xc0], &mut pos),
+            Err(MsgpackError::ExpectedFloat)
+        );
+
+        let mut pos = 0;
+        assert_eq!(
+            read_float64(&[0xd3, 0x00], &mut pos),
+            Err(MsgpackError::Truncated)
+        );
     }
 
     // --- read_uint_or_nil ---

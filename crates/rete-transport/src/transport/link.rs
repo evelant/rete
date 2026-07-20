@@ -221,7 +221,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         Self::build_link_packet(link, link_id, plaintext, context, rng)
     }
 
-    /// Build an LRRTT measurement packet for a link (initiator sends after proof).
+    /// Build an LRRTT packet from an already encoded payload.
+    ///
+    /// This low-level compatibility surface is useful for protocol tests and
+    /// peers that already own a MessagePack encoder. Normal initiators should
+    /// call [`Self::build_lrrtt_packet_for_rtt`] so the wire payload is the
+    /// canonical MessagePack float64 representation emitted by Python RNS.
     pub fn build_lrrtt_packet<R: RngCore + CryptoRng>(
         &self,
         link_id: &LinkId,
@@ -230,6 +235,23 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     ) -> Result<alloc::vec::Vec<u8>, SendError> {
         let link = self.links.get(link_id).ok_or(SendError::LinkNotFound)?;
         Self::build_link_packet(link, link_id, rtt_bytes, CONTEXT_LRRTT, rng)
+    }
+
+    /// Build a canonical Python-compatible LRRTT measurement packet.
+    ///
+    /// `umsgpack.packb(float)` emits the float64 marker followed by the
+    /// big-endian IEEE-754 value. Form it in a fixed stack buffer so encoding
+    /// itself performs no allocation.
+    pub fn build_lrrtt_packet_for_rtt<R: RngCore + CryptoRng>(
+        &self,
+        link_id: &LinkId,
+        rtt: f64,
+        rng: &mut R,
+    ) -> Result<alloc::vec::Vec<u8>, SendError> {
+        let mut payload = [0u8; 9];
+        payload[0] = 0xcb;
+        payload[1..].copy_from_slice(&rtt.to_be_bytes());
+        self.build_lrrtt_packet(link_id, &payload, rng)
     }
 
     /// Build an unencrypted keepalive request/response packet for a link.
@@ -537,6 +559,32 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         IngestResult::LinkEstablished { link_id: *link_id }
     }
 
+    /// Tear down a responder handshake whose authenticated LRRTT plaintext is
+    /// not a Python-compatible MessagePack number.
+    ///
+    /// Python calls `Link.teardown()` from the LRRTT exception path. Construct
+    /// its encrypted LINKCLOSE while the session key is still retained, then
+    /// purge local state regardless of whether packet construction succeeds.
+    fn teardown_malformed_lrrtt<'a, R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        rng: &mut R,
+    ) -> IngestResult<'a> {
+        let interface = self.links.get(link_id).and_then(Link::bound_interface);
+        let close_raw = self.build_linkclose_packet(link_id, rng).ok();
+        if close_raw.is_none() {
+            self.remove_owned_link(link_id);
+        }
+        self.stats.packets_dropped_invalid += 1;
+        self.stats.links_failed += 1;
+        self.stats.links_closed += 1;
+        IngestResult::LinkTeardown {
+            link_id: *link_id,
+            close_raw,
+            interface,
+        }
+    }
+
     pub(super) fn handle_link_data<'a, R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
@@ -637,28 +685,53 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             Ok(n) => n,
             Err(_) => {
                 self.stats.crypto_failures += 1;
+                self.stats.packets_dropped_invalid += 1;
                 return IngestResult::Invalid;
             }
         };
 
         match context {
             CONTEXT_LRRTT => {
-                // Only a pending responder consumes LRRTT. Once its encrypted
-                // payload authenticates, retain the packet's local inbound
-                // height just as Python Link.rtt_packet() does.
+                // Rete intentionally consumes LRRTT only for a pending
+                // responder. Python also reprocesses it on Active responders,
+                // but exact parity there requires an immutable request_time;
+                // Rete's last_outbound changes after activation. Decrypt and
+                // decode the complete first MessagePack object before changing
+                // any Link lifecycle state. Python's unpackb() deliberately
+                // leaves trailing bytes unread, so no exact-length check is
+                // applied.
                 if link.role != LinkRole::Responder
                     || link.state != crate::link::LinkState::Handshake
                 {
                     return IngestResult::Invalid;
                 }
+                let mut pos = 0;
+                let peer_rtt = match rete_core::msgpack::read_float64(
+                    &dec_buf[..dec_len],
+                    &mut pos,
+                ) {
+                    Ok(peer_rtt) => peer_rtt,
+                    Err(_) => return self.teardown_malformed_lrrtt(link_id, rng),
+                };
+
+                // Python computes max(measured_rtt, peer_rtt). Express it as
+                // the comparison Python's max() performs so a peer NaN does
+                // not replace a finite local measurement.
+                let measured_rtt = now.saturating_sub(link.last_outbound) as f64;
+                let measured_rtt = if measured_rtt <= 0.0 {
+                    0.001
+                } else {
+                    measured_rtt
+                };
+                let rtt = if peer_rtt > measured_rtt {
+                    peer_rtt
+                } else {
+                    measured_rtt
+                };
+
+                // Only authenticated, numeric LRRTT reaches lifecycle mutation.
                 link.set_expected_hops(hops);
-                // RTT measurement — activates responder link.
-                // Compute RTT: time since link was created (proof sent shortly after).
-                // Floor at 0.001s so sub-second RTT (from u64 truncation) still triggers
-                // dynamic keepalive tuning.
-                let raw_rtt = now.saturating_sub(link.last_outbound) as f32;
-                let rtt = if raw_rtt <= 0.0 { 0.001 } else { raw_rtt };
-                link.update_keepalive(rtt);
+                link.update_keepalive(rtt as f32);
                 link.activate(now);
                 self.stats.links_established += 1;
                 IngestResult::LinkEstablished { link_id: *link_id }

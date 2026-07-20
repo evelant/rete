@@ -436,6 +436,19 @@ pub enum IngestResult<'a> {
         /// The link_id.
         link_id: LinkId,
     },
+    /// A locally owned Link was purged after an authenticated handshake
+    /// payload failed protocol decoding.
+    ///
+    /// `close_raw` carries the best-effort encrypted LINKCLOSE response. Link
+    /// removal is unconditional even if construction of that response failed.
+    LinkTeardown {
+        /// The link_id.
+        link_id: LinkId,
+        /// Encrypted LINKCLOSE packet, when construction succeeded.
+        close_raw: Option<alloc::vec::Vec<u8>>,
+        /// Interface retained by the authenticated Link handshake.
+        interface: Option<u8>,
+    },
     /// A proof was received for a packet we sent.
     ///
     /// The corresponding receipt has already been reclaimed when this result
@@ -597,9 +610,11 @@ pub struct TransportStats {
     pub announces_rate_limited: u64,
     /// Links that reached Active state (LRRTT or LRPROOF exchange completed).
     pub links_established: u64,
-    /// Links closed (LINKCLOSE received or keepalive timeout).
+    /// Links closed (LINKCLOSE received, local protocol-error teardown, or
+    /// keepalive timeout).
     pub links_closed: u64,
-    /// Link handshake failures (crypto errors during establishment).
+    /// Link handshake failures (cryptographic errors or malformed authenticated
+    /// negotiation payloads during establishment).
     pub links_failed: u64,
     /// Link requests received (before LRPROOF sent).
     pub link_requests_received: u64,

@@ -1778,6 +1778,23 @@ mod tests {
                     .unwrap_or(false)
             })
             .expect("initiator should auto-send LRRTT");
+        let parsed_lrrtt = Packet::parse(&lrrtt_pkt.data).unwrap();
+        let initiator_rtt = init.transport.get_link(&link_id).unwrap().rtt as f64;
+        let mut plaintext = [0u8; rete_core::MTU];
+        let plaintext_len = init
+            .transport
+            .get_link(&link_id)
+            .unwrap()
+            .decrypt(parsed_lrrtt.payload, &mut plaintext)
+            .unwrap();
+        let mut canonical_rtt = [0u8; 9];
+        canonical_rtt[0] = 0xcb;
+        canonical_rtt[1..].copy_from_slice(&initiator_rtt.to_be_bytes());
+        assert_eq!(
+            &plaintext[..plaintext_len],
+            &canonical_rtt,
+            "automatic LRRTT must be canonical MessagePack float64"
+        );
 
         // The same authenticated packet on the wrong interface must neither
         // teach a height nor poison the correct copy's dedup admission.
@@ -1850,6 +1867,101 @@ mod tests {
                 .all(|packet| packet.routing == PacketRouting::BoundInterface(0)),
             "LRRTT must use the interface authenticated by LRPROOF ingress"
         );
+    }
+
+    #[test]
+    fn node_core_authenticated_malformed_lrrtt_emits_close_and_event_once() {
+        let mut rng = rand::thread_rng();
+        let mut resp = make_core(b"malformed-lrrtt-resp");
+        let mut init = make_core(b"malformed-lrrtt-init");
+        let resp_id = Identity::from_seed(b"malformed-lrrtt-resp").unwrap();
+        init.register_peer(&resp_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+
+        let (request, link_id) = init
+            .initiate_link(*resp.dest_hash(), 100, &mut rng)
+            .unwrap();
+        let accepted = resp.handle_ingest(&request.data, 100, 0, &mut rng);
+        let proof = accepted.packets.first().unwrap();
+        let established = init.handle_ingest(&proof.data, 101, 0, &mut rng);
+        assert!(matches!(
+            established.events.first(),
+            Some(NodeEvent::LinkEstablished { .. })
+        ));
+
+        let malformed = init
+            .transport
+            .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+            .unwrap();
+        let replay = malformed.clone();
+        let pending_request = rete_core::RequestId::from([0x42; TRUNCATED_HASH_LEN]);
+        resp.register_pending_request(pending_request, link_id, 101, None);
+        assert_eq!(resp.pending_requests.len(), 1);
+        let invalid_before = resp.transport.stats().packets_dropped_invalid;
+        let failed_before = resp.transport.stats().links_failed;
+        let closed_before = resp.transport.stats().links_closed;
+        let established_before = resp.transport.stats().links_established;
+        let outcome = resp.handle_ingest(&malformed, 102, 0, &mut rng);
+
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            outcome.events.first(),
+            Some(NodeEvent::RequestFailed {
+                link_id: id,
+                request_id,
+                reason: crate::RequestFailReason::LinkClosed,
+            }) if *id == link_id && *request_id == pending_request
+        ));
+        assert!(matches!(
+            outcome.events.get(1),
+            Some(NodeEvent::LinkClosed { link_id: id }) if *id == link_id
+        ));
+        assert!(resp.pending_requests.is_empty());
+        assert_eq!(outcome.packets.len(), 1);
+        assert_eq!(
+            outcome.packets[0].routing,
+            PacketRouting::BoundInterface(0)
+        );
+        assert_eq!(
+            Packet::parse(&outcome.packets[0].data).unwrap().context,
+            rete_core::CONTEXT_LINKCLOSE
+        );
+        assert!(resp.transport.get_link(&link_id).is_none());
+        assert_eq!(
+            resp.transport.stats().packets_dropped_invalid,
+            invalid_before + 1
+        );
+        assert_eq!(resp.transport.stats().links_failed, failed_before + 1);
+        assert_eq!(resp.transport.stats().links_closed, closed_before + 1);
+        assert_eq!(
+            resp.transport.stats().links_established,
+            established_before
+        );
+
+        let parsed_close = Packet::parse(&outcome.packets[0].data).unwrap();
+        let mut close_plaintext = [0u8; rete_core::MTU];
+        let close_len = init
+            .transport
+            .get_link(&link_id)
+            .unwrap()
+            .decrypt(parsed_close.payload, &mut close_plaintext)
+            .unwrap();
+        assert_eq!(&close_plaintext[..close_len], link_id.as_ref());
+
+        let replay_outcome = resp.handle_ingest(&replay, 103, 0, &mut rng);
+        assert!(replay_outcome.events.is_empty());
+        assert!(replay_outcome.packets.is_empty());
+        assert_eq!(resp.transport.stats().links_failed, failed_before + 1);
+        assert_eq!(resp.transport.stats().links_closed, closed_before + 1);
+
+        let initiator_close = init.handle_ingest(&outcome.packets[0].data, 104, 0, &mut rng);
+        assert_eq!(initiator_close.events.len(), 1);
+        assert!(matches!(
+            initiator_close.events.first(),
+            Some(NodeEvent::LinkClosed { link_id: id }) if *id == link_id
+        ));
+        assert!(initiator_close.packets.is_empty());
+        assert!(init.transport.get_link(&link_id).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -3720,6 +3832,128 @@ mod tests {
             }
             other => panic!("A expected ChannelMessages for reply, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn malformed_lrrtt_teardown_routes_across_relay_in_both_directions() {
+        let mut rng = rand::thread_rng();
+        let mut node_a = make_core(b"malformed-relay-a");
+        let mut node_b = make_core(b"malformed-relay-b");
+        let mut node_c = make_core(b"malformed-relay-c");
+        node_b.enable_transport();
+
+        let id_b = Identity::from_seed(b"malformed-relay-b").unwrap();
+        let id_c = Identity::from_seed(b"malformed-relay-c").unwrap();
+        let c_dest = *node_c.dest_hash();
+        node_a
+            .register_peer(&id_c, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut a_to_c = rete_transport::Path::via_repeater(id_b.hash(), 2, 100);
+        a_to_c.received_on = Some(0);
+        node_a.transport.insert_path(c_dest, a_to_c);
+        node_b
+            .register_peer(&id_c, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let mut b_to_c = rete_transport::Path::direct(100);
+        b_to_c.received_on = Some(1);
+        node_b.transport.insert_path(c_dest, b_to_c);
+
+        let (request, link_id) = node_a.initiate_link(c_dest, 100, &mut rng).unwrap();
+        let request_at_c = node_b.handle_ingest(&request.data, 100, 0, &mut rng);
+        assert_eq!(request_at_c.packets.len(), 1);
+        let accepted = node_c.handle_ingest(&request_at_c.packets[0].data, 101, 1, &mut rng);
+        assert_eq!(accepted.packets.len(), 1);
+        let proof_at_a = node_b.handle_ingest(&accepted.packets[0].data, 102, 1, &mut rng);
+        assert_eq!(proof_at_a.packets.len(), 1);
+        let established =
+            node_a.handle_ingest(&proof_at_a.packets[0].data, 103, 0, &mut rng);
+        assert!(matches!(
+            established.events.first(),
+            Some(NodeEvent::LinkEstablished { .. })
+        ));
+        assert_eq!(
+            node_c
+                .transport
+                .get_link(&link_id)
+                .unwrap()
+                .expected_hops(),
+            None
+        );
+
+        let malformed = node_a
+            .transport
+            .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+            .unwrap();
+        let malformed_replay = malformed.clone();
+        let forwarded = node_b.handle_ingest(&malformed, 104, 0, &mut rng);
+        assert!(forwarded.events.is_empty());
+        assert_eq!(forwarded.packets.len(), 1);
+        assert_eq!(
+            forwarded.packets[0].routing,
+            PacketRouting::ExactInterface(1)
+        );
+        assert_eq!(Packet::parse(&forwarded.packets[0].data).unwrap().hops, 1);
+
+        let invalid_before = node_c.transport.stats().packets_dropped_invalid;
+        let failed_before = node_c.transport.stats().links_failed;
+        let closed_before = node_c.transport.stats().links_closed;
+        let established_before = node_c.transport.stats().links_established;
+        let teardown = node_c.handle_ingest(&forwarded.packets[0].data, 105, 1, &mut rng);
+        assert_eq!(teardown.events.len(), 1);
+        assert!(matches!(
+            teardown.events.first(),
+            Some(NodeEvent::LinkClosed { link_id: id }) if *id == link_id
+        ));
+        assert_eq!(teardown.packets.len(), 1);
+        assert_eq!(
+            teardown.packets[0].routing,
+            PacketRouting::BoundInterface(1)
+        );
+        assert!(node_c.transport.get_link(&link_id).is_none());
+        assert_eq!(
+            node_c.transport.stats().packets_dropped_invalid,
+            invalid_before + 1
+        );
+        assert_eq!(node_c.transport.stats().links_failed, failed_before + 1);
+        assert_eq!(node_c.transport.stats().links_closed, closed_before + 1);
+        assert_eq!(
+            node_c.transport.stats().links_established,
+            established_before
+        );
+
+        let close_at_a =
+            node_b.handle_ingest(&teardown.packets[0].data, 106, 1, &mut rng);
+        assert!(close_at_a.events.is_empty());
+        assert_eq!(close_at_a.packets.len(), 1);
+        assert_eq!(
+            close_at_a.packets[0].routing,
+            PacketRouting::ExactInterface(0)
+        );
+        assert_eq!(
+            Packet::parse(&close_at_a.packets[0].data)
+                .unwrap()
+                .context,
+            rete_core::CONTEXT_LINKCLOSE
+        );
+        let closed_a = node_a.handle_ingest(&close_at_a.packets[0].data, 107, 0, &mut rng);
+        assert_eq!(closed_a.events.len(), 1);
+        assert!(matches!(
+            closed_a.events.first(),
+            Some(NodeEvent::LinkClosed { link_id: id }) if *id == link_id
+        ));
+        assert!(closed_a.packets.is_empty());
+        assert!(node_a.transport.get_link(&link_id).is_none());
+
+        // A replay can still traverse B's retained relay entry, but C has
+        // purged the owned Link and must not emit or count a second teardown.
+        let replay_at_c = node_b.handle_ingest(&malformed_replay, 108, 0, &mut rng);
+        assert_eq!(replay_at_c.packets.len(), 1);
+        let replay_outcome =
+            node_c.handle_ingest(&replay_at_c.packets[0].data, 109, 1, &mut rng);
+        assert!(replay_outcome.events.is_empty());
+        assert!(replay_outcome.packets.is_empty());
+        assert_eq!(node_c.transport.stats().links_failed, failed_before + 1);
+        assert_eq!(node_c.transport.stats().links_closed, closed_before + 1);
     }
 
     /// Reverse direction: C initiates link to A through relay B.

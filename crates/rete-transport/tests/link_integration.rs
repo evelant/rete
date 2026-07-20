@@ -6,8 +6,8 @@
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rete_core::{
     DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, Packet, PacketBuilder,
-    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LRPROOF, CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT,
-    TRUNCATED_HASH_LEN,
+    PacketType, CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF, CONTEXT_LRRTT,
+    CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
     compute_link_id, HeaplessStorage, IngestResult, Link, LinkState, LinkTableKind, Path,
@@ -357,7 +357,7 @@ fn header2_owned_link_proof_and_data_reach_typed_dispatch() {
     assert_eq!(initiator_transport.reverse_count(), 0);
 
     let lrrtt = initiator_transport
-        .build_lrrtt_packet(&link_id, b"h2-rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut header2_lrrtt = wrap_header2(&lrrtt, responder.hash());
     assert!(matches!(
@@ -495,12 +495,29 @@ fn lrrtt_activates_responder_link() {
     let mut rng = rand::thread_rng();
 
     // Initiator sends LRRTT
+    let encoded_rtt = init_t.get_link(&link_id).unwrap().rtt as f64;
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt-data", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, encoded_rtt, &mut rng)
         .unwrap();
+    let parsed = Packet::parse(&lrrtt).unwrap();
+    assert_eq!(parsed.context, CONTEXT_LRRTT);
+    let mut plaintext = [0u8; MTU];
+    let plaintext_len = init_t
+        .get_link(&link_id)
+        .unwrap()
+        .decrypt(parsed.payload, &mut plaintext)
+        .unwrap();
+    let mut expected_plaintext = [0u8; 9];
+    expected_plaintext[0] = 0xcb;
+    expected_plaintext[1..].copy_from_slice(&encoded_rtt.to_be_bytes());
+    assert_eq!(&plaintext[..plaintext_len], &expected_plaintext);
 
     // A packet that does not authenticate must not teach the responder a
     // route height or activate the Link.
+    let invalid_before = resp_t.stats().packets_dropped_invalid;
+    let crypto_before = resp_t.stats().crypto_failures;
+    let failed_before = resp_t.stats().links_failed;
+    let closed_before = resp_t.stats().links_closed;
     let mut invalid_lrrtt = lrrtt.clone();
     *invalid_lrrtt.last_mut().unwrap() ^= 0x80;
     assert!(matches!(
@@ -510,6 +527,11 @@ fn lrrtt_activates_responder_link() {
     let pending = resp_t.get_link(&link_id).unwrap();
     assert_eq!(pending.state, LinkState::Handshake);
     assert_eq!(pending.expected_hops(), None);
+    assert_eq!(pending.rtt, 0.0);
+    assert_eq!(resp_t.stats().packets_dropped_invalid, invalid_before + 1);
+    assert_eq!(resp_t.stats().crypto_failures, crypto_before + 1);
+    assert_eq!(resp_t.stats().links_failed, failed_before);
+    assert_eq!(resp_t.stats().links_closed, closed_before);
 
     let mut lrrtt_buf = lrrtt;
     match resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id) {
@@ -526,13 +548,208 @@ fn lrrtt_activates_responder_link() {
 }
 
 #[test]
+fn lrrtt_accepts_python_numeric_scalars_and_uses_python_max_ordering() {
+    fn float64_payload(value: f64) -> Vec<u8> {
+        let mut payload = vec![0xcb];
+        payload.extend_from_slice(&value.to_be_bytes());
+        payload
+    }
+
+    fn float32_payload(value: f32) -> Vec<u8> {
+        let mut payload = vec![0xca];
+        payload.extend_from_slice(&value.to_be_bytes());
+        payload
+    }
+
+    let cases = vec![
+        (vec![0xff], 2.0f32), // negative fixint
+        (vec![0xd3, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd], 2.0),
+        (vec![0xc3, 0xc1, 0xff], 2.0), // bool, then ignored trailing objects
+        (float32_payload(4.5), 4.5),
+        (float64_payload(3.5), 3.5),
+        (float64_payload(f64::NAN), 2.0),
+        (float64_payload(f64::NEG_INFINITY), 2.0),
+        (float64_payload(f64::INFINITY), f32::INFINITY),
+    ];
+
+    for (payload, expected) in cases {
+        let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+        let mut rng = rand::thread_rng();
+        let lrrtt = init_t
+            .build_lrrtt_packet(&link_id, &payload, &mut rng)
+            .unwrap();
+        let mut lrrtt_buf = lrrtt;
+        assert!(matches!(
+            resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id),
+            IngestResult::LinkEstablished { link_id: id } if id == link_id
+        ));
+
+        let link = resp_t.get_link(&link_id).unwrap();
+        assert_eq!(link.rtt, expected, "payload {payload:02x?}");
+        assert_eq!(link.state, LinkState::Active);
+        assert_eq!(link.expected_hops(), Some(1));
+        assert_eq!(resp_t.stats().links_established, 1);
+    }
+}
+
+#[test]
+fn authenticated_malformed_lrrtt_tears_down_once_and_returns_encrypted_close() {
+    for malformed_plaintext in [vec![0xc0], vec![0xcb, 0x00]] {
+        let (mut init_t, init_id, mut resp_t, resp_id, link_id) = full_handshake();
+        let mut rng = rand::thread_rng();
+        let malformed = init_t
+            .build_lrrtt_packet(&link_id, &malformed_plaintext, &mut rng)
+            .unwrap();
+        let replay = malformed.clone();
+
+        let before_invalid = resp_t.stats().packets_dropped_invalid;
+        let before_failed = resp_t.stats().links_failed;
+        let before_closed = resp_t.stats().links_closed;
+        let before_established = resp_t.stats().links_established;
+        let before_crypto = resp_t.stats().crypto_failures;
+        let pending = resp_t.get_link(&link_id).unwrap();
+        assert_eq!(pending.state, LinkState::Handshake);
+        assert_eq!(pending.expected_hops(), None);
+        assert_eq!(pending.rtt, 0.0);
+
+        let mut malformed_buf = malformed;
+        let close = match resp_t.ingest(&mut malformed_buf, 102, &mut rng, &resp_id) {
+            IngestResult::LinkTeardown {
+                link_id: id,
+                close_raw: Some(close),
+                interface: Some(0),
+            } if id == link_id => close,
+            other => panic!("expected LinkTeardown with close, got {other:?}"),
+        };
+        assert_eq!(resp_t.link_count(), 0);
+        assert_eq!(resp_t.channel_receipt_count(), 0);
+        assert_eq!(
+            resp_t.stats().packets_dropped_invalid,
+            before_invalid + 1
+        );
+        assert_eq!(resp_t.stats().links_failed, before_failed + 1);
+        assert_eq!(resp_t.stats().links_closed, before_closed + 1);
+        assert_eq!(resp_t.stats().links_established, before_established);
+        assert_eq!(resp_t.stats().crypto_failures, before_crypto);
+
+        let parsed_close = Packet::parse(&close).unwrap();
+        assert_eq!(parsed_close.context, CONTEXT_LINKCLOSE);
+        let mut plaintext = [0u8; MTU];
+        let plaintext_len = init_t
+            .get_link(&link_id)
+            .unwrap()
+            .decrypt(parsed_close.payload, &mut plaintext)
+            .unwrap();
+        assert_eq!(&plaintext[..plaintext_len], link_id.as_ref());
+
+        let failed_after = resp_t.stats().links_failed;
+        let closed_after = resp_t.stats().links_closed;
+        let invalid_after = resp_t.stats().packets_dropped_invalid;
+        let mut replay_buf = replay;
+        assert!(matches!(
+            resp_t.ingest(&mut replay_buf, 103, &mut rng, &resp_id),
+            IngestResult::Duplicate | IngestResult::Invalid
+        ));
+        assert_eq!(resp_t.stats().links_failed, failed_after);
+        assert_eq!(resp_t.stats().links_closed, closed_after);
+        assert_eq!(resp_t.stats().packets_dropped_invalid, invalid_after);
+
+        let mut close_buf = close;
+        assert!(matches!(
+            init_t.ingest(&mut close_buf, 104, &mut rng, &init_id),
+            IngestResult::LinkClosed { link_id: id } if id == link_id
+        ));
+        assert_eq!(init_t.link_count(), 0);
+    }
+}
+
+#[test]
+fn malformed_lrrtt_does_not_teardown_outside_pending_responder_handshake() {
+    let (mut init_t, init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let malformed_for_initiator = init_t
+        .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+        .unwrap();
+    let init_failed = init_t.stats().links_failed;
+    let init_closed = init_t.stats().links_closed;
+    let mut initiator_buf = malformed_for_initiator;
+    assert!(matches!(
+        init_t.ingest(&mut initiator_buf, 102, &mut rng, &init_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(init_t.get_link(&link_id).unwrap().state, LinkState::Active);
+    assert_eq!(init_t.stats().links_failed, init_failed);
+    assert_eq!(init_t.stats().links_closed, init_closed);
+
+    let valid = init_t
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
+        .unwrap();
+    let mut valid_buf = valid;
+    assert!(matches!(
+        resp_t.ingest(&mut valid_buf, 102, &mut rng, &resp_id),
+        IngestResult::LinkEstablished { .. }
+    ));
+    let resp_failed = resp_t.stats().links_failed;
+    let resp_closed = resp_t.stats().links_closed;
+
+    // Intentional current Rete hardening/divergence: unlike Python, an Active
+    // responder does not reprocess LRRTT. Exact repeated-LRRTT parity requires
+    // retaining immutable request_time instead of the mutable last_outbound.
+    let malformed_for_active_responder = init_t
+        .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+        .unwrap();
+    let mut responder_buf = malformed_for_active_responder;
+    assert!(matches!(
+        resp_t.ingest(&mut responder_buf, 103, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Active);
+    assert_eq!(resp_t.stats().links_failed, resp_failed);
+    assert_eq!(resp_t.stats().links_closed, resp_closed);
+}
+
+#[test]
+fn malformed_lrrtt_purges_receipts_for_the_torn_down_link() {
+    let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    let valid = init_t
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
+        .unwrap();
+    let mut valid_buf = valid;
+    assert!(matches!(
+        resp_t.ingest(&mut valid_buf, 102, &mut rng, &resp_id),
+        IngestResult::LinkEstablished { .. }
+    ));
+    resp_t
+        .send_channel_message(&link_id, 0x01, b"pending", 103, &mut rng)
+        .unwrap();
+    assert_eq!(resp_t.channel_receipt_count(), 1);
+
+    // Simulate a responder still negotiating while a stale receipt exists;
+    // teardown must purge all session-owned terminal state atomically.
+    resp_t.get_link_mut(&link_id).unwrap().state = LinkState::Handshake;
+    let malformed = init_t
+        .build_lrrtt_packet(&link_id, &[0xc0], &mut rng)
+        .unwrap();
+    let mut malformed_buf = malformed;
+    assert!(matches!(
+        resp_t.ingest(&mut malformed_buf, 104, &mut rng, &resp_id),
+        IngestResult::LinkTeardown { .. }
+    ));
+    assert_eq!(resp_t.link_count(), 0);
+    assert_eq!(resp_t.channel_receipt_count(), 0);
+}
+
+#[test]
 fn link_data_encrypt_decrypt() {
     let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
     let mut rng = rand::thread_rng();
 
     // Activate responder via LRRTT
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -563,7 +780,7 @@ fn bidirectional_link_data() {
 
     // Activate responder via LRRTT
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -596,7 +813,7 @@ fn keepalive_request_response() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -649,7 +866,7 @@ fn keepalive_wrong_interface_does_not_poison_correct_copy() {
     let mut rng = rand::thread_rng();
 
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest_on(&mut lrrtt_buf, 102, 0, &mut rng, &resp_id);
@@ -680,7 +897,7 @@ fn malformed_wrong_role_and_legacy_encrypted_keepalives_do_not_refresh_liveness(
     let mut rng = rand::thread_rng();
 
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -744,7 +961,7 @@ fn linkclose_tears_down() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -783,7 +1000,7 @@ fn link_stale_in_tick() {
 
     // Activate responder via LRRTT first
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -821,7 +1038,7 @@ fn authenticated_link_data_revives_stale_link_during_grace() {
     let mut rng = rand::thread_rng();
 
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -972,7 +1189,7 @@ fn channel_data_over_link() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1303,7 +1520,7 @@ fn transport_keepalive_sent_when_due() {
 
     // Activate responder via LRRTT
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1362,7 +1579,7 @@ fn channel_send_receive_through_transport() {
 
     // Activate both sides
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1420,7 +1637,7 @@ fn channel_reorder_through_transport() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1461,7 +1678,7 @@ fn channel_retransmit_on_timeout() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1614,7 +1831,7 @@ fn channel_window_blocks_at_capacity() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1646,7 +1863,7 @@ fn channel_teardown_on_max_retries() {
 
     // Activate responder
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);
@@ -1746,7 +1963,7 @@ fn link_handshake_sets_dynamic_keepalive() {
 
     // Activate responder via LRRTT
     let lrrtt = init_t
-        .build_lrrtt_packet(&link_id, b"rtt", &mut rng)
+        .build_lrrtt_packet_for_rtt(&link_id, 1.0, &mut rng)
         .unwrap();
     let mut lrrtt_buf = lrrtt;
     let _ = resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id);

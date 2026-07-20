@@ -121,6 +121,33 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.dispatch_ingest_result(result, now, rng)
     }
 
+    fn link_closed_outcome(
+        &mut self,
+        link_id: LinkId,
+        packets: Vec<OutboundPacket>,
+    ) -> IngestOutcome {
+        // Fail any pending requests on this link (single pass).
+        let mut events: Vec<NodeEvent> = Vec::new();
+        self.pending_requests.retain(|r| {
+            if r.link_id == link_id {
+                events.push(NodeEvent::RequestFailed {
+                    link_id,
+                    request_id: r.request_id,
+                    reason: RequestFailReason::LinkClosed,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        events.push(NodeEvent::LinkClosed { link_id });
+        IngestOutcome {
+            events,
+            packets,
+            rejection: None,
+        }
+    }
+
     fn dispatch_ingest_result<R: RngCore + CryptoRng>(
         &mut self,
         result: IngestResult<'_>,
@@ -268,16 +295,18 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             },
             IngestResult::LinkEstablished { link_id } => {
                 let mut packets = Vec::new();
-                // Auto-send LRRTT if we are the initiator (activates responder).
-                // Uses the low 32 bits of epoch seconds as a timing marker for RTT calculation.
-                if self
+                // Auto-send Python-compatible MessagePack float64 LRRTT if we
+                // are the initiator (activates the responder).
+                let initiator_rtt = self
                     .transport
                     .get_link(&link_id)
-                    .map(|l| l.role == rete_transport::LinkRole::Initiator)
-                    .unwrap_or(false)
-                {
-                    let rtt_bytes = &now.to_be_bytes()[4..8];
-                    if let Ok(pkt) = self.transport.build_lrrtt_packet(&link_id, rtt_bytes, rng) {
+                    .filter(|link| link.role == rete_transport::LinkRole::Initiator)
+                    .map(|link| link.rtt as f64);
+                if let Some(rtt) = initiator_rtt {
+                    if let Ok(pkt) = self
+                        .transport
+                        .build_lrrtt_packet_for_rtt(&link_id, rtt, rng)
+                    {
                         if let Ok(outbound) = self.owned_link_outbound(&link_id, pkt) {
                             packets.push(outbound);
                         }
@@ -406,26 +435,23 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 }
             }
             IngestResult::LinkClosed { link_id } => {
-                // Fail any pending requests on this link (single pass)
-                let mut events: Vec<NodeEvent> = Vec::new();
-                self.pending_requests.retain(|r| {
-                    if r.link_id == link_id {
-                        events.push(NodeEvent::RequestFailed {
-                            link_id,
-                            request_id: r.request_id,
-                            reason: RequestFailReason::LinkClosed,
-                        });
-                        false
-                    } else {
-                        true
-                    }
-                });
-                events.push(NodeEvent::LinkClosed { link_id });
-                IngestOutcome {
-                    events,
-                    packets: Vec::new(),
-                    rejection: None,
-                }
+                self.link_closed_outcome(link_id, Vec::new())
+            }
+            IngestResult::LinkTeardown {
+                link_id,
+                close_raw,
+                interface,
+            } => {
+                let packets = close_raw
+                    .zip(interface)
+                    .map(|(data, interface)| {
+                        vec![OutboundPacket {
+                            data,
+                            routing: PacketRouting::BoundInterface(interface),
+                        }]
+                    })
+                    .unwrap_or_default();
+                self.link_closed_outcome(link_id, packets)
             }
             IngestResult::ProofReceived { packet_hash } => IngestOutcome {
                 events: vec![NodeEvent::ProofReceived { packet_hash }],
