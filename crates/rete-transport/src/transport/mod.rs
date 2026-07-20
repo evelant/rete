@@ -185,7 +185,7 @@ pub const PATH_REQUEST_DEST: DestHash = DestHash::new([
 /// An entry in the reverse table, keyed by truncated packet hash.
 ///
 /// Used to route replies back along the path the original packet traversed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReverseEntry {
     /// Monotonic timestamp when this entry was created.
     pub timestamp: u64,
@@ -224,6 +224,14 @@ pub struct LinkTableEntry {
 enum RelayLinkAdmission {
     Inserted,
     Existing,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReverseRouteAdmission {
+    Inserted,
+    Existing,
+    Conflict,
     Full,
 }
 
@@ -359,6 +367,24 @@ pub enum IngestResult<'a> {
         link_id: LinkId,
         /// The bounded table that rejected the Link.
         table: LinkTableKind,
+    },
+    /// A transported DATA packet could not retain its reverse route because
+    /// the bounded reverse table is full.
+    ///
+    /// Its full packet hash remains in the normal deduplication window. The
+    /// packet has not been rewritten and must not be emitted.
+    ReverseTableFull {
+        /// Truncated packet hash that could not be admitted.
+        truncated_hash: [u8; TRUNCATED_HASH_LEN],
+    },
+    /// A transported DATA packet's truncated hash is already bound to a
+    /// different reverse route.
+    ///
+    /// The retained route wins: it is not redirected, and the colliding
+    /// packet has not been rewritten and must not be emitted.
+    ReverseRouteConflict {
+        /// Truncated packet hash whose retained route conflicts.
+        truncated_hash: [u8; TRUNCATED_HASH_LEN],
     },
     /// A link handshake completed (LRPROOF validated or LRRTT processed).
     LinkEstablished {
@@ -743,7 +769,44 @@ impl<S: TransportStorage> Transport<S> {
         }
     }
 
-    fn remember_reverse_route(
+    fn admit_reverse_route(
+        &mut self,
+        truncated_hash: [u8; TRUNCATED_HASH_LEN],
+        entry: ReverseEntry,
+    ) -> ReverseRouteAdmission {
+        if let Some(existing) = self.reverse_table.get(&truncated_hash).copied() {
+            return if existing.received_on == entry.received_on
+                && existing.forwarded_to == entry.forwarded_to
+            {
+                // Admission is idempotent. In particular, do not refresh the
+                // timestamp or let a replay redirect an established route.
+                ReverseRouteAdmission::Existing
+            } else {
+                ReverseRouteAdmission::Conflict
+            };
+        }
+
+        match self.reverse_table.insert(truncated_hash, entry) {
+            Ok(None) => ReverseRouteAdmission::Inserted,
+            Ok(Some(previous)) => {
+                // A conforming StorageMap cannot replace an entry after the
+                // lookup above. Restore it defensively so an unusual backend
+                // cannot redirect an established reverse route.
+                let restored = self.reverse_table.insert(truncated_hash, previous);
+                debug_assert!(matches!(restored, Ok(Some(_))));
+                if previous.received_on == entry.received_on
+                    && previous.forwarded_to == entry.forwarded_to
+                {
+                    ReverseRouteAdmission::Existing
+                } else {
+                    ReverseRouteAdmission::Conflict
+                }
+            }
+            Err(_) => ReverseRouteAdmission::Full,
+        }
+    }
+
+    fn remember_reverse_route_best_effort(
         &mut self,
         packet_hash: &[u8; 32],
         now: u64,
@@ -988,15 +1051,16 @@ impl<S: TransportStorage> Transport<S> {
                     .get(&dest)
                     .map(|path| (path.via, path.received_on, path.hops));
 
+                let Some((next_hop, Some(outbound_iface), remaining)) = path_route else {
+                    self.stats.packets_dropped_invalid += 1;
+                    return IngestResult::Invalid;
+                };
+
                 // A relayed LINKREQUEST may be emitted only after its complete
                 // bidirectional route has been retained. The packet hash has
                 // already entered the normal dedup window, matching owned-Link
                 // capacity rejection.
                 if is_link_request {
-                    let Some((_, Some(outbound_iface), remaining)) = path_route else {
-                        self.stats.packets_dropped_invalid += 1;
-                        return IngestResult::Invalid;
-                    };
                     let lid = match compute_link_id(raw) {
                         Ok(lid) => lid,
                         Err(_) => {
@@ -1034,38 +1098,58 @@ impl<S: TransportStorage> Transport<S> {
                             };
                         }
                     }
+                } else {
+                    // Python RNS uses an unbounded dictionary here. Rete's
+                    // embedded table is bounded, so DATA admission must
+                    // retain the complete reverse route transactionally
+                    // before the caller-owned packet is rewritten or emitted.
+                    let reverse_hash = pkt_hash[..TRUNCATED_HASH_LEN]
+                        .try_into()
+                        .expect("truncated packet hash slice has fixed length");
+                    let reverse_entry = ReverseEntry {
+                        timestamp: now,
+                        received_on: iface,
+                        forwarded_to: outbound_iface,
+                    };
+                    match self.admit_reverse_route(reverse_hash, reverse_entry) {
+                        ReverseRouteAdmission::Inserted | ReverseRouteAdmission::Existing => {}
+                        ReverseRouteAdmission::Conflict => {
+                            return IngestResult::ReverseRouteConflict {
+                                truncated_hash: reverse_hash,
+                            };
+                        }
+                        ReverseRouteAdmission::Full => {
+                            return IngestResult::ReverseTableFull {
+                                truncated_hash: reverse_hash,
+                            };
+                        }
+                    }
                 }
 
                 #[allow(clippy::drop_non_drop)]
                 drop(pkt);
 
-                // Python increments before recording the relay route and
-                // emitting the forwarded packet.
+                // The emitted wire packet carries the post-increment hop
+                // count. Reverse state is already durable at this point so
+                // no fallible operation remains before the Forward result.
                 raw[1] = inbound_hops;
-                let h2_result = match path_route {
-                    Some((Some(via), Some(outbound_iface), _)) => {
+                let h2_result = match next_hop {
+                    Some(via) => {
                         raw[2..2 + TRUNCATED_HASH_LEN].copy_from_slice(via.as_ref());
-                        if !is_link_request {
-                            self.remember_reverse_route(&pkt_hash, now, iface, outbound_iface);
-                        }
                         IngestResult::Forward {
                             raw: &raw[..len],
                             source_iface: iface,
                             target: ForwardTarget::ExactInterface(outbound_iface),
                         }
                     }
-                    Some((None, Some(outbound_iface), _)) => {
+                    None => {
                         let forwarded_len = normalize_owned_header2(raw);
-                        if !is_link_request {
-                            self.remember_reverse_route(&pkt_hash, now, iface, outbound_iface);
-                        }
                         IngestResult::Forward {
                             raw: &raw[..forwarded_len],
                             source_iface: iface,
                             target: ForwardTarget::ExactInterface(outbound_iface),
                         }
                     }
-                    Some((_, None, _)) | None => IngestResult::Invalid,
                 };
                 match &h2_result {
                     IngestResult::Forward { .. } => self.stats.packets_forwarded += 1,
@@ -1200,10 +1284,19 @@ impl<S: TransportStorage> Transport<S> {
                             self.stats.packets_dropped_invalid += 1;
                             return IngestResult::Invalid;
                         };
-                        // Create reverse_table entry so the proof can route back.
+                        // H1 admission intentionally remains the legacy
+                        // best-effort behavior in this compatibility seam.
+                        // Making it transactional before interface roles
+                        // distinguish remote ingress from local injection
+                        // would change the product's local-origin contract.
                         let mut trunc_hash = [0u8; TRUNCATED_HASH_LEN];
                         trunc_hash.copy_from_slice(&pkt_hash[..TRUNCATED_HASH_LEN]);
-                        self.remember_reverse_route(&pkt_hash, now, iface, outbound_iface);
+                        self.remember_reverse_route_best_effort(
+                            &pkt_hash,
+                            now,
+                            iface,
+                            outbound_iface,
+                        );
                         relay_log!(
                             "[relay] H1 DATA FORWARD dest={} reverse={}",
                             hex_short(dh.as_ref()),

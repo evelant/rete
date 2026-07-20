@@ -841,6 +841,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     Err(_) => IngestOutcome::empty(),
                 }
             }
+            IngestResult::ReverseTableFull { .. }
+            | IngestResult::ReverseRouteConflict { .. } => IngestOutcome::empty(),
             IngestResult::LinkTableFull { .. }
             | IngestResult::Duplicate
             | IngestResult::Invalid => {

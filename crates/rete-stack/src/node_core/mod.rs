@@ -914,6 +914,7 @@ mod tests {
     type TestNodeCore = NodeCore<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
     type SmallReceiptNodeCore = NodeCore<rete_transport::HeaplessStorage<4, 4, 8, 2>>;
     type TwoRelayNodeCore = NodeCore<rete_transport::HeaplessStorage<8, 4, 16, 2>>;
+    type TwoReverseNodeCore = NodeCore<rete_transport::HeaplessStorage<2, 4, 1, 2>>;
 
     #[derive(Default)]
     struct RecordingReceiptSink {
@@ -1365,6 +1366,134 @@ mod tests {
         assert_eq!(core.transport.relay_link_count(), 2);
         assert_eq!(core.transport.get_relay_link(&first_id), Some(&retained));
         assert!(core.transport.get_relay_link(&overflow_id).is_none());
+    }
+
+    #[test]
+    fn node_core_emits_nothing_when_reverse_table_is_full() {
+        let identity = Identity::from_seed(b"node-core-bounded-reverse").unwrap();
+        let mut core = TwoReverseNodeCore::new(identity, "testapp", &["reverse"]).unwrap();
+        core.enable_transport();
+        let relay_hash = core.identity.hash();
+        let destination = DestHash::from([0x71; TRUNCATED_HASH_LEN]);
+        let mut path = rete_transport::Path::direct(100);
+        path.received_on = Some(7);
+        assert!(core.transport.insert_path(destination, path));
+        let mut rng = rand::thread_rng();
+
+        let build_data = |payload: &[u8]| {
+            let mut raw = [0u8; MTU];
+            let len = PacketBuilder::new(&mut raw)
+                .header_type(HeaderType::Header2)
+                .transport_type(TRANSPORT_TYPE_TRANSPORT)
+                .packet_type(PacketType::Data)
+                .dest_type(DestType::Single)
+                .transport_id(relay_hash.as_ref())
+                .destination_hash(destination.as_ref())
+                .context(0)
+                .payload(payload)
+                .build()
+                .unwrap();
+            raw[..len].to_vec()
+        };
+
+        for (payload, now, source_iface) in [
+            (b"first".as_slice(), 100, 3),
+            (b"second".as_slice(), 101, 4),
+        ] {
+            let admitted = core.handle_ingest(&build_data(payload), now, source_iface, &mut rng);
+            assert!(admitted.events.is_empty());
+            assert_eq!(admitted.packets.len(), 1);
+            assert_eq!(
+                admitted.packets[0].routing,
+                PacketRouting::ExactInterface(7)
+            );
+        }
+        assert_eq!(core.transport.reverse_count(), 2);
+
+        let overflow = build_data(b"reverse table overflow");
+        let overflow_hash = Packet::parse(&overflow).unwrap().compute_hash();
+        let overflow_key: [u8; TRUNCATED_HASH_LEN] =
+            overflow_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+        let forwarded_before = core.transport.stats().packets_forwarded;
+        let invalid_before = core.transport.stats().packets_dropped_invalid;
+        let rejected = core.handle_ingest(&overflow, 102, 5, &mut rng);
+        assert!(rejected.events.is_empty());
+        assert!(rejected.packets.is_empty());
+        assert_eq!(core.transport.reverse_count(), 2);
+        assert!(core.transport.get_reverse(&overflow_key).is_none());
+        assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(
+            core.transport.stats().packets_dropped_invalid,
+            invalid_before
+        );
+
+        let dedup_before = core.transport.stats().packets_dropped_dedup;
+        let retry = core.handle_ingest(&overflow, 103, 5, &mut rng);
+        assert!(retry.events.is_empty());
+        assert!(retry.packets.is_empty());
+        assert_eq!(
+            core.transport.stats().packets_dropped_dedup,
+            dedup_before + 1,
+            "capacity rejection must retain the full hash in dedup"
+        );
+    }
+
+    #[test]
+    fn node_core_emits_nothing_for_conflicting_reverse_route() {
+        let identity = Identity::from_seed(b"node-core-conflicting-reverse").unwrap();
+        let mut core = TwoReverseNodeCore::new(identity, "testapp", &["reverse"]).unwrap();
+        core.enable_transport();
+        let relay_hash = core.identity.hash();
+        let destination = DestHash::from([0x72; TRUNCATED_HASH_LEN]);
+        let mut path = rete_transport::Path::direct(100);
+        path.received_on = Some(7);
+        assert!(core.transport.insert_path(destination, path));
+        let mut rng = rand::thread_rng();
+
+        let build_data = |payload: &[u8]| {
+            let mut raw = [0u8; MTU];
+            let len = PacketBuilder::new(&mut raw)
+                .header_type(HeaderType::Header2)
+                .transport_type(TRANSPORT_TYPE_TRANSPORT)
+                .packet_type(PacketType::Data)
+                .dest_type(DestType::Single)
+                .transport_id(relay_hash.as_ref())
+                .destination_hash(destination.as_ref())
+                .context(0)
+                .payload(payload)
+                .build()
+                .unwrap();
+            raw[..len].to_vec()
+        };
+
+        let original = build_data(b"stable reverse key");
+        let original_hash = Packet::parse(&original).unwrap().compute_hash();
+        let reverse_key: [u8; TRUNCATED_HASH_LEN] =
+            original_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+        let admitted = core.handle_ingest(&original, 100, 3, &mut rng);
+        assert_eq!(admitted.packets.len(), 1);
+        let retained = *core.transport.get_reverse(&reverse_key).unwrap();
+
+        // Evict the original full hash from dedup while its truncated reverse
+        // key remains retained.
+        let filler = build_data(b"dedup filler");
+        let admitted = core.handle_ingest(&filler, 101, 4, &mut rng);
+        assert_eq!(admitted.packets.len(), 1);
+
+        let mut redirected_path = rete_transport::Path::direct(102);
+        redirected_path.received_on = Some(9);
+        assert!(core.transport.insert_path(destination, redirected_path));
+        let forwarded_before = core.transport.stats().packets_forwarded;
+        let invalid_before = core.transport.stats().packets_dropped_invalid;
+        let rejected = core.handle_ingest(&original, 102, 6, &mut rng);
+        assert!(rejected.events.is_empty());
+        assert!(rejected.packets.is_empty());
+        assert_eq!(core.transport.get_reverse(&reverse_key), Some(&retained));
+        assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(
+            core.transport.stats().packets_dropped_invalid,
+            invalid_before
+        );
     }
 
     #[test]

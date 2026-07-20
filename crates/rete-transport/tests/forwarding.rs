@@ -46,6 +46,8 @@ fn build_header2_proof(
 
 /// Small transport suitable for tests.
 type TestTransport = Transport<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
+/// Two-entry reverse table with a one-packet dedup window.
+type TinyReverseTransport = Transport<rete_transport::HeaplessStorage<2, 4, 1, 2>>;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -564,6 +566,186 @@ fn reverse_entry_created_on_forward() {
     // Look up by truncated hash
     let trunc: [u8; TRUNCATED_HASH_LEN] = pkt_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
     assert!(t.get_reverse(&trunc).is_some());
+}
+
+#[test]
+fn header2_data_reverse_capacity_fails_closed_before_rewrite_and_stays_deduped() {
+    let relay_identity = Identity::from_seed(b"bounded-reverse-relay").unwrap();
+    let relay_hash = relay_identity.hash();
+    let destination = DestHash::from([0xC1; TRUNCATED_HASH_LEN]);
+    let mut transport = TinyReverseTransport::new();
+    transport.set_local_identity(relay_hash);
+    let mut path = Path::direct(100);
+    path.received_on = Some(7);
+    assert!(transport.insert_path(destination, path));
+    let mut rng = rand::thread_rng();
+
+    for (payload, now, source_iface) in [
+        (b"first".as_slice(), 100, 3),
+        (b"second".as_slice(), 101, 4),
+    ] {
+        let mut raw = build_header2_data(relay_hash.as_bytes(), destination.as_bytes(), payload);
+        assert!(matches!(
+            transport.ingest_on(&mut raw, now, source_iface, &mut rng, &relay_identity),
+            IngestResult::Forward {
+                target: ForwardTarget::ExactInterface(7),
+                ..
+            }
+        ));
+    }
+    assert_eq!(transport.reverse_count(), 2);
+
+    let overflow = build_header2_data(
+        relay_hash.as_bytes(),
+        destination.as_bytes(),
+        b"reverse table overflow",
+    );
+    let expected_hash = Packet::parse(&overflow).unwrap().compute_hash();
+    let expected_key: [u8; TRUNCATED_HASH_LEN] =
+        expected_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+    let forwarded_before = transport.stats().packets_forwarded;
+    let invalid_before = transport.stats().packets_dropped_invalid;
+    let mut rejected = overflow.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut rejected, 102, 5, &mut rng, &relay_identity),
+        IngestResult::ReverseTableFull { truncated_hash } if truncated_hash == expected_key
+    ));
+    assert_eq!(rejected, overflow, "capacity rejection rewrote raw packet");
+    assert_eq!(transport.reverse_count(), 2);
+    assert_eq!(transport.stats().packets_forwarded, forwarded_before);
+    assert_eq!(transport.stats().packets_dropped_invalid, invalid_before);
+    assert!(transport.get_reverse(&expected_key).is_none());
+
+    let mut retry = overflow.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut retry, 103, 5, &mut rng, &relay_identity),
+        IngestResult::Duplicate
+    ));
+    assert_eq!(retry, overflow, "dedup rejection rewrote raw packet");
+    assert_eq!(transport.reverse_count(), 2);
+}
+
+#[test]
+fn header2_data_reverse_collision_keeps_original_route_and_fails_closed() {
+    let relay_identity = Identity::from_seed(b"colliding-reverse-relay").unwrap();
+    let relay_hash = relay_identity.hash();
+    let destination = DestHash::from([0xC2; TRUNCATED_HASH_LEN]);
+    let mut transport = TinyReverseTransport::new();
+    transport.set_local_identity(relay_hash);
+    let mut path = Path::direct(100);
+    path.received_on = Some(7);
+    assert!(transport.insert_path(destination, path));
+    let mut rng = rand::thread_rng();
+
+    let original = build_header2_data(
+        relay_hash.as_bytes(),
+        destination.as_bytes(),
+        b"stable reverse key",
+    );
+    let original_hash = Packet::parse(&original).unwrap().compute_hash();
+    let reverse_key: [u8; TRUNCATED_HASH_LEN] =
+        original_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+    let mut first = original.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut first, 100, 3, &mut rng, &relay_identity),
+        IngestResult::Forward {
+            target: ForwardTarget::ExactInterface(7),
+            ..
+        }
+    ));
+    let retained = *transport.get_reverse(&reverse_key).unwrap();
+
+    // Evict the original full hash from the one-entry dedup window without
+    // removing its reverse route.
+    let mut filler = build_header2_data(
+        relay_hash.as_bytes(),
+        destination.as_bytes(),
+        b"dedup filler",
+    );
+    assert!(matches!(
+        transport.ingest_on(&mut filler, 101, 4, &mut rng, &relay_identity),
+        IngestResult::Forward { .. }
+    ));
+
+    let mut redirected_path = Path::direct(102);
+    redirected_path.received_on = Some(9);
+    assert!(transport.insert_path(destination, redirected_path));
+    let forwarded_before = transport.stats().packets_forwarded;
+    let invalid_before = transport.stats().packets_dropped_invalid;
+    let mut collision = original.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut collision, 102, 6, &mut rng, &relay_identity),
+        IngestResult::ReverseRouteConflict { truncated_hash }
+            if truncated_hash == reverse_key
+    ));
+    assert_eq!(
+        collision, original,
+        "collision rejection rewrote raw packet"
+    );
+    assert_eq!(transport.get_reverse(&reverse_key).copied(), Some(retained));
+    assert_eq!(transport.stats().packets_forwarded, forwarded_before);
+    assert_eq!(transport.stats().packets_dropped_invalid, invalid_before);
+
+    let mut retry = original.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut retry, 103, 6, &mut rng, &relay_identity),
+        IngestResult::Duplicate
+    ));
+    assert_eq!(retry, original, "dedup rejection rewrote raw packet");
+    assert_eq!(transport.get_reverse(&reverse_key).copied(), Some(retained));
+}
+
+#[test]
+fn header2_data_existing_reverse_route_is_idempotent() {
+    let relay_identity = Identity::from_seed(b"idempotent-reverse-relay").unwrap();
+    let relay_hash = relay_identity.hash();
+    let destination = DestHash::from([0xC3; TRUNCATED_HASH_LEN]);
+    let mut transport = TinyReverseTransport::new();
+    transport.set_local_identity(relay_hash);
+    let mut path = Path::direct(100);
+    path.received_on = Some(7);
+    assert!(transport.insert_path(destination, path));
+    let mut rng = rand::thread_rng();
+
+    let original = build_header2_data(
+        relay_hash.as_bytes(),
+        destination.as_bytes(),
+        b"idempotent reverse key",
+    );
+    let original_hash = Packet::parse(&original).unwrap().compute_hash();
+    let reverse_key: [u8; TRUNCATED_HASH_LEN] =
+        original_hash[..TRUNCATED_HASH_LEN].try_into().unwrap();
+    let mut first = original.clone();
+    assert!(matches!(
+        transport.ingest_on(&mut first, 100, 3, &mut rng, &relay_identity),
+        IngestResult::Forward { .. }
+    ));
+    let retained = *transport.get_reverse(&reverse_key).unwrap();
+
+    let mut filler = build_header2_data(
+        relay_hash.as_bytes(),
+        destination.as_bytes(),
+        b"dedup eviction",
+    );
+    assert!(matches!(
+        transport.ingest_on(&mut filler, 101, 4, &mut rng, &relay_identity),
+        IngestResult::Forward { .. }
+    ));
+
+    let mut replay = original;
+    assert!(matches!(
+        transport.ingest_on(&mut replay, 200, 3, &mut rng, &relay_identity),
+        IngestResult::Forward {
+            source_iface: 3,
+            target: ForwardTarget::ExactInterface(7),
+            ..
+        }
+    ));
+    assert_eq!(
+        transport.get_reverse(&reverse_key).copied(),
+        Some(retained),
+        "idempotent admission must not refresh or replace the retained route"
+    );
 }
 
 #[test]
