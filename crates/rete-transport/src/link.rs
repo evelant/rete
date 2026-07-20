@@ -135,6 +135,13 @@ pub struct Link {
     pub stale_time: u64,
     /// Destination hash this link is associated with.
     pub destination_hash: DestHash,
+    /// Hop count retained when the Link was created.
+    ///
+    /// Initiators snapshot the learned path and use it to admit LRPROOF.
+    /// Responders start without a value and learn it from authenticated LRRTT.
+    /// Initiators may retain [`crate::transport::PATHFINDER_M`] as the explicit
+    /// compatibility wildcard when they were created before a path was known.
+    expected_hops: Option<u8>,
     /// Runtime interface selected for this locally owned Link.
     ///
     /// Initiators bind only from validated LRPROOF ingress. Responders bind to
@@ -164,6 +171,29 @@ impl Link {
     /// Runtime interface bound to this locally owned Link, if established.
     pub const fn bound_interface(&self) -> Option<u8> {
         self.bound_interface
+    }
+
+    /// Hop count expected for this Link.
+    ///
+    /// A responder returns `None` until authenticated LRRTT establishes its
+    /// inbound height. An initiator always returns `Some`, where
+    /// [`crate::transport::PATHFINDER_M`] is the Reticulum compatibility
+    /// sentinel for an initiator created before a path was known.
+    pub const fn expected_hops(&self) -> Option<u8> {
+        self.expected_hops
+    }
+
+    /// Whether an LRPROOF arrived at the retained path height.
+    pub(crate) const fn accepts_lrproof_hops(&self, hops: u8) -> bool {
+        matches!(
+            self.expected_hops,
+            Some(expected) if expected == crate::transport::PATHFINDER_M || expected == hops
+        )
+    }
+
+    /// Retain the authenticated inbound height learned from LRRTT.
+    pub(crate) fn set_expected_hops(&mut self, hops: u8) {
+        self.expected_hops = Some(hops);
     }
 
     /// Create a Link as responder from a received LINKREQUEST.
@@ -252,6 +282,7 @@ impl Link {
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: DestHash::ZERO,
+            expected_hops: None,
             bound_interface: None,
             signalling: peer_signalling,
             channel: None,
@@ -298,9 +329,31 @@ impl Link {
     ///
     /// The 3 signalling bytes encode MTU and encryption mode, matching Python's
     /// `Link.LINK_MTU_SIZE` format.
+    ///
+    /// This low-level constructor has no path table, so it retains
+    /// [`crate::transport::PATHFINDER_M`] as the LRPROOF compatibility
+    /// wildcard. [`crate::Transport::initiate_link`] snapshots a known path's
+    /// exact hop count instead.
     pub fn new_initiator<R: RngCore + CryptoRng>(
         dest_hash: DestHash,
         our_ed25519_pub: &[u8; 32],
+        rng: &mut R,
+        now: u64,
+    ) -> (Self, [u8; 64 + LINK_MTU_SIZE]) {
+        Self::new_initiator_with_expected_hops(
+            dest_hash,
+            our_ed25519_pub,
+            crate::transport::PATHFINDER_M,
+            rng,
+            now,
+        )
+    }
+
+    /// Create an initiator while atomically retaining its path height.
+    pub(crate) fn new_initiator_with_expected_hops<R: RngCore + CryptoRng>(
+        dest_hash: DestHash,
+        our_ed25519_pub: &[u8; 32],
+        expected_hops: u8,
         rng: &mut R,
         now: u64,
     ) -> (Self, [u8; 64 + LINK_MTU_SIZE]) {
@@ -337,6 +390,7 @@ impl Link {
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: dest_hash,
+            expected_hops: Some(expected_hops),
             bound_interface: None,
             signalling: sig_bytes,
             channel: None,
@@ -794,6 +848,7 @@ mod tests {
 
         assert_eq!(link.state, LinkState::Handshake);
         assert_eq!(link.role, LinkRole::Responder);
+        assert_eq!(link.expected_hops(), None);
         assert_eq!(link.peer_x25519_pub, x25519_pub);
         assert_eq!(link.peer_ed25519_pub, ed25519_pub);
     }
@@ -1019,6 +1074,10 @@ mod tests {
 
         assert_eq!(link.state, LinkState::Pending);
         assert_eq!(link.role, LinkRole::Initiator);
+        assert_eq!(
+            link.expected_hops(),
+            Some(crate::transport::PATHFINDER_M)
+        );
         assert_eq!(payload.len(), 67); // 64 keys + 3 signalling
         assert_eq!(&payload[..32], &link.our_x25519_pub);
     }

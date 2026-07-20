@@ -1041,6 +1041,29 @@ impl<S: TransportStorage> Transport<S> {
             }
         }
 
+        // Python retains hops_to(destination) when an initiator creates its
+        // pending Link, then admits LRPROOF only at that height. Apply the
+        // local ingress increment here and reject mismatches before packet-hash
+        // admission, so an otherwise valid proof observed at the wrong height
+        // cannot suppress a later authoritative copy. PATHFINDER_M remains the
+        // compatibility wildcard for Links initiated without a known path.
+        if pkt.packet_type == PacketType::Proof
+            && pkt.dest_type == DestType::Link
+            && pkt.context == CONTEXT_LRPROOF
+        {
+            let link_id = LinkId::from_slice(pkt.destination_hash);
+            let inbound_hops = pkt.hops.saturating_add(1);
+            if self.links.get(&link_id).is_some_and(|link| {
+                link.role == crate::link::LinkRole::Initiator
+                    && link.state == crate::link::LinkState::Handshake
+                    && link.bound_interface.is_none()
+                    && !link.accepts_lrproof_hops(inbound_hops)
+            }) {
+                self.stats.packets_dropped_invalid += 1;
+                return IngestResult::Invalid;
+            }
+        }
+
         // Compute packet hash for dedup
         let pkt_hash = pkt.compute_hash();
 
@@ -1254,8 +1277,7 @@ impl<S: TransportStorage> Transport<S> {
                     if self.links.contains_key(&lid) {
                         return self.handle_link_data(
                             &lid,
-                            pkt.context,
-                            pkt.payload,
+                            &pkt,
                             now,
                             pkt_hash,
                             rng,
@@ -1310,8 +1332,7 @@ impl<S: TransportStorage> Transport<S> {
                     // Try local handling (will return Invalid if link not found).
                     return self.handle_link_data(
                         &lid,
-                        pkt.context,
-                        pkt.payload,
+                        &pkt,
                         now,
                         pkt_hash,
                         rng,
@@ -3131,9 +3152,18 @@ mod tests {
             .initiate_link(dest_hash, &initiator, &mut rng, now)
             .unwrap();
         assert_eq!(transport.link_interface(&link_id), None);
+        let pending = transport.get_link(&link_id).unwrap();
+        assert_eq!(pending.state, crate::link::LinkState::Handshake);
+        assert_eq!(pending.expected_hops(), Some(1));
+
+        // The pending Link retains the path height from construction even if
+        // routing knowledge changes before its LRPROOF returns.
+        let mut changed_path = Path::via_repeater(initiator.hash(), 4, now + 1);
+        changed_path.received_on = Some(3);
+        assert!(transport.insert_path(dest_hash, changed_path));
         assert_eq!(
-            transport.get_link(&link_id).unwrap().state,
-            crate::link::LinkState::Handshake
+            transport.get_link(&link_id).unwrap().expected_hops(),
+            Some(1)
         );
 
         let request_payload = Packet::parse(&request).unwrap().payload;
@@ -3155,6 +3185,27 @@ mod tests {
 
         let mut invalid_payload = proof_payload;
         invalid_payload[0] ^= 0x80;
+
+        // Hop bytes are excluded from the packet hash. A valid proof first
+        // observed one hop too high must be rejected before dedup admission,
+        // leaving the authoritative copy below eligible for validation.
+        let (mut wrong_hops, wrong_hops_len) = build_proof(&proof_payload);
+        wrong_hops[1] = 1; // local ingress increments this to 2; retained path is 1
+        assert!(matches!(
+            transport.ingest_on(
+                &mut wrong_hops[..wrong_hops_len],
+                now + 1,
+                4,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::Invalid
+        ));
+        let pending = transport.get_link(&link_id).unwrap();
+        assert_eq!(pending.state, crate::link::LinkState::Handshake);
+        assert_eq!(pending.bound_interface(), None);
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
+
         let (mut invalid, invalid_len) = build_proof(&invalid_payload);
         assert!(matches!(
             transport.ingest_on(
@@ -3184,6 +3235,8 @@ mod tests {
         let active = transport.get_link(&link_id).unwrap();
         assert!(active.is_active());
         assert_eq!(active.bound_interface(), Some(9));
+        assert_eq!(active.expected_hops(), Some(1));
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
 
         assert!(matches!(
             transport.handle_lrproof(&link_id, &proof_payload, now + 3, 5),
@@ -3192,6 +3245,56 @@ mod tests {
         let unchanged = transport.get_link(&link_id).unwrap();
         assert!(unchanged.is_active());
         assert_eq!(unchanged.bound_interface(), Some(9));
+    }
+
+    #[test]
+    fn initiator_without_path_accepts_lrproof_at_unknown_height() {
+        let now = 250;
+        let mut transport = TestTransport::new();
+        let initiator = Identity::from_seed(b"proof-unknown-initiator").unwrap();
+        let responder = Identity::from_seed(b"proof-unknown-responder").unwrap();
+        let dest_hash =
+            rete_core::destination_hash("test.unknown.initiator", Some(&responder.hash()));
+        transport.register_identity(dest_hash, responder.public_key(), now);
+        transport.remove_path(&dest_hash);
+        let mut rng = rand_core::OsRng;
+
+        let (request, link_id) = transport
+            .initiate_link(dest_hash, &initiator, &mut rng, now)
+            .unwrap();
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().expected_hops(),
+            Some(PATHFINDER_M)
+        );
+
+        let request_payload = Packet::parse(&request).unwrap().payload;
+        let responder_link =
+            Link::from_request(link_id, request_payload, &mut rng, now).unwrap();
+        let proof_payload = responder_link.build_proof(&responder).unwrap();
+        let mut proof = [0u8; rete_core::MTU];
+        let proof_len = PacketBuilder::new(&mut proof)
+            .packet_type(PacketType::Proof)
+            .dest_type(DestType::Link)
+            .destination_hash(link_id.as_ref())
+            .hops(6)
+            .context(CONTEXT_LRPROOF)
+            .payload(&proof_payload)
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            transport.ingest_on(
+                &mut proof[..proof_len],
+                now + 1,
+                5,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::LinkEstablished { .. }
+        ));
+        let active = transport.get_link(&link_id).unwrap();
+        assert!(active.is_active());
+        assert_eq!(active.expected_hops(), Some(PATHFINDER_M));
     }
 
     #[test]

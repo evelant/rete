@@ -12,7 +12,9 @@ use rete_core::{
     TRUNCATED_HASH_LEN,
 };
 
-use super::{ChannelReceipt, IngestResult, LinkTableKind, SendError, Transport};
+use super::{
+    ChannelReceipt, IngestResult, LinkTableKind, SendError, Transport, PATHFINDER_M,
+};
 
 enum OwnedLinkAdmission {
     Inserted,
@@ -142,7 +144,9 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// Returns the raw LINKREQUEST packet and the link_id only after the
     /// corresponding Link state has been retained. A generated ID collision
     /// returns [`SendError::LinkAlreadyExists`]; bounded storage exhaustion
-    /// returns [`SendError::LinkTableFull`] without releasing the request.
+    /// returns [`SendError::LinkTableFull`] without releasing the request. The
+    /// pending Link snapshots the current path height for LRPROOF admission;
+    /// an unknown path uses [`PATHFINDER_M`] as the compatibility wildcard.
     pub fn initiate_link<R: RngCore + CryptoRng>(
         &mut self,
         dest_hash: DestHash,
@@ -150,8 +154,21 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         rng: &mut R,
         now: u64,
     ) -> Result<(alloc::vec::Vec<u8>, LinkId), SendError> {
-        let (mut link, request_payload) =
-            Link::new_initiator(dest_hash, identity.ed25519_pub(), rng, now);
+        // Python Link snapshots hops_to(destination) at construction. Retain
+        // that value atomically with the pending Link so later path changes do
+        // not alter which LRPROOF height can establish this handshake.
+        let expected_hops = self
+            .paths
+            .get(&dest_hash)
+            .map(|path| path.hops)
+            .unwrap_or(PATHFINDER_M);
+        let (mut link, request_payload) = Link::new_initiator_with_expected_hops(
+            dest_hash,
+            identity.ed25519_pub(),
+            expected_hops,
+            rng,
+            now,
+        );
 
         // Build LINKREQUEST packet.
         // dest_type must be Single (matching the target destination type), not Link.
@@ -523,12 +540,14 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     pub(super) fn handle_link_data<'a, R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
-        context: u8,
-        ciphertext: &[u8],
+        packet: &Packet<'_>,
         now: u64,
         pkt_hash: [u8; 32],
         rng: &mut R,
     ) -> IngestResult<'a> {
+        let context = packet.context;
+        let ciphertext = packet.payload;
+        let hops = packet.hops;
         // Python RNS keepalives are the only ordinary Link DATA context that is
         // deliberately not encrypted. Handle the exact role-specific byte before
         // the generic Token path. Invalid bytes never touch Link liveness state.
@@ -624,6 +643,15 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
 
         match context {
             CONTEXT_LRRTT => {
+                // Only a pending responder consumes LRRTT. Once its encrypted
+                // payload authenticates, retain the packet's local inbound
+                // height just as Python Link.rtt_packet() does.
+                if link.role != LinkRole::Responder
+                    || link.state != crate::link::LinkState::Handshake
+                {
+                    return IngestResult::Invalid;
+                }
+                link.set_expected_hops(hops);
                 // RTT measurement — activates responder link.
                 // Compute RTT: time since link was created (proof sent shortly after).
                 // Floor at 0.001s so sub-second RTT (from u64 truncation) still triggers

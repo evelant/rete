@@ -64,7 +64,7 @@ pub use transport::{
     AnnounceRateEntry, ChannelMaintenanceAction, ForwardTarget, IngestResult, LinkTableEntry,
     LinkTableKind, PendingChannelRetry, PendingChannelTeardown, ResourceOptions, ReverseEntry,
     SendError, TickResult, TickSummary, Transport, TransportStats, PATH_REQUEST_DEST,
-    RECEIPT_TIMEOUT, REVERSE_TIMEOUT,
+    PATHFINDER_M, RECEIPT_TIMEOUT, REVERSE_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------

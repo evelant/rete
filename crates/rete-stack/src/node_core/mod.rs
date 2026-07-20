@@ -1732,6 +1732,11 @@ mod tests {
         let (outbound, link_id) = init
             .initiate_link(*resp.dest_hash(), 100, &mut rng)
             .expect("should produce LINKREQUEST");
+        assert_eq!(
+            init.transport.get_link(&link_id).unwrap().expected_hops(),
+            Some(1),
+            "registered direct path should be retained at Link creation"
+        );
 
         // Responder ingests LINKREQUEST → emits LinkEstablished + proof
         let resp_outcome = resp.handle_ingest(&outbound.data, 100, 0, &mut rng);
@@ -1745,6 +1750,11 @@ mod tests {
         assert!(
             !resp_outcome.packets.is_empty(),
             "responder should send LRPROOF"
+        );
+        assert_eq!(
+            resp.transport.get_link(&link_id).unwrap().expected_hops(),
+            None,
+            "responder must not learn its height before authenticated LRRTT"
         );
         let proof_pkt = &resp_outcome.packets[0];
 
@@ -1769,14 +1779,29 @@ mod tests {
             })
             .expect("initiator should auto-send LRRTT");
 
-        // Responder ingests LRRTT → activates
-        let resp_outcome2 = resp.handle_ingest(&lrrtt_pkt.data, 102, 0, &mut rng);
+        // The same authenticated packet on the wrong interface must neither
+        // teach a height nor poison the correct copy's dedup admission.
+        let wrong_interface = resp.handle_ingest(&lrrtt_pkt.data, 102, 7, &mut rng);
+        assert!(wrong_interface.events.is_empty());
+        assert!(wrong_interface.packets.is_empty());
+        assert_eq!(
+            resp.transport.get_link(&link_id).unwrap().expected_hops(),
+            None
+        );
+
+        // Responder ingests LRRTT on its bound interface → activates
+        let resp_outcome2 = resp.handle_ingest(&lrrtt_pkt.data, 103, 0, &mut rng);
         assert!(
             matches!(
                 resp_outcome2.events.first(),
                 Some(NodeEvent::LinkEstablished { .. })
             ),
             "responder should emit LinkEstablished on LRRTT"
+        );
+        assert_eq!(
+            resp.transport.get_link(&link_id).unwrap().expected_hops(),
+            Some(1),
+            "direct LRRTT should teach the responder one inbound hop"
         );
 
         (init, resp, link_id)
@@ -3451,6 +3476,15 @@ mod tests {
         let (lr_outbound, link_id) = node_a
             .initiate_link(c_dest, 100, &mut rng)
             .expect("A should produce LINKREQUEST");
+        assert_eq!(
+            node_a
+                .transport
+                .get_link(&link_id)
+                .unwrap()
+                .expected_hops(),
+            Some(2),
+            "A should retain its two-hop path while the Link is pending"
+        );
         let lr_parsed = Packet::parse(&lr_outbound.data).unwrap();
         assert_eq!(lr_outbound.routing, PacketRouting::ExactInterface(0));
         assert_eq!(
@@ -3477,6 +3511,9 @@ mod tests {
             b_outcome.packets[0].routing,
             PacketRouting::ExactInterface(1)
         );
+        let relay_link = node_b.transport.get_relay_link(&link_id).unwrap();
+        assert_eq!(relay_link.inbound_hops, 1);
+        assert_eq!(relay_link.outbound_hops, 1);
 
         let forwarded_lr = &b_outcome.packets[0].data;
 
@@ -3491,6 +3528,15 @@ mod tests {
             "C should emit LinkEstablished on receiving LINKREQUEST"
         );
         assert!(!c_outcome.packets.is_empty(), "C should produce LRPROOF");
+        assert_eq!(
+            node_c
+                .transport
+                .get_link(&link_id)
+                .unwrap()
+                .expected_hops(),
+            None,
+            "C should not learn its height from unauthenticated routing state"
+        );
         let lrproof_pkt = &c_outcome.packets[0].data;
 
         // 5d. Feed LRPROOF to B (arriving on iface 1 from C's direction).
@@ -3507,10 +3553,34 @@ mod tests {
             "relay B should forward the LRPROOF"
         );
         let forwarded_proof = &b_proof_outcome.packets[0].data;
+        assert_eq!(
+            Packet::parse(forwarded_proof).unwrap().hops,
+            1,
+            "B should emit the proof one wire hop below A's local view"
+        );
+
+        // Hop bytes are excluded from the proof hash. First present the valid
+        // proof at the wrong height and require a clean, pre-dedup rejection;
+        // the unmodified copy must still be able to establish the Link.
+        let mut wrong_hop_proof = forwarded_proof.clone();
+        wrong_hop_proof[1] = 0;
+        let dedup_before = node_a.transport.stats().packets_dropped_dedup;
+        let wrong_hop_outcome = node_a.handle_ingest(&wrong_hop_proof, 103, 0, &mut rng);
+        assert!(wrong_hop_outcome.events.is_empty());
+        assert!(wrong_hop_outcome.packets.is_empty());
+        let pending_a = node_a.transport.get_link(&link_id).unwrap();
+        assert_eq!(pending_a.state, rete_transport::LinkState::Handshake);
+        assert_eq!(pending_a.bound_interface(), None);
+        assert_eq!(pending_a.expected_hops(), Some(2));
+        assert_eq!(
+            node_a.transport.stats().packets_dropped_dedup,
+            dedup_before,
+            "wrong-hop LRPROOF must not enter the dedup window"
+        );
 
         // 5e. Feed LRPROOF to A (arriving on iface 0).
         // A verifies the proof → emits LinkEstablished + auto-sends LRRTT.
-        let a_proof_outcome = node_a.handle_ingest(forwarded_proof, 103, 0, &mut rng);
+        let a_proof_outcome = node_a.handle_ingest(forwarded_proof, 104, 0, &mut rng);
         assert!(
             matches!(
                 a_proof_outcome.events.first(),
@@ -3532,7 +3602,7 @@ mod tests {
         assert_eq!(lrrtt_pkt.routing, PacketRouting::BoundInterface(0));
 
         // 5f. Feed LRRTT to B → B forwards via link_table.
-        let b_rtt_outcome = node_b.handle_ingest(&lrrtt_pkt.data, 104, 0, &mut rng);
+        let b_rtt_outcome = node_b.handle_ingest(&lrrtt_pkt.data, 105, 0, &mut rng);
         assert!(
             b_rtt_outcome.events.is_empty(),
             "relay B should not emit an event for forwarded LRRTT"
@@ -3543,9 +3613,10 @@ mod tests {
             "relay B should forward the LRRTT"
         );
         let forwarded_rtt = &b_rtt_outcome.packets[0].data;
+        assert_eq!(Packet::parse(forwarded_rtt).unwrap().hops, 1);
 
         // 5g. Feed LRRTT to C → C emits LinkEstablished (link activated).
-        let c_rtt_outcome = node_c.handle_ingest(forwarded_rtt, 105, 1, &mut rng);
+        let c_rtt_outcome = node_c.handle_ingest(forwarded_rtt, 106, 1, &mut rng);
         assert!(
             matches!(
                 c_rtt_outcome.events.first(),
@@ -3561,12 +3632,14 @@ mod tests {
             rete_transport::LinkState::Active,
             "A's link should be Active"
         );
+        assert_eq!(a_link.expected_hops(), Some(2));
         let c_link = node_c.transport.get_link(&link_id).unwrap();
         assert_eq!(
             c_link.state,
             rete_transport::LinkState::Active,
             "C's link should be Active"
         );
+        assert_eq!(c_link.expected_hops(), Some(2));
 
         // -----------------------------------------------------------------
         // Step 6: A sends channel message → B forwards → C receives

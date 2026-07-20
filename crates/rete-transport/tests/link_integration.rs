@@ -481,10 +481,12 @@ fn full_handshake_two_transports() {
     // Initiator should have an active link
     let init_link = init_t.get_link(&link_id).unwrap();
     assert_eq!(init_link.state, LinkState::Active);
+    assert_eq!(init_link.expected_hops(), Some(1));
 
     // Responder should have a handshake link (waiting for LRRTT)
     let resp_link = resp_t.get_link(&link_id).unwrap();
     assert_eq!(resp_link.state, LinkState::Handshake);
+    assert_eq!(resp_link.expected_hops(), None);
 }
 
 #[test]
@@ -496,6 +498,19 @@ fn lrrtt_activates_responder_link() {
     let lrrtt = init_t
         .build_lrrtt_packet(&link_id, b"rtt-data", &mut rng)
         .unwrap();
+
+    // A packet that does not authenticate must not teach the responder a
+    // route height or activate the Link.
+    let mut invalid_lrrtt = lrrtt.clone();
+    *invalid_lrrtt.last_mut().unwrap() ^= 0x80;
+    assert!(matches!(
+        resp_t.ingest(&mut invalid_lrrtt, 101, &mut rng, &resp_id),
+        IngestResult::Invalid
+    ));
+    let pending = resp_t.get_link(&link_id).unwrap();
+    assert_eq!(pending.state, LinkState::Handshake);
+    assert_eq!(pending.expected_hops(), None);
+
     let mut lrrtt_buf = lrrtt;
     match resp_t.ingest(&mut lrrtt_buf, 102, &mut rng, &resp_id) {
         IngestResult::LinkEstablished { link_id: lid } => {
@@ -507,6 +522,7 @@ fn lrrtt_activates_responder_link() {
     // Responder link should now be Active
     let resp_link = resp_t.get_link(&link_id).unwrap();
     assert_eq!(resp_link.state, LinkState::Active);
+    assert_eq!(resp_link.expected_hops(), Some(1));
 }
 
 #[test]
