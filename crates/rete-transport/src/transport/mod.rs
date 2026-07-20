@@ -200,7 +200,7 @@ pub struct ReverseEntry {
 /// Used to bidirectionally route link traffic (DATA, PROOF, etc.)
 /// through a transport relay for the lifetime of the link.
 /// Matches Python RNS `Transport.link_table`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkTableEntry {
     /// Monotonic timestamp when this entry was created.
     pub timestamp: u64,
@@ -218,6 +218,13 @@ pub struct LinkTableEntry {
     pub outbound_hops: u8,
     /// Destination hash of the link target.
     pub destination_hash: DestHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayLinkAdmission {
+    Inserted,
+    Existing,
+    Full,
 }
 
 fn link_forward_interface(entry: &LinkTableEntry, source_iface: u8) -> Option<u8> {
@@ -673,6 +680,35 @@ impl<S: TransportStorage> Transport<S> {
         self.reverse_table.len()
     }
 
+    /// Look up a Link route retained on behalf of two remote endpoints.
+    pub fn get_relay_link(&self, link_id: &LinkId) -> Option<&LinkTableEntry> {
+        self.link_table.get(link_id)
+    }
+
+    /// Number of Link routes retained on behalf of remote endpoints.
+    pub fn relay_link_count(&self) -> usize {
+        self.link_table.len()
+    }
+
+    fn admit_relay_link(&mut self, link_id: LinkId, entry: LinkTableEntry) -> RelayLinkAdmission {
+        if self.link_table.contains_key(&link_id) {
+            return RelayLinkAdmission::Existing;
+        }
+
+        match self.link_table.insert(link_id, entry) {
+            Ok(None) => RelayLinkAdmission::Inserted,
+            Ok(Some(previous)) => {
+                // A conforming StorageMap cannot replace an entry after the
+                // contains check above. Restore it defensively so an unusual
+                // backend cannot redirect an established relayed Link.
+                let restored = self.link_table.insert(link_id, previous);
+                debug_assert!(matches!(restored, Ok(Some(_))));
+                RelayLinkAdmission::Existing
+            }
+            Err(_) => RelayLinkAdmission::Full,
+        }
+    }
+
     fn remember_reverse_route(
         &mut self,
         packet_hash: &[u8; 32],
@@ -907,59 +943,69 @@ impl<S: TransportStorage> Transport<S> {
                         let dest = DestHash::from_slice(pkt.destination_hash);
                         let is_link_request = pkt.packet_type == PacketType::LinkRequest;
                         let is_link_dest = pkt.dest_type == DestType::Link;
+                        let inbound_hops = pkt.hops.saturating_add(1);
+                        let path_route = self
+                            .paths
+                            .get(&dest)
+                            .map(|path| (path.via, path.received_on, path.hops));
+
+                        // A relayed LINKREQUEST may be emitted only after its
+                        // complete bidirectional route has been retained. The
+                        // packet hash has already entered the normal dedup
+                        // window, matching owned-Link capacity rejection.
+                        if is_link_request {
+                            let Some((_, Some(outbound_iface), remaining)) = path_route else {
+                                self.stats.packets_dropped_invalid += 1;
+                                return IngestResult::Invalid;
+                            };
+                            let lid = match compute_link_id(raw) {
+                                Ok(lid) => lid,
+                                Err(_) => {
+                                    self.stats.packets_dropped_invalid += 1;
+                                    return IngestResult::Invalid;
+                                }
+                            };
+                            let entry = LinkTableEntry {
+                                timestamp: now,
+                                received_on: iface,
+                                outbound_to: outbound_iface,
+                                inbound_hops,
+                                outbound_hops: remaining,
+                                destination_hash: dest,
+                            };
+                            match self.admit_relay_link(lid, entry) {
+                                RelayLinkAdmission::Inserted => {
+                                    relay_log!(
+                                        "[relay] H2 LINKREQUEST link_table INSERT lid={} dest={} in_hops={} out_hops={} rcvd={} out={}",
+                                        hex_short(lid.as_ref()),
+                                        hex_short(dest.as_ref()),
+                                        inbound_hops,
+                                        remaining,
+                                        iface,
+                                        outbound_iface,
+                                    );
+                                }
+                                RelayLinkAdmission::Existing => {
+                                    return IngestResult::Duplicate;
+                                }
+                                RelayLinkAdmission::Full => {
+                                    return IngestResult::LinkTableFull {
+                                        link_id: lid,
+                                        table: LinkTableKind::Relay,
+                                    };
+                                }
+                            }
+                        }
 
                         // End pkt borrow on raw before mutating
                         #[allow(clippy::drop_non_drop)]
                         drop(pkt);
 
-                        raw[1] = raw[1].saturating_add(1);
-                        // Capture hops AFTER increment to match Python
+                        // Store and emit hops AFTER increment to match Python
                         // (Transport.py:1319 increments first, line 1488 stores).
-                        let inbound_hops = raw[1];
-
-                        // For LINKREQUEST: store a link_table entry keyed by link_id.
-                        // This enables bidirectional routing of all link traffic
-                        // (LRPROOF, LRRTT, DATA, keepalives, etc.) through this relay.
-                        if is_link_request {
-                            let Some(path) = self.paths.get(&dest) else {
-                                self.stats.packets_dropped_invalid += 1;
-                                return IngestResult::Invalid;
-                            };
-                            let Some(outbound_iface) = path.received_on else {
-                                self.stats.packets_dropped_invalid += 1;
-                                return IngestResult::Invalid;
-                            };
-                            if let Ok(lid) = compute_link_id(raw) {
-                                let remaining = path.hops;
-                                relay_log!(
-                                    "[relay] H2 LINKREQUEST link_table INSERT lid={} dest={} in_hops={} out_hops={} rcvd={} out={}",
-                                    hex_short(lid.as_ref()),
-                                    hex_short(dest.as_ref()),
-                                    inbound_hops,
-                                    remaining,
-                                    iface,
-                                    outbound_iface,
-                                );
-                                let _ = self.link_table.insert(
-                                    lid,
-                                    LinkTableEntry {
-                                        timestamp: now,
-                                        received_on: iface,
-                                        outbound_to: outbound_iface,
-                                        inbound_hops,
-                                        outbound_hops: remaining,
-                                        destination_hash: dest,
-                                    },
-                                );
-                            }
-                        }
-
-                        let path_route = self
-                            .paths
-                            .get(&dest)
-                            .map(|path| (path.via, path.received_on));
+                        raw[1] = inbound_hops;
                         let h2_result = match path_route {
-                            Some((Some(via), Some(outbound_iface))) => {
+                            Some((Some(via), Some(outbound_iface), _)) => {
                                 relay_log!(
                                     "[relay] H2 FWD via={} dest={} iface={}",
                                     hex_short(via.as_ref()),
@@ -981,7 +1027,7 @@ impl<S: TransportStorage> Transport<S> {
                                     target: ForwardTarget::ExactInterface(outbound_iface),
                                 }
                             }
-                            Some((None, Some(outbound_iface))) => {
+                            Some((None, Some(outbound_iface), _)) => {
                                 relay_log!(
                                     "[relay] H2->H1 FWD direct dest={} iface={} len={}->{}",
                                     hex_short(dest.as_ref()),
@@ -1006,7 +1052,7 @@ impl<S: TransportStorage> Transport<S> {
                                     target: ForwardTarget::ExactInterface(outbound_iface),
                                 }
                             }
-                            Some((_, None)) => {
+                            Some((_, None, _)) => {
                                 relay_log!(
                                     "[relay] H2 PATH WITHOUT INTERFACE dest={}",
                                     hex_short(dest.as_ref()),
@@ -1470,27 +1516,42 @@ impl<S: TransportStorage> Transport<S> {
                             self.stats.packets_dropped_invalid += 1;
                             return IngestResult::Invalid;
                         };
-                        if let Ok(lid) = compute_link_id(raw) {
-                            let remaining = path.hops;
-                            relay_log!(
-                                "[relay] H1 LINKREQUEST link_table INSERT lid={} dest={} out_hops={} rcvd={} out={}",
-                                hex_short(lid.as_ref()),
-                                hex_short(dh.as_ref()),
-                                remaining,
-                                iface,
-                                outbound_iface,
-                            );
-                            let _ = self.link_table.insert(
-                                lid,
-                                LinkTableEntry {
-                                    timestamp: now,
-                                    received_on: iface,
-                                    outbound_to: outbound_iface,
-                                    inbound_hops: pkt.hops,
-                                    outbound_hops: remaining,
-                                    destination_hash: dh,
-                                },
-                            );
+                        let lid = match compute_link_id(raw) {
+                            Ok(lid) => lid,
+                            Err(_) => {
+                                self.stats.packets_dropped_invalid += 1;
+                                return IngestResult::Invalid;
+                            }
+                        };
+                        let remaining = path.hops;
+                        let entry = LinkTableEntry {
+                            timestamp: now,
+                            received_on: iface,
+                            outbound_to: outbound_iface,
+                            inbound_hops: pkt.hops,
+                            outbound_hops: remaining,
+                            destination_hash: dh,
+                        };
+                        match self.admit_relay_link(lid, entry) {
+                            RelayLinkAdmission::Inserted => {
+                                relay_log!(
+                                    "[relay] H1 LINKREQUEST link_table INSERT lid={} dest={} out_hops={} rcvd={} out={}",
+                                    hex_short(lid.as_ref()),
+                                    hex_short(dh.as_ref()),
+                                    remaining,
+                                    iface,
+                                    outbound_iface,
+                                );
+                            }
+                            RelayLinkAdmission::Existing => {
+                                return IngestResult::Duplicate;
+                            }
+                            RelayLinkAdmission::Full => {
+                                return IngestResult::LinkTableFull {
+                                    link_id: lid,
+                                    table: LinkTableKind::Relay,
+                                };
+                            }
                         }
                         self.stats.packets_forwarded += 1;
                         return IngestResult::Forward {
@@ -1606,6 +1667,7 @@ mod tests {
     };
 
     type TestTransport = Transport<crate::HeaplessStorage<64, 16, 128, 4>>;
+    type TwoRelayTransport = Transport<crate::HeaplessStorage<8, 4, 16, 2>>;
 
     #[test]
     fn test_path_expiry() {
@@ -1880,6 +1942,21 @@ mod tests {
     // Link relay forwarding via link_table
     // -----------------------------------------------------------------------
 
+    /// Helper: build a HEADER_1 LINKREQUEST packet.
+    fn build_h1_linkrequest(dest_hash: &DestHash, payload: &[u8]) -> ([u8; rete_core::MTU], usize) {
+        let mut buf = [0u8; rete_core::MTU];
+        let n = PacketBuilder::new(&mut buf)
+            .packet_type(PacketType::LinkRequest)
+            .dest_type(DestType::Single)
+            .hops(0)
+            .destination_hash(dest_hash.as_ref())
+            .context(0x00)
+            .payload(payload)
+            .build()
+            .unwrap();
+        (buf, n)
+    }
+
     /// Helper: build a HEADER_2 LINKREQUEST packet targeting a relay.
     fn build_h2_linkrequest(
         relay_id: &IdentityHash,
@@ -1910,6 +1987,245 @@ mod tests {
         path.received_on = Some(1);
         t.insert_path(dest_hash, path);
         t
+    }
+
+    fn insert_relay_path<S: crate::TransportStorage>(
+        transport: &mut Transport<S>,
+        dest_hash: DestHash,
+        iface: u8,
+    ) {
+        let mut path = Path::direct(0);
+        path.received_on = Some(iface);
+        assert!(transport.insert_path(dest_hash, path));
+    }
+
+    fn relay_entry(tag: u8) -> LinkTableEntry {
+        LinkTableEntry {
+            timestamp: u64::from(tag),
+            received_on: tag,
+            outbound_to: tag.saturating_add(1),
+            inbound_hops: tag.saturating_add(2),
+            outbound_hops: tag.saturating_add(3),
+            destination_hash: DestHash::from([tag; TRUNCATED_HASH_LEN]),
+        }
+    }
+
+    #[test]
+    fn relay_link_admission_distinguishes_existing_from_full_without_replacement() {
+        let mut transport = TwoRelayTransport::new();
+        let existing_id = LinkId::from([0x11; TRUNCATED_HASH_LEN]);
+        let other_id = LinkId::from([0x22; TRUNCATED_HASH_LEN]);
+        let overflow_id = LinkId::from([0x33; TRUNCATED_HASH_LEN]);
+        let retained = relay_entry(1);
+        let replacement = relay_entry(9);
+
+        assert_eq!(
+            transport.admit_relay_link(existing_id, retained),
+            RelayLinkAdmission::Inserted
+        );
+        assert_eq!(transport.relay_link_count(), 1);
+        assert_eq!(
+            transport.admit_relay_link(existing_id, replacement),
+            RelayLinkAdmission::Existing
+        );
+        assert_eq!(transport.get_relay_link(&existing_id), Some(&retained));
+        assert_eq!(
+            transport.admit_relay_link(other_id, relay_entry(2)),
+            RelayLinkAdmission::Inserted
+        );
+        assert_eq!(
+            transport.admit_relay_link(overflow_id, relay_entry(3)),
+            RelayLinkAdmission::Full
+        );
+        assert_eq!(transport.relay_link_count(), 2);
+        assert_eq!(transport.get_relay_link(&existing_id), Some(&retained));
+        assert!(transport.get_relay_link(&other_id).is_some());
+        assert!(transport.get_relay_link(&overflow_id).is_none());
+    }
+
+    #[test]
+    fn h2_relay_link_capacity_rejects_before_forward_and_preserves_dedup() {
+        let relay_hash = IdentityHash::from([0x31; TRUNCATED_HASH_LEN]);
+        let first_dest = DestHash::from([0x41; TRUNCATED_HASH_LEN]);
+        let second_dest = DestHash::from([0x42; TRUNCATED_HASH_LEN]);
+        let overflow_dest = DestHash::from([0x43; TRUNCATED_HASH_LEN]);
+        let identity = Identity::from_seed(b"bounded-h2-relay-link").unwrap();
+        let mut rng = rand_core::OsRng;
+        let mut transport = TwoRelayTransport::new();
+        transport.set_local_identity(relay_hash);
+        insert_relay_path(&mut transport, first_dest, 7);
+        insert_relay_path(&mut transport, second_dest, 8);
+        insert_relay_path(&mut transport, overflow_dest, 9);
+
+        let (mut first, first_len) = build_h2_linkrequest(&relay_hash, &first_dest, &[0x51; 64]);
+        let first_id = compute_link_id(&first[..first_len]).unwrap();
+        assert!(matches!(
+            transport.ingest_on(&mut first[..first_len], 100, 3, &mut rng, &identity),
+            IngestResult::Forward {
+                source_iface: 3,
+                target: ForwardTarget::ExactInterface(7),
+                ..
+            }
+        ));
+        let retained = *transport.get_relay_link(&first_id).unwrap();
+        let (mut second, second_len) = build_h2_linkrequest(&relay_hash, &second_dest, &[0x52; 64]);
+        assert!(matches!(
+            transport.ingest_on(&mut second[..second_len], 101, 4, &mut rng, &identity),
+            IngestResult::Forward {
+                source_iface: 4,
+                target: ForwardTarget::ExactInterface(8),
+                ..
+            }
+        ));
+        assert_eq!(transport.relay_link_count(), 2);
+        assert_eq!(transport.reverse_count(), 0);
+
+        let (overflow, overflow_len) =
+            build_h2_linkrequest(&relay_hash, &overflow_dest, &[0x53; 64]);
+        let overflow_id = compute_link_id(&overflow[..overflow_len]).unwrap();
+        let mut rejected = overflow;
+        let forwarded_before = transport.stats().packets_forwarded;
+        assert!(matches!(
+            transport.ingest_on(
+                &mut rejected[..overflow_len],
+                102,
+                5,
+                &mut rng,
+                &identity,
+            ),
+            IngestResult::LinkTableFull {
+                link_id,
+                table: LinkTableKind::Relay,
+            } if link_id == overflow_id
+        ));
+        assert_eq!(
+            &rejected[..overflow_len],
+            &overflow[..overflow_len],
+            "capacity rejection must not rewrite an unforwarded H2 packet"
+        );
+        assert_eq!(transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(transport.relay_link_count(), 2);
+        assert_eq!(transport.get_relay_link(&first_id), Some(&retained));
+        assert!(transport.get_relay_link(&overflow_id).is_none());
+        assert_eq!(transport.reverse_count(), 0);
+
+        let _ = transport.tick(101 + crate::link::STALE_TIMEOUT_SECS + 1);
+        assert_eq!(transport.relay_link_count(), 0);
+        let mut replay = overflow;
+        assert!(matches!(
+            transport.ingest_on(
+                &mut replay[..overflow_len],
+                101 + crate::link::STALE_TIMEOUT_SECS + 2,
+                5,
+                &mut rng,
+                &identity,
+            ),
+            IngestResult::Duplicate
+        ));
+        assert_eq!(transport.relay_link_count(), 0);
+
+        let (mut fresh, fresh_len) = build_h2_linkrequest(&relay_hash, &overflow_dest, &[0x54; 64]);
+        assert!(matches!(
+            transport.ingest_on(
+                &mut fresh[..fresh_len],
+                101 + crate::link::STALE_TIMEOUT_SECS + 3,
+                5,
+                &mut rng,
+                &identity,
+            ),
+            IngestResult::Forward {
+                source_iface: 5,
+                target: ForwardTarget::ExactInterface(9),
+                ..
+            }
+        ));
+        assert_eq!(transport.relay_link_count(), 1);
+    }
+
+    #[test]
+    fn h1_relay_link_capacity_rejects_without_forwarding() {
+        let relay_hash = IdentityHash::from([0x61; TRUNCATED_HASH_LEN]);
+        let first_dest = DestHash::from([0x71; TRUNCATED_HASH_LEN]);
+        let second_dest = DestHash::from([0x72; TRUNCATED_HASH_LEN]);
+        let overflow_dest = DestHash::from([0x73; TRUNCATED_HASH_LEN]);
+        let identity = Identity::from_seed(b"bounded-h1-relay-link").unwrap();
+        let mut rng = rand_core::OsRng;
+        let mut transport = TwoRelayTransport::new();
+        transport.set_local_identity(relay_hash);
+        insert_relay_path(&mut transport, first_dest, 7);
+        insert_relay_path(&mut transport, second_dest, 8);
+        insert_relay_path(&mut transport, overflow_dest, 9);
+
+        let (mut first, first_len) = build_h1_linkrequest(&first_dest, &[0x81; 64]);
+        let first_id = compute_link_id(&first[..first_len]).unwrap();
+        assert!(matches!(
+            transport.ingest_on(&mut first[..first_len], 100, 3, &mut rng, &identity),
+            IngestResult::Forward {
+                source_iface: 3,
+                target: ForwardTarget::ExactInterface(7),
+                ..
+            }
+        ));
+        let retained = *transport.get_relay_link(&first_id).unwrap();
+
+        let (mut second, second_len) = build_h1_linkrequest(&second_dest, &[0x82; 64]);
+        assert!(matches!(
+            transport.ingest_on(&mut second[..second_len], 101, 4, &mut rng, &identity),
+            IngestResult::Forward {
+                source_iface: 4,
+                target: ForwardTarget::ExactInterface(8),
+                ..
+            }
+        ));
+
+        let (mut overflow, overflow_len) = build_h1_linkrequest(&overflow_dest, &[0x83; 64]);
+        let overflow_id = compute_link_id(&overflow[..overflow_len]).unwrap();
+        let forwarded_before = transport.stats().packets_forwarded;
+        assert!(matches!(
+            transport.ingest_on(
+                &mut overflow[..overflow_len],
+                102,
+                5,
+                &mut rng,
+                &identity,
+            ),
+            IngestResult::LinkTableFull {
+                link_id,
+                table: LinkTableKind::Relay,
+            } if link_id == overflow_id
+        ));
+        assert_eq!(transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(transport.relay_link_count(), 2);
+        assert_eq!(transport.get_relay_link(&first_id), Some(&retained));
+        assert!(transport.get_relay_link(&overflow_id).is_none());
+        assert_eq!(transport.reverse_count(), 0);
+    }
+
+    #[test]
+    fn relay_link_missing_or_unbound_path_never_allocates_state() {
+        let relay_hash = IdentityHash::from([0x91; TRUNCATED_HASH_LEN]);
+        let missing_dest = DestHash::from([0x92; TRUNCATED_HASH_LEN]);
+        let unbound_dest = DestHash::from([0x93; TRUNCATED_HASH_LEN]);
+        let identity = Identity::from_seed(b"relay-link-missing-route").unwrap();
+        let mut rng = rand_core::OsRng;
+        let mut transport = TwoRelayTransport::new();
+        transport.set_local_identity(relay_hash);
+        assert!(transport.insert_path(unbound_dest, Path::direct(0)));
+
+        let (mut h2, h2_len) = build_h2_linkrequest(&relay_hash, &missing_dest, &[0x94; 64]);
+        assert!(matches!(
+            transport.ingest_on(&mut h2[..h2_len], 100, 3, &mut rng, &identity),
+            IngestResult::Invalid
+        ));
+        assert_eq!(transport.relay_link_count(), 0);
+
+        let (mut h1, h1_len) = build_h1_linkrequest(&unbound_dest, &[0x95; 64]);
+        assert!(matches!(
+            transport.ingest_on(&mut h1[..h1_len], 101, 4, &mut rng, &identity),
+            IngestResult::Invalid
+        ));
+        assert_eq!(transport.relay_link_count(), 0);
+        assert_eq!(transport.reverse_count(), 0);
     }
 
     /// Set up a relay link entry and a cryptographically valid LRPROOF.

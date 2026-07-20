@@ -913,6 +913,7 @@ mod tests {
 
     type TestNodeCore = NodeCore<rete_transport::HeaplessStorage<64, 16, 128, 4>>;
     type SmallReceiptNodeCore = NodeCore<rete_transport::HeaplessStorage<4, 4, 8, 2>>;
+    type TwoRelayNodeCore = NodeCore<rete_transport::HeaplessStorage<8, 4, 16, 2>>;
 
     #[derive(Default)]
     struct RecordingReceiptSink {
@@ -1300,6 +1301,70 @@ mod tests {
         );
         assert_eq!(outcome.packets.len(), 1);
         assert_eq!(outcome.packets[0].routing, PacketRouting::ExactInterface(1));
+    }
+
+    #[test]
+    fn node_core_emits_no_packet_when_relay_link_table_is_full() {
+        let identity = Identity::from_seed(b"node-core-bounded-relay").unwrap();
+        let mut core = TwoRelayNodeCore::new(identity, "testapp", &["relay"]).unwrap();
+        core.enable_transport();
+        let mut rng = rand::thread_rng();
+        let relay_hash = core.identity.hash();
+        let first_dest = DestHash::from([0x51; TRUNCATED_HASH_LEN]);
+        let second_dest = DestHash::from([0x52; TRUNCATED_HASH_LEN]);
+        let overflow_dest = DestHash::from([0x53; TRUNCATED_HASH_LEN]);
+        for (destination, iface) in [(first_dest, 7), (second_dest, 8), (overflow_dest, 9)] {
+            let mut path = rete_transport::Path::direct(100);
+            path.received_on = Some(iface);
+            assert!(core.transport.insert_path(destination, path));
+        }
+
+        let build_request = |destination: DestHash, payload: [u8; 64]| {
+            let mut raw = [0u8; MTU];
+            let len = PacketBuilder::new(&mut raw)
+                .header_type(HeaderType::Header2)
+                .transport_type(TRANSPORT_TYPE_TRANSPORT)
+                .packet_type(PacketType::LinkRequest)
+                .dest_type(DestType::Single)
+                .transport_id(relay_hash.as_ref())
+                .destination_hash(destination.as_ref())
+                .context(0)
+                .payload(&payload)
+                .build()
+                .unwrap();
+            (raw, len)
+        };
+
+        let (first, first_len) = build_request(first_dest, [0x61; 64]);
+        let first_id = rete_transport::compute_link_id(&first[..first_len]).unwrap();
+        let admitted = core.handle_ingest(&first[..first_len], 100, 3, &mut rng);
+        assert!(admitted.events.is_empty());
+        assert_eq!(admitted.packets.len(), 1);
+        assert_eq!(
+            admitted.packets[0].routing,
+            PacketRouting::ExactInterface(7)
+        );
+        let retained = *core.transport.get_relay_link(&first_id).unwrap();
+
+        let (second, second_len) = build_request(second_dest, [0x62; 64]);
+        let admitted = core.handle_ingest(&second[..second_len], 101, 4, &mut rng);
+        assert!(admitted.events.is_empty());
+        assert_eq!(admitted.packets.len(), 1);
+        assert_eq!(
+            admitted.packets[0].routing,
+            PacketRouting::ExactInterface(8)
+        );
+
+        let (overflow, overflow_len) = build_request(overflow_dest, [0x63; 64]);
+        let overflow_id = rete_transport::compute_link_id(&overflow[..overflow_len]).unwrap();
+        let forwarded_before = core.transport.stats().packets_forwarded;
+        let rejected = core.handle_ingest(&overflow[..overflow_len], 102, 5, &mut rng);
+        assert!(rejected.events.is_empty());
+        assert!(rejected.packets.is_empty());
+        assert_eq!(core.transport.stats().packets_forwarded, forwarded_before);
+        assert_eq!(core.transport.relay_link_count(), 2);
+        assert_eq!(core.transport.get_relay_link(&first_id), Some(&retained));
+        assert!(core.transport.get_relay_link(&overflow_id).is_none());
     }
 
     #[test]
