@@ -170,6 +170,23 @@ fn dispatch_dual_exact_interface_can_route_back_to_source_slot() {
 }
 
 #[test]
+fn dispatch_dual_bound_interface_routes_to_bound_slot() {
+    block_on(async {
+        let mut iface0 = MockInterface::new();
+        let mut iface1 = MockInterface::new();
+        let packets = vec![OutboundPacket {
+            data: b"bound-link-packet".to_vec(),
+            routing: PacketRouting::BoundInterface(1),
+        }];
+
+        dispatch_dual(&mut iface0, &mut iface1, &packets, 0).await;
+
+        assert!(iface0.outbound.is_empty());
+        assert_eq!(iface1.outbound, vec![b"bound-link-packet".to_vec()]);
+    });
+}
+
+#[test]
 fn dispatch_dual_unknown_exact_interface_drops_packet() {
     block_on(async {
         let mut iface0 = MockInterface::new();
@@ -198,6 +215,27 @@ fn dispatch_single_unknown_exact_interface_drops_packet() {
         dispatch_single(&mut iface, &packets).await;
 
         assert!(iface.outbound.is_empty());
+    });
+}
+
+#[test]
+fn dispatch_single_bound_interface_zero_sends_and_unknown_drops() {
+    block_on(async {
+        let mut iface = MockInterface::new();
+        let packets = vec![
+            OutboundPacket {
+                data: b"bound-zero".to_vec(),
+                routing: PacketRouting::BoundInterface(0),
+            },
+            OutboundPacket {
+                data: b"bound-unknown".to_vec(),
+                routing: PacketRouting::BoundInterface(1),
+            },
+        ];
+
+        dispatch_single(&mut iface, &packets).await;
+
+        assert_eq!(iface.outbound, vec![b"bound-zero".to_vec()]);
     });
 }
 

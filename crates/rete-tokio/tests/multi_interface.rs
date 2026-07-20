@@ -155,6 +155,81 @@ fn exact_interface_same_hub_slot_excludes_only_source_client() {
 }
 
 #[test]
+fn exact_interface_same_hub_without_source_client_sends_selected_slot() {
+    big_stack_test(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = ClientHub::new(4);
+                let (_first_client, mut first_rx) = hub.register().await;
+                let (_second_client, mut second_rx) = hub.register().await;
+                let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
+                let packets = [OutboundPacket {
+                    data: b"local-exact".to_vec(),
+                    routing: PacketRouting::ExactInterface(0),
+                }];
+
+                dispatch(&slots, &packets, 0, None).await;
+
+                assert_eq!(first_rx.try_recv().unwrap(), b"local-exact");
+                assert_eq!(second_rx.try_recv().unwrap(), b"local-exact");
+            });
+    });
+}
+
+#[test]
+fn bound_interface_same_hub_slot_targets_source_client() {
+    big_stack_test(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = ClientHub::new(4);
+                let (source_client, mut source_rx) = hub.register().await;
+                let (_peer_client, mut peer_rx) = hub.register().await;
+                let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
+                let packets = [OutboundPacket {
+                    data: b"synchronous-bound".to_vec(),
+                    routing: PacketRouting::BoundInterface(0),
+                }];
+
+                dispatch(&slots, &packets, 0, Some(source_client)).await;
+
+                assert_eq!(source_rx.try_recv().unwrap(), b"synchronous-bound");
+                assert!(peer_rx.try_recv().is_err());
+            });
+    });
+}
+
+#[test]
+fn bound_interface_hub_without_client_identity_broadcasts_instead_of_dropping() {
+    big_stack_test(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let hub = ClientHub::new(4);
+                let (_first_client, mut first_rx) = hub.register().await;
+                let (_second_client, mut second_rx) = hub.register().await;
+                let slots = vec![InterfaceSlot::Hub(hub.broadcaster())];
+                let packets = [OutboundPacket {
+                    data: b"asynchronous-bound".to_vec(),
+                    routing: PacketRouting::BoundInterface(0),
+                }];
+
+                dispatch(&slots, &packets, 0, None).await;
+
+                assert_eq!(first_rx.try_recv().unwrap(), b"asynchronous-bound");
+                assert_eq!(second_rx.try_recv().unwrap(), b"asynchronous-bound");
+            });
+    });
+}
+
+#[test]
 fn forward_excludes_source_interface() {
     big_stack_test(|| {
         tokio::runtime::Builder::new_current_thread()

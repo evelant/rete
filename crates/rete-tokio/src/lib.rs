@@ -618,6 +618,10 @@ impl TokioNode {
                     dispatch(&slots, &outcome.packets, msg.iface_idx, msg.client_id).await;
                     for event in outcome.events {
                         let extra = on_event(event, &mut self.core, &mut rng);
+                        // Application callback output is not necessarily a
+                        // reply on the Link that produced this event. Keep it
+                        // source-less so a bound shared Hub uses the documented
+                        // broadcast fallback until endpoint IDs are retained.
                         dispatch(&slots, &extra, 0, None).await;
                     }
                 }
@@ -659,7 +663,10 @@ impl TokioNode {
 /// and `AllExceptSource` broadcasts to all Hub clients except the originator
 /// (instead of skipping the entire slot). `ExactInterface` sends to the named
 /// slot; if that is the source Hub slot, it relays to the other clients while
-/// excluding the originating client. A Direct source slot is still sent to.
+/// excluding the originating client. `BoundInterface` represents locally owned
+/// Link traffic: synchronous output targets the source Hub client, while output
+/// without retained client identity broadcasts on that Hub as a transitional
+/// fallback. A Direct source slot is still sent to.
 pub async fn dispatch(
     slots: &[InterfaceSlot],
     packets: &[OutboundPacket],
@@ -675,9 +682,31 @@ pub async fn dispatch(
             }
             PacketRouting::ExactInterface(interface) => {
                 if let Some(slot) = slots.get(interface as usize) {
-                    if interface == source_iface && matches!(slot, InterfaceSlot::Hub(_)) {
+                    if interface == source_iface
+                        && source_client.is_some()
+                        && matches!(slot, InterfaceSlot::Hub(_))
+                    {
                         slot.send_except_source(&pkt.data, source_client).await;
                     } else {
+                        // A locally originated exact route has no source client
+                        // to exclude. Send it on the selected slot instead of
+                        // treating interface zero as an artificial source.
+                        slot.send_packet(&pkt.data).await;
+                    }
+                }
+            }
+            PacketRouting::BoundInterface(interface) => {
+                if let Some(slot) = slots.get(interface as usize) {
+                    if interface == source_iface
+                        && source_client.is_some()
+                        && matches!(slot, InterfaceSlot::Hub(_))
+                    {
+                        slot.send_to_source(&pkt.data, source_client).await;
+                    } else {
+                        // Link state currently retains only the interface slot,
+                        // not a shared Hub client ID. Preserve delivery by
+                        // broadcasting on the bound Hub until endpoint-aware
+                        // bindings can narrow asynchronous output.
                         slot.send_packet(&pkt.data).await;
                     }
                 }

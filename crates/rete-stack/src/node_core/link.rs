@@ -18,10 +18,18 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         now: u64,
         rng: &mut R,
     ) -> Result<(OutboundPacket, LinkId), SendError> {
+        // A learned path selects only this initial request. The Link itself is
+        // deliberately left unbound until a valid LRPROOF arrives.
+        let routing = self
+            .transport
+            .get_path(&dest_hash)
+            .and_then(|path| path.received_on)
+            .map(super::PacketRouting::ExactInterface)
+            .unwrap_or(super::PacketRouting::All);
         let (raw, link_id) = self
             .transport
             .initiate_link(dest_hash, &self.identity, rng, now)?;
-        Ok((OutboundPacket::broadcast(raw), link_id))
+        Ok((OutboundPacket { data: raw, routing }, link_id))
     }
 
     /// Send a channel message on a link.
@@ -36,10 +44,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         now: u64,
         rng: &mut R,
     ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         let raw = self
             .transport
             .send_channel_message(link_id, message_type, payload, now, rng)?;
-        Ok(OutboundPacket::broadcast(raw))
+        Ok(OutboundPacket { data: raw, routing })
     }
 
     /// Send stream data on a link via channel.
@@ -76,13 +85,19 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         link_id: &LinkId,
         rng: &mut R,
     ) -> (Option<OutboundPacket>, Option<NodeEvent>) {
+        // build_linkclose_packet removes the Link, so retain its routing before
+        // asking the transport to construct the close packet.
+        let routing = match self.owned_link_routing(link_id) {
+            Ok(routing) => routing,
+            Err(_) => return (None, None),
+        };
         let pkt = self.transport.build_linkclose_packet(link_id, rng).ok();
         let event = if pkt.is_some() {
             Some(NodeEvent::LinkClosed { link_id: *link_id })
         } else {
             None
         };
-        (pkt.map(OutboundPacket::broadcast), event)
+        (pkt.map(|data| OutboundPacket { data, routing }), event)
     }
 
     /// Send a LINKIDENTIFY packet on an established link.
@@ -95,6 +110,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         link_id: &LinkId,
         rng: &mut R,
     ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         // Build identify payload: pub_key[64] || Ed25519_sig[64]
         let pub_key = self.identity.public_key();
         let sig = self.identity.sign(&pub_key).map_err(SendError::Crypto)?;
@@ -108,6 +124,6 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             rete_core::CONTEXT_LINKIDENTIFY,
             rng,
         )?;
-        Ok(OutboundPacket::broadcast(pkt))
+        Ok(OutboundPacket { data: pkt, routing })
     }
 }

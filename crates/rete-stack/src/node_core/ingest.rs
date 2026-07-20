@@ -258,6 +258,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             },
             IngestResult::LinkRequestReceived { link_id, proof_raw } => IngestOutcome {
                 events: vec![NodeEvent::LinkEstablished { link_id }],
+                // LRPROOF is a synchronous response to the accepted request.
+                // Preserve SourceInterface provenance for proof telemetry.
                 packets: vec![OutboundPacket {
                     data: proof_raw,
                     routing: PacketRouting::SourceInterface,
@@ -276,7 +278,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 {
                     let rtt_bytes = &now.to_be_bytes()[4..8];
                     if let Ok(pkt) = self.transport.build_lrrtt_packet(&link_id, rtt_bytes, rng) {
-                        packets.push(OutboundPacket::broadcast(pkt));
+                        if let Ok(outbound) = self.owned_link_outbound(&link_id, pkt) {
+                            packets.push(outbound);
+                        }
                     }
                 }
                 IngestOutcome {
@@ -294,7 +298,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 // If this is a keepalive request, send the response back
                 if context == rete_core::CONTEXT_KEEPALIVE {
                     if let Ok(pkt) = self.transport.build_keepalive_packet(&link_id, false, rng) {
-                        packets.push(OutboundPacket::broadcast(pkt));
+                        if let Ok(outbound) = self.owned_link_outbound(&link_id, pkt) {
+                            packets.push(outbound);
+                        }
                     }
                 }
                 // Handle LINKIDENTIFY: validate and emit LinkIdentified event
@@ -472,24 +478,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
                 match effective {
                     ResourceStrategy::AcceptAll => {
-                        if let Some(pkt) =
-                            self.transport
-                                .accept_resource(&link_id, &resource_hash, rng)
-                        {
-                            packets.push(OutboundPacket::broadcast(pkt));
-                        }
-                        for pkt in self.transport.drain_resource_outbound() {
-                            packets.push(OutboundPacket::broadcast(pkt));
-                        }
+                        packets.extend(self.accept_resource(&link_id, &resource_hash, rng));
+                        packets.extend(self.drain_resource_outbound());
                     }
                     ResourceStrategy::AcceptNone => {
-                        if let Some(pkt) =
-                            self.transport
-                                .reject_resource(&link_id, &resource_hash, rng)
-                        {
-                            packets.push(OutboundPacket::broadcast(pkt));
-                        }
-                        self.transport.cleanup_resources();
+                        packets.extend(self.reject_resource(&link_id, &resource_hash, rng));
                     }
                     ResourceStrategy::AcceptApp => {
                         // No auto-action — application calls accept/reject
@@ -545,9 +538,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     // Failure helper: drain outbound, cleanup, clean split buf
                     macro_rules! resource_failed {
                         ($packets:expr) => {{
-                            for pkt in self.transport.drain_resource_outbound() {
-                                $packets.push(OutboundPacket::broadcast(pkt));
-                            }
+                            $packets.extend(self.drain_resource_outbound());
                             self.transport.cleanup_resources();
                             if split_total > 1 {
                                 if let Some(idx) = self.split_recv_buf.iter().position(|e| {
@@ -629,14 +620,16 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             .payload(&proof)
                             .build()
                         {
-                            packets.push(OutboundPacket::broadcast(pkt_buf[..pkt_len].to_vec()));
+                            if let Ok(outbound) = self
+                                .owned_link_outbound(&link_id, pkt_buf[..pkt_len].to_vec())
+                            {
+                                packets.push(outbound);
+                            }
                         }
                     }
 
                     // Drain any resource outbound packets
-                    for pkt in self.transport.drain_resource_outbound() {
-                        packets.push(OutboundPacket::broadcast(pkt));
-                    }
+                    packets.extend(self.drain_resource_outbound());
                     // Clean up completed receiver resource
                     self.transport.cleanup_resources();
 
@@ -747,9 +740,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     };
                 }
                 // Not all parts received yet — drain resource outbound
-                for pkt in self.transport.drain_resource_outbound() {
-                    packets.push(OutboundPacket::broadcast(pkt));
-                }
+                packets.extend(self.drain_resource_outbound());
                 // Only send follow-up REQ when the entire window batch has
                 // arrived (outstanding_parts == 0). Python does the same:
                 // Resource.py line 886 checks `outstanding_parts == 0`.
@@ -767,7 +758,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             self.transport
                                 .build_followup_request(&link_id, &resource_hash, rng)
                         {
-                            packets.push(OutboundPacket::broadcast(req_pkt));
+                            if let Ok(outbound) = self.owned_link_outbound(&link_id, req_pkt) {
+                                packets.push(outbound);
+                            }
                         }
                     }
                 }
@@ -802,10 +795,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             } => {
                 // Sender received proof — transfer complete on our end
                 self.transport.cleanup_resources();
-                let mut packets = Vec::new();
-                for pkt in self.transport.drain_resource_outbound() {
-                    packets.push(OutboundPacket::broadcast(pkt));
-                }
+                let packets = self.drain_resource_outbound();
                 IngestOutcome {
                     events: vec![NodeEvent::ResourceComplete {
                         link_id,
@@ -821,10 +811,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 resource_hash,
             } => {
                 self.transport.cleanup_resources();
-                let mut packets = Vec::new();
-                for pkt in self.transport.drain_resource_outbound() {
-                    packets.push(OutboundPacket::broadcast(pkt));
-                }
+                let packets = self.drain_resource_outbound();
                 let mut events = vec![NodeEvent::ResourceFailed {
                     link_id,
                     resource_hash,
@@ -896,27 +883,19 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 // resource packets while exposing the Link admission failure.
                 IngestOutcome {
                     events: vec![],
-                    packets: self
-                        .transport
-                        .drain_resource_outbound()
-                        .into_iter()
-                        .map(OutboundPacket::broadcast)
-                        .collect(),
+                    packets: self.drain_resource_outbound(),
                     rejection: Some(IngestRejection::LinkTableFull { link_id, table }),
                 }
             }
             IngestResult::Duplicate | IngestResult::Invalid => {
                 // Drain any resource outbound packets that may have been queued
-                let resource_pkts = self.transport.drain_resource_outbound();
+                let resource_pkts = self.drain_resource_outbound();
                 if resource_pkts.is_empty() {
                     IngestOutcome::empty()
                 } else {
                     IngestOutcome {
                         events: vec![],
-                        packets: resource_pkts
-                            .into_iter()
-                            .map(OutboundPacket::broadcast)
-                            .collect(),
+                        packets: resource_pkts,
                         rejection: None,
                     }
                 }
@@ -990,9 +969,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             {
                                 response_packets.push(pkt);
                             }
-                            for rpkt in self.transport.drain_resource_outbound() {
-                                response_packets.push(OutboundPacket::broadcast(rpkt));
-                            }
+                            response_packets.extend(self.drain_resource_outbound());
                         }
                     }
                 }
@@ -1012,9 +989,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.transport.tick_resources(now, rng);
 
         // Drain any resource outbound packets queued during ingest or tick_resources
-        for pkt in self.transport.drain_resource_outbound() {
-            packets.push(OutboundPacket::broadcast(pkt));
-        }
+        packets.extend(self.drain_resource_outbound());
 
         // Send keepalives BEFORE tick — tick may mark links Stale, which would
         // prevent build_keepalive_packet from working (it requires Active state).
@@ -1022,12 +997,16 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         // as 5s, which equals TICK_INTERVAL. Sending keepalives first ensures
         // they go out before the stale check.
         for ka in self.transport.build_pending_keepalives(now, rng) {
-            packets.push(OutboundPacket::broadcast(ka));
+            if let Some(outbound) = self.route_owned_link_raw(ka) {
+                packets.push(outbound);
+            }
         }
 
         // Channel retransmissions
         for retx in self.transport.pending_channel_retransmits(now, rng) {
-            packets.push(OutboundPacket::broadcast(retx));
+            if let Some(outbound) = self.route_owned_link_raw(retx) {
+                packets.push(outbound);
+            }
         }
 
         packets

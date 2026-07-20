@@ -118,6 +118,8 @@ pub enum SendError {
     LinkNotFound,
     /// Link exists but is not in Active state (still Pending/Handshake/Stale/Closed).
     LinkNotActive,
+    /// A locally owned Link packet has no authoritative runtime interface.
+    LinkInterfaceUnknown,
     /// Channel send window is full (back-pressure).
     WindowFull,
     /// The bounded DATA receipt table has no free entry.
@@ -143,6 +145,7 @@ impl core::fmt::Display for SendError {
             SendError::LinkTableFull => write!(f, "owned link table full"),
             SendError::LinkNotFound => write!(f, "link not found"),
             SendError::LinkNotActive => write!(f, "link not active"),
+            SendError::LinkInterfaceUnknown => write!(f, "link interface is not bound"),
             SendError::WindowFull => write!(f, "channel window full"),
             SendError::ReceiptTableFull => write!(f, "packet receipt table full"),
             SendError::ReceiptHashAlreadyTracked => {
@@ -999,6 +1002,28 @@ impl<S: TransportStorage> Transport<S> {
 
         self.stats.packets_received += 1;
 
+        // Python accepts Link DATA only on that Link's attached interface.
+        // Rete applies the same route-affinity hardening to Link-owned
+        // RESOURCE_PRF traffic as a fail-closed policy. Perform both checks
+        // before dedup admission so a packet observed on the wrong interface
+        // cannot poison the hash window and suppress a later copy from the
+        // authoritative interface. Ordinary delivery proofs remain globally
+        // validated; LRPROOF remains exempt until cryptographic validation
+        // establishes the initiator binding.
+        let is_owned_link_payload = pkt.packet_type == PacketType::Data
+            || (pkt.packet_type == PacketType::Proof && pkt.context == CONTEXT_RESOURCE_PRF);
+        if is_owned_link_payload && pkt.dest_type == DestType::Link {
+            let link_id = LinkId::from_slice(pkt.destination_hash);
+            if self
+                .links
+                .get(&link_id)
+                .is_some_and(|link| link.bound_interface != Some(iface))
+            {
+                self.stats.packets_dropped_invalid += 1;
+                return IngestResult::Invalid;
+            }
+        }
+
         // Compute packet hash for dedup
         let pkt_hash = pkt.compute_hash();
 
@@ -1357,7 +1382,7 @@ impl<S: TransportStorage> Transport<S> {
                     && pkt.dest_type == DestType::Link
                     && self.links.contains_key(&lid)
                 {
-                    return self.handle_lrproof(&lid, pkt.payload, now);
+                    return self.handle_lrproof(&lid, pkt.payload, now, iface);
                 }
 
                 // Check for RESOURCE_PRF (resource completion proof from receiver).
@@ -1573,7 +1598,7 @@ impl<S: TransportStorage> Transport<S> {
                         self.stats.packets_dropped_invalid += 1;
                         return IngestResult::Invalid;
                     }
-                    self.handle_link_request(raw, &dh, pkt.payload, now, rng, identity)
+                    self.handle_link_request(raw, &dh, pkt.payload, now, iface, rng, identity)
                 } else {
                     if h2_ownership == Header2Ownership::Own {
                         // Remote HEADER_2 LINKREQUEST/SINGLE was handled by
@@ -3022,6 +3047,200 @@ mod tests {
         assert!(link.is_active());
 
         (transport, link_id, responder_identity)
+    }
+
+    #[test]
+    fn responder_link_binds_linkrequest_ingress_interface() {
+        let now = 100;
+        let mut transport = TestTransport::new();
+        let responder = Identity::from_seed(b"bound-responder").unwrap();
+        let initiator = Identity::from_seed(b"bound-initiator").unwrap();
+        let dest_hash = rete_core::destination_hash("test.bound.responder", Some(&responder.hash()));
+        transport.add_local_destination(dest_hash);
+        let mut rng = rand_core::OsRng;
+        let (_, request_payload) =
+            Link::new_initiator(dest_hash, initiator.ed25519_pub(), &mut rng, now);
+        let (mut request, request_len) = build_h1_linkrequest(&dest_hash, &request_payload);
+        let link_id = compute_link_id(&request[..request_len]).unwrap();
+
+        assert!(matches!(
+            transport.ingest_on(
+                &mut request[..request_len],
+                now,
+                6,
+                &mut rng,
+                &responder,
+            ),
+            IngestResult::LinkRequestReceived { .. }
+        ));
+        assert_eq!(transport.link_interface(&link_id), Some(6));
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().bound_interface(),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn initiator_binds_only_valid_lrproof_ingress_and_never_migrates() {
+        let now = 200;
+        let mut transport = TestTransport::new();
+        let initiator = Identity::from_seed(b"proof-bound-initiator").unwrap();
+        let responder = Identity::from_seed(b"proof-bound-responder").unwrap();
+        let dest_hash =
+            rete_core::destination_hash("test.bound.initiator", Some(&responder.hash()));
+        transport.register_identity(dest_hash, responder.public_key(), now);
+        let mut learned = Path::direct(now);
+        learned.received_on = Some(7);
+        assert!(transport.insert_path(dest_hash, learned));
+        let mut rng = rand_core::OsRng;
+
+        let (request, link_id) = transport
+            .initiate_link(dest_hash, &initiator, &mut rng, now)
+            .unwrap();
+        assert_eq!(transport.link_interface(&link_id), None);
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().state,
+            crate::link::LinkState::Handshake
+        );
+
+        let request_payload = Packet::parse(&request).unwrap().payload;
+        let responder_link =
+            Link::from_request(link_id, request_payload, &mut rng, now).unwrap();
+        let proof_payload = responder_link.build_proof(&responder).unwrap();
+        let build_proof = |payload: &[u8]| {
+            let mut proof = [0u8; rete_core::MTU];
+            let len = PacketBuilder::new(&mut proof)
+                .packet_type(PacketType::Proof)
+                .dest_type(DestType::Link)
+                .destination_hash(link_id.as_ref())
+                .context(CONTEXT_LRPROOF)
+                .payload(payload)
+                .build()
+                .unwrap();
+            (proof, len)
+        };
+
+        let mut invalid_payload = proof_payload;
+        invalid_payload[0] ^= 0x80;
+        let (mut invalid, invalid_len) = build_proof(&invalid_payload);
+        assert!(matches!(
+            transport.ingest_on(
+                &mut invalid[..invalid_len],
+                now + 1,
+                4,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::Invalid
+        ));
+        let pending = transport.get_link(&link_id).unwrap();
+        assert_eq!(pending.state, crate::link::LinkState::Handshake);
+        assert_eq!(pending.bound_interface(), None);
+
+        let (mut valid, valid_len) = build_proof(&proof_payload);
+        assert!(matches!(
+            transport.ingest_on(
+                &mut valid[..valid_len],
+                now + 2,
+                9,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::LinkEstablished { .. }
+        ));
+        let active = transport.get_link(&link_id).unwrap();
+        assert!(active.is_active());
+        assert_eq!(active.bound_interface(), Some(9));
+
+        assert!(matches!(
+            transport.handle_lrproof(&link_id, &proof_payload, now + 3, 5),
+            IngestResult::Invalid
+        ));
+        let unchanged = transport.get_link(&link_id).unwrap();
+        assert!(unchanged.is_active());
+        assert_eq!(unchanged.bound_interface(), Some(9));
+    }
+
+    #[test]
+    fn owned_link_data_wrong_interface_does_not_poison_correct_copy() {
+        let now = 300;
+        let (mut transport, link_id, initiator) = make_transport_with_active_link(now);
+        let mut rng = rand_core::OsRng;
+        let mut data = transport
+            .build_link_data_packet(&link_id, b"authoritative interface", 0, &mut rng)
+            .unwrap();
+        let last_inbound = transport.get_link(&link_id).unwrap().last_inbound;
+
+        assert!(matches!(
+            transport.ingest_on(&mut data, now + 1, 7, &mut rng, &initiator),
+            IngestResult::Invalid
+        ));
+        assert_eq!(
+            transport.get_link(&link_id).unwrap().last_inbound,
+            last_inbound
+        );
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
+
+        assert!(matches!(
+            transport.ingest_on(&mut data, now + 2, 0, &mut rng, &initiator),
+            IngestResult::LinkData { data, .. } if data == b"authoritative interface"
+        ));
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
+    }
+
+    #[test]
+    fn resource_proof_wrong_interface_does_not_poison_correct_copy() {
+        let now = 400;
+        let (mut transport, link_id, initiator) = make_transport_with_active_link(now);
+        let mut rng = rand_core::OsRng;
+        transport
+            .start_resource(
+                &link_id,
+                b"resource proof route",
+                b"resource proof route",
+                false,
+                &mut rng,
+            )
+            .unwrap();
+        let resource = transport.resources.first().unwrap();
+        let resource_hash = resource.resource_hash;
+        let proof_payload = resource.build_proof();
+        let mut proof = [0u8; rete_core::MTU];
+        let proof_len = PacketBuilder::new(&mut proof)
+            .packet_type(PacketType::Proof)
+            .dest_type(DestType::Link)
+            .destination_hash(link_id.as_ref())
+            .context(rete_core::CONTEXT_RESOURCE_PRF)
+            .payload(&proof_payload)
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            transport.ingest_on(
+                &mut proof[..proof_len],
+                now + 1,
+                8,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::Invalid
+        ));
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
+
+        assert!(matches!(
+            transport.ingest_on(
+                &mut proof[..proof_len],
+                now + 2,
+                0,
+                &mut rng,
+                &initiator,
+            ),
+            IngestResult::ResourceComplete {
+                resource_hash: observed,
+                ..
+            } if observed == resource_hash[..TRUNCATED_HASH_LEN]
+        ));
+        assert_eq!(transport.stats().packets_dropped_dedup, 0);
     }
 
     #[test]

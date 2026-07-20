@@ -123,6 +123,16 @@ pub struct Link {
     pub stale_time: u64,
     /// Destination hash this link is associated with.
     pub destination_hash: DestHash,
+    /// Runtime interface selected for this locally owned Link.
+    ///
+    /// Initiators bind only from validated LRPROOF ingress. Responders bind to
+    /// the interface that supplied the LINKREQUEST. A learned path may select
+    /// the initial LINKREQUEST egress, but it is not authoritative Link state.
+    ///
+    /// This is an interface-slot index, not a hosted shared-instance client
+    /// identity. A Hub that multiplexes clients behind one slot therefore does
+    /// not gain Python's per-client interface isolation from this field.
+    pub(crate) bound_interface: Option<u8>,
     /// MTU signalling bytes (3 bytes: MTU + encryption mode).
     /// Included in LINKREQUEST and LRPROOF for protocol completeness.
     pub signalling: [u8; LINK_MTU_SIZE],
@@ -139,6 +149,11 @@ pub struct IdentifiedPeer {
 }
 
 impl Link {
+    /// Runtime interface bound to this locally owned Link, if established.
+    pub const fn bound_interface(&self) -> Option<u8> {
+        self.bound_interface
+    }
+
     /// Create a Link as responder from a received LINKREQUEST.
     ///
     /// Extracts the peer's keys, generates our ephemeral key, performs ECDH+HKDF,
@@ -223,6 +238,7 @@ impl Link {
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: DestHash::ZERO,
+            bound_interface: None,
             signalling: peer_signalling,
             channel: None,
             identified: None,
@@ -305,6 +321,7 @@ impl Link {
             keepalive_interval: KEEPALIVE_INTERVAL_SECS,
             stale_time: STALE_TIMEOUT_SECS,
             destination_hash: dest_hash,
+            bound_interface: None,
             signalling: sig_bytes,
             channel: None,
             identified: None,

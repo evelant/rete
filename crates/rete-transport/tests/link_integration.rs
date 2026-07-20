@@ -273,7 +273,7 @@ fn header2_owned_link_proof_and_data_reach_typed_dispatch() {
         .initiate_link(destination, &initiator, &mut rng, 100)
         .unwrap();
     let mut request = request;
-    let proof = match responder_transport.ingest(&mut request, 100, &mut rng, &responder) {
+    let proof = match responder_transport.ingest_on(&mut request, 100, 5, &mut rng, &responder) {
         IngestResult::LinkRequestReceived { proof_raw, .. } => proof_raw,
         other => panic!("expected local LINKREQUEST, got {other:?}"),
     };

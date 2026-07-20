@@ -35,6 +35,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         self.links.len()
     }
 
+    /// Runtime interface bound to a locally owned Link, if routing has
+    /// established one.
+    pub fn link_interface(&self, link_id: &LinkId) -> Option<u8> {
+        self.links.get(link_id).and_then(Link::bound_interface)
+    }
+
     /// Number of tracked channel receipts (pending channel ACKs).
     pub fn channel_receipt_count(&self) -> usize {
         self.channel_receipts.len()
@@ -215,6 +221,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         dest_hash: &DestHash,
         payload: &[u8],
         now: u64,
+        iface: u8,
         rng: &mut R,
         identity: &Identity,
     ) -> IngestResult<'a> {
@@ -237,6 +244,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             }
         };
         link.destination_hash = *dest_hash;
+        link.bound_interface = Some(iface);
 
         match self.admit_owned_link(link_id, link) {
             OwnedLinkAdmission::Inserted => {}
@@ -338,12 +346,23 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         link_id: &LinkId,
         proof_payload: &[u8],
         now: u64,
+        iface: u8,
     ) -> IngestResult<'a> {
         // Look up the initiator link
         let link = match self.links.get_mut(link_id) {
             Some(l) => l,
             None => return IngestResult::Invalid,
         };
+
+        // A proof can establish an initiator Link exactly once. In particular,
+        // a replay received after activation must never migrate the retained
+        // interface or reset the cryptographic state.
+        if link.role != crate::link::LinkRole::Initiator
+            || link.state != crate::link::LinkState::Handshake
+            || link.bound_interface.is_some()
+        {
+            return IngestResult::Invalid;
+        }
 
         // Need the destination identity to verify the proof
         let dest_hash = link.destination_hash;
@@ -366,6 +385,12 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             self.stats.crypto_failures += 1;
             return IngestResult::Invalid;
         }
+
+        // A cryptographically valid LRPROOF is authoritative evidence of the
+        // interface on which this Link is reachable. This confirms a learned
+        // path binding and repairs a stale/missing one without trusting an
+        // unauthenticated packet.
+        link.bound_interface = Some(iface);
 
         // Compute RTT: time since LINKREQUEST was sent (last_outbound was set at creation).
         // With u64-second timestamps, loopback RTT rounds to 0. Use a floor of 0.001s

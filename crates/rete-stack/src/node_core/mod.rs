@@ -134,6 +134,13 @@ pub enum PacketRouting {
     SourceInterface,
     /// Send only on one exact interface selected by Reticulum routing state.
     ExactInterface(u8),
+    /// Send locally owned, post-handshake Link traffic on its bound interface.
+    ///
+    /// Runtimes with shared multi-client interfaces may target the synchronous
+    /// ingress client when known. Without retained endpoint identity they must
+    /// still send on the bound interface, even if that means broadcasting to
+    /// every client sharing the interface.
+    BoundInterface(u8),
     /// Send on all interfaces except the source.
     AllExceptSource,
     /// Send on all interfaces.
@@ -643,6 +650,59 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         OutboundPacket::broadcast(raw)
     }
 
+    /// Return the authoritative route for an established locally owned Link.
+    ///
+    /// The initial LINKREQUEST is the sole broadcast-capable Link operation
+    /// and is routed separately from the learned path. Every subsequent Link
+    /// operation fails closed when handshake ingress has not established a
+    /// binding.
+    pub(super) fn owned_link_routing(
+        &self,
+        link_id: &LinkId,
+    ) -> Result<PacketRouting, SendError> {
+        self
+            .transport
+            .get_link(link_id)
+            .ok_or(SendError::LinkNotFound)?
+            .bound_interface()
+            .map(PacketRouting::BoundInterface)
+            .ok_or(SendError::LinkInterfaceUnknown)
+    }
+
+    /// Route a packet originated asynchronously by an established owned Link.
+    pub(super) fn owned_link_outbound(
+        &self,
+        link_id: &LinkId,
+        data: Vec<u8>,
+    ) -> Result<OutboundPacket, SendError> {
+        Ok(OutboundPacket {
+            data,
+            routing: self.owned_link_routing(link_id)?,
+        })
+    }
+
+    /// Recover the Link ID from an internally queued Link packet and apply its
+    /// retained interface binding. The transport's resource queue currently
+    /// exposes raw bytes; malformed, non-Link, missing-Link and unbound-Link
+    /// entries are invariant violations and fail closed.
+    pub(super) fn route_owned_link_raw(&self, data: Vec<u8>) -> Option<OutboundPacket> {
+        let link_id = Packet::parse(&data).ok().and_then(|packet| {
+            (packet.dest_type == DestType::Link)
+                .then(|| LinkId::from_slice(packet.destination_hash))
+        });
+        link_id.and_then(|link_id| self.owned_link_outbound(&link_id, data).ok())
+    }
+
+    /// Drain raw resource-control/data packets while preserving their owned
+    /// Link interface routing.
+    pub(super) fn drain_resource_outbound(&mut self) -> Vec<OutboundPacket> {
+        let packets = self.transport.drain_resource_outbound();
+        packets
+            .into_iter()
+            .filter_map(|packet| self.route_owned_link_raw(packet))
+            .collect()
+    }
+
     /// Build a proof OutboundPacket for a received packet hash, if possible.
     ///
     /// Uses `dest_type=Single` — for non-link (DATA) proofs only.
@@ -663,6 +723,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         link_id: &LinkId,
     ) -> Option<OutboundPacket> {
         Transport::<S>::build_link_proof_packet(&self.identity, packet_hash, link_id).map(|data| {
+            // This synchronous proof is attached to the authoritative ingress
+            // operation itself. Preserve SourceInterface provenance so callers
+            // can distinguish a generated delivery proof from a relayed proof.
             OutboundPacket {
                 data,
                 routing: PacketRouting::SourceInterface,
@@ -677,10 +740,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         data: &[u8],
         rng: &mut R,
     ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         let pkt =
             self.transport
                 .build_link_data_packet(link_id, data, rete_core::CONTEXT_NONE, rng)?;
-        Ok(OutboundPacket::broadcast(pkt))
+        Ok(OutboundPacket { data: pkt, routing })
     }
 
     /// Send a link.request() on an established link.
@@ -704,6 +768,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             return self.send_request_as_resource(link_id, &packed, now, rng);
         }
 
+        let routing = self.owned_link_routing(link_id)?;
         let pkt = self.transport.build_link_data_packet(
             link_id,
             &packed,
@@ -719,7 +784,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
         self.register_pending_request(req_id, *link_id, now, None);
 
-        Ok((OutboundPacket::broadcast(pkt), req_id))
+        Ok((OutboundPacket { data: pkt, routing }, req_id))
     }
 
     /// Send a large request as a resource transfer with `is_request=true`.
@@ -730,6 +795,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         now: u64,
         rng: &mut R,
     ) -> Result<(OutboundPacket, RequestId), SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         let req_id = rete_transport::request_id(packed);
         let (pkt, resource_hash) = self
             .transport
@@ -747,7 +813,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let mut rh = [0u8; TRUNCATED_HASH_LEN];
         rh.copy_from_slice(&resource_hash[..TRUNCATED_HASH_LEN]);
         self.register_pending_request(req_id, *link_id, now, Some(rh));
-        Ok((OutboundPacket::broadcast(pkt), req_id))
+        Ok((OutboundPacket { data: pkt, routing }, req_id))
     }
 
     /// Register a pending request for timeout tracking.
@@ -797,6 +863,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         data: &[u8],
         rng: &mut R,
     ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         let packed = rete_transport::build_response(request_id, data);
         let pkt = self.transport.build_link_data_packet(
             link_id,
@@ -804,7 +871,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             rete_core::CONTEXT_RESPONSE,
             rng,
         )?;
-        Ok(OutboundPacket::broadcast(pkt))
+        Ok(OutboundPacket { data: pkt, routing })
     }
 
     /// Get the link MDU for a given link.
@@ -836,6 +903,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         data: &[u8],
         rng: &mut R,
     ) -> Result<OutboundPacket, SendError> {
+        let routing = self.owned_link_routing(link_id)?;
         let packed = rete_transport::build_response(request_id, data);
         let (pkt, _resource_hash) = self
             .transport
@@ -851,7 +919,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 rng,
             )
             .ok_or(SendError::ResourceLimit)?;
-        Ok(OutboundPacket::broadcast(pkt))
+        Ok(OutboundPacket { data: pkt, routing })
     }
 
     /// Start a resource transfer on a link.
@@ -868,6 +936,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         use alloc::borrow::Cow;
         use rete_transport::resource::MAX_EFFICIENT_SIZE;
 
+        let routing = self.owned_link_routing(link_id)?;
+
         // For split resources (data > MAX_EFFICIENT_SIZE), skip whole-blob
         // compression. Each segment will be compressed independently by the
         // transport layer. Compressed data can't be split at arbitrary boundaries.
@@ -876,7 +946,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 .transport
                 .start_resource(link_id, data, data, false, rng)
                 .ok_or(SendError::ResourceLimit)?;
-            return Ok(OutboundPacket::broadcast(pkt));
+            return Ok(OutboundPacket { data: pkt, routing });
         }
 
         let compressed = self
@@ -894,7 +964,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             .transport
             .start_resource(link_id, &send_data, data, is_compressed, rng)
             .ok_or(SendError::ResourceLimit)?;
-        Ok(OutboundPacket::broadcast(pkt))
+        Ok(OutboundPacket { data: pkt, routing })
     }
 
     /// Accept a deferred resource offer (for AcceptApp strategy).
@@ -906,8 +976,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         resource_hash: &[u8; TRUNCATED_HASH_LEN],
         rng: &mut R,
     ) -> Vec<OutboundPacket> {
+        let Ok(routing) = self.owned_link_routing(link_id) else {
+            return Vec::new();
+        };
         match self.transport.accept_resource(link_id, resource_hash, rng) {
-            Some(pkt) => vec![OutboundPacket::broadcast(pkt)],
+            Some(pkt) => vec![OutboundPacket { data: pkt, routing }],
             None => Vec::new(),
         }
     }
@@ -921,8 +994,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         resource_hash: &[u8; TRUNCATED_HASH_LEN],
         rng: &mut R,
     ) -> Vec<OutboundPacket> {
+        let Ok(routing) = self.owned_link_routing(link_id) else {
+            return Vec::new();
+        };
         let packets = match self.transport.reject_resource(link_id, resource_hash, rng) {
-            Some(pkt) => vec![OutboundPacket::broadcast(pkt)],
+            Some(pkt) => vec![OutboundPacket { data: pkt, routing }],
             None => Vec::new(),
         };
         self.transport.cleanup_resources();
@@ -1721,6 +1797,17 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(has_lrrtt, "initiator should auto-send LRRTT after LRPROOF");
+        assert!(
+            init_outcome
+                .packets
+                .iter()
+                .filter(|packet| {
+                    Packet::parse(&packet.data)
+                        .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_LRRTT)
+                })
+                .all(|packet| packet.routing == PacketRouting::BoundInterface(0)),
+            "LRRTT must use the interface authenticated by LRPROOF ingress"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1733,6 +1820,12 @@ mod tests {
         let mut rng = rand::thread_rng();
         let dest_hash = DestHash::from([0xAA; TRUNCATED_HASH_LEN]);
 
+        let missing_link = LinkId::from([0x55; TRUNCATED_HASH_LEN]);
+        assert!(matches!(
+            core.send_link_data(&missing_link, b"missing", &mut rng),
+            Err(SendError::LinkNotFound)
+        ));
+
         let (outbound, link_id) = core
             .initiate_link(dest_hash, 100, &mut rng)
             .expect("should produce a link request");
@@ -1740,7 +1833,55 @@ mod tests {
         let parsed = Packet::parse(&outbound.data).unwrap();
         assert_eq!(parsed.packet_type, PacketType::LinkRequest);
         assert_eq!(outbound.routing, PacketRouting::All);
+        assert_eq!(
+            core.transport.get_link(&link_id).unwrap().bound_interface(),
+            None,
+            "an unknown-path initial request must not fabricate Link binding"
+        );
+        assert!(matches!(
+            core.send_link_data(&link_id, b"not established", &mut rng),
+            Err(SendError::LinkInterfaceUnknown)
+        ));
+        assert!(core.close_link(&link_id, &mut rng).0.is_none());
         assert!(core.transport.get_link(&link_id).is_some());
+    }
+
+    #[test]
+    fn initial_linkrequest_uses_path_but_valid_lrproof_authoritatively_binds_link() {
+        let mut rng = rand::thread_rng();
+        let mut responder = make_core(b"binding-responder");
+        let mut initiator = make_core(b"binding-initiator");
+        let responder_id = Identity::from_seed(b"binding-responder").unwrap();
+        initiator
+            .register_peer(&responder_id, "testapp", &["aspect1"], 100)
+            .unwrap();
+        let destination = *responder.dest_hash();
+        let mut path = rete_transport::Path::direct(100);
+        path.received_on = Some(7);
+        assert!(initiator.transport.insert_path(destination, path));
+
+        let (request, link_id) = initiator
+            .initiate_link(destination, 100, &mut rng)
+            .unwrap();
+        assert_eq!(request.routing, PacketRouting::ExactInterface(7));
+        assert_eq!(initiator.transport.link_interface(&link_id), None);
+
+        let response = responder.handle_ingest(&request.data, 101, 3, &mut rng);
+        assert_eq!(responder.transport.link_interface(&link_id), Some(3));
+        assert_eq!(response.packets.len(), 1);
+        assert_eq!(response.packets[0].routing, PacketRouting::SourceInterface);
+
+        let established = initiator.handle_ingest(&response.packets[0].data, 102, 9, &mut rng);
+        assert_eq!(initiator.transport.link_interface(&link_id), Some(9));
+        let lrrtt = established
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_LRRTT)
+            })
+            .expect("valid LRPROOF should produce LRRTT");
+        assert_eq!(lrrtt.routing, PacketRouting::BoundInterface(9));
     }
 
     #[test]
@@ -1778,6 +1919,14 @@ mod tests {
                 .unwrap_or(false)
         });
         assert!(has_keepalive, "tick should produce keepalive packet");
+        assert!(outcome
+            .packets
+            .iter()
+            .filter(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|parsed| parsed.context == rete_core::CONTEXT_KEEPALIVE)
+            })
+            .all(|packet| packet.routing == PacketRouting::BoundInterface(0)));
     }
 
     // -----------------------------------------------------------------------
@@ -1845,6 +1994,11 @@ mod tests {
             })
             .collect();
         assert_eq!(channel_pkts.len(), 1, "should retransmit one channel msg");
+        assert_eq!(
+            channel_pkts[0].routing,
+            PacketRouting::BoundInterface(0),
+            "channel retransmit must retain the Link interface"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1891,6 +2045,55 @@ mod tests {
             }
             other => panic!("expected ChannelMessages, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn established_owned_link_application_packets_use_bound_interface() {
+        let (mut initiator, _responder, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let bound = PacketRouting::BoundInterface(0);
+
+        let plain = initiator
+            .send_link_data(&link_id, b"plain", &mut rng)
+            .unwrap();
+        assert_eq!(plain.routing, bound);
+
+        let channel = initiator
+            .send_channel_message(&link_id, 0x44, b"channel", 200, &mut rng)
+            .unwrap();
+        assert_eq!(channel.routing, bound);
+
+        let stream = initiator
+            .send_stream_data(&link_id, 4, b"stream", false, 201, &mut rng)
+            .unwrap();
+        assert_eq!(stream.routing, bound);
+
+        let identify = initiator.link_identify(&link_id, &mut rng).unwrap();
+        assert_eq!(identify.routing, bound);
+
+        let (request, request_id) = initiator
+            .send_request(&link_id, "/route", b"request", 202, &mut rng)
+            .unwrap();
+        assert_eq!(request.routing, bound);
+
+        let response = initiator
+            .send_response(&link_id, &request_id, b"response", &mut rng)
+            .unwrap();
+        assert_eq!(response.routing, bound);
+
+        let resource = initiator
+            .start_resource(&link_id, b"resource", &mut rng)
+            .unwrap();
+        assert_eq!(resource.routing, bound);
+
+        let response_resource = initiator
+            .start_response_resource(&link_id, &request_id, &[0xA5; 600], &mut rng)
+            .unwrap();
+        assert_eq!(response_resource.routing, bound);
+
+        let (close, event) = initiator.close_link(&link_id, &mut rng);
+        assert_eq!(close.unwrap().routing, bound);
+        assert!(matches!(event, Some(NodeEvent::LinkClosed { .. })));
     }
 
     // -----------------------------------------------------------------------
@@ -2903,10 +3106,9 @@ mod tests {
         // transport_id = B's identity hash.
         let id_b = Identity::from_seed(b"relay-node-b").unwrap();
         let c_dest = *node_c.dest_hash();
-        node_a.transport.insert_path(
-            c_dest,
-            rete_transport::Path::via_repeater(id_b.hash(), 2, 100),
-        );
+        let mut a_to_c = rete_transport::Path::via_repeater(id_b.hash(), 2, 100);
+        a_to_c.received_on = Some(0);
+        node_a.transport.insert_path(c_dest, a_to_c);
 
         // -----------------------------------------------------------------
         // Step 4: B knows C's identity and has a direct path to C's dest.
@@ -2931,6 +3133,7 @@ mod tests {
             .initiate_link(c_dest, 100, &mut rng)
             .expect("A should produce LINKREQUEST");
         let lr_parsed = Packet::parse(&lr_outbound.data).unwrap();
+        assert_eq!(lr_outbound.routing, PacketRouting::ExactInterface(0));
         assert_eq!(
             lr_parsed.header_type,
             HeaderType::Header2,
@@ -3007,6 +3210,7 @@ mod tests {
                     .unwrap_or(false)
             })
             .expect("A should auto-send LRRTT after link establishment");
+        assert_eq!(lrrtt_pkt.routing, PacketRouting::BoundInterface(0));
 
         // 5f. Feed LRRTT to B → B forwards via link_table.
         let b_rtt_outcome = node_b.handle_ingest(&lrrtt_pkt.data, 104, 0, &mut rng);
@@ -3051,6 +3255,7 @@ mod tests {
         let a_ch_outbound = node_a
             .send_channel_message(&link_id, 0x42, b"relay-channel-test", 200, &mut rng)
             .expect("A should send channel message");
+        assert_eq!(a_ch_outbound.routing, PacketRouting::BoundInterface(0));
 
         // Feed channel message to B → B forwards via link_table
         let b_ch_outcome = node_b.handle_ingest(&a_ch_outbound.data, 200, 0, &mut rng);
@@ -3090,6 +3295,7 @@ mod tests {
         let c_reply_outbound = node_c
             .send_channel_message(&link_id, 0x43, b"relay-reply", 210, &mut rng)
             .expect("C should send channel message back");
+        assert_eq!(c_reply_outbound.routing, PacketRouting::BoundInterface(1));
 
         // Feed reply to B → B forwards via link_table
         let b_reply_outcome = node_b.handle_ingest(&c_reply_outbound.data, 210, 1, &mut rng);
@@ -3144,10 +3350,9 @@ mod tests {
             .register_peer(&id_a, "testapp", &["aspect1"], 100)
             .unwrap();
         let a_dest = *node_a.dest_hash();
-        node_c.transport.insert_path(
-            a_dest,
-            rete_transport::Path::via_repeater(id_b.hash(), 2, 100),
-        );
+        let mut c_to_a = rete_transport::Path::via_repeater(id_b.hash(), 2, 100);
+        c_to_a.received_on = Some(0);
+        node_c.transport.insert_path(a_dest, c_to_a);
 
         // B knows A's identity (for LINKREQUEST forwarding)
         node_b
@@ -3163,6 +3368,7 @@ mod tests {
         let (lr_outbound, link_id) = node_c
             .initiate_link(a_dest, 100, &mut rng)
             .expect("C should produce LINKREQUEST");
+        assert_eq!(lr_outbound.routing, PacketRouting::ExactInterface(0));
         assert_eq!(
             Packet::parse(&lr_outbound.data).unwrap().header_type,
             HeaderType::Header2,
@@ -4061,6 +4267,10 @@ mod tests {
             !outcome.packets.is_empty(),
             "AcceptAll should auto-accept (produce RESOURCE_REQ packets)"
         );
+        assert!(outcome
+            .packets
+            .iter()
+            .all(|packet| packet.routing == PacketRouting::BoundInterface(0)));
     }
 
     #[test]
@@ -4094,6 +4304,10 @@ mod tests {
             "packet should be RESOURCE_RCL, got context {}",
             pkt.context
         );
+        assert_eq!(
+            outcome.packets[0].routing,
+            PacketRouting::BoundInterface(0)
+        );
     }
 
     #[test]
@@ -4126,6 +4340,9 @@ mod tests {
             !packets.is_empty(),
             "explicit accept_resource should produce RESOURCE_REQ packets"
         );
+        assert!(packets
+            .iter()
+            .all(|packet| packet.routing == PacketRouting::BoundInterface(0)));
     }
 
     #[test]
@@ -4155,6 +4372,7 @@ mod tests {
             rete_core::CONTEXT_RESOURCE_RCL,
             "packet should be RESOURCE_RCL"
         );
+        assert_eq!(packets[0].routing, PacketRouting::BoundInterface(0));
     }
 
     #[test]
