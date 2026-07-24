@@ -186,6 +186,16 @@ impl Link {
         self.bound_interface
     }
 
+    /// Maximum plaintext size for one encrypted packet on this Link.
+    pub fn mdu(&self) -> usize {
+        let mtu = decode_mtu(&self.signalling) as usize;
+        if mtu == 0 {
+            LINK_MDU
+        } else {
+            compute_link_mdu(mtu)
+        }
+    }
+
     /// Hop count expected for this Link.
     ///
     /// A responder returns `None` until authenticated LRRTT establishes its

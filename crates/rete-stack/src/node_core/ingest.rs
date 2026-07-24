@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
-    DestType, Identity, LinkId, MTU, PacketBuilder, PacketType, PathHash, RequestId,
+    DestType, Identity, LinkId, MTU, Packet, PacketBuilder, PacketType, PathHash, RequestId,
     TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
@@ -132,6 +132,8 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
         let mut pkt_buf = [0u8; MTU];
         pkt_buf[..len].copy_from_slice(raw);
+        let inbound_packet_hash =
+            Packet::parse(&pkt_buf[..len]).ok().map(|packet| packet.compute_hash());
         let result = self
             .transport
             .ingest_on_with_receipt_sink_at(
@@ -146,7 +148,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
 
         match result {
             IngestResult::ProofReceived { .. } => Ok(IngestOutcome::empty()),
-            result => Ok(self.dispatch_ingest_result(result, now, link_now, rng)),
+            result => Ok(self.dispatch_ingest_result(
+                result,
+                inbound_packet_hash,
+                now,
+                link_now,
+                rng,
+            )),
         }
     }
 
@@ -158,10 +166,12 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         iface: u8,
         rng: &mut R,
     ) -> IngestOutcome {
+        let inbound_packet_hash =
+            Packet::parse(pkt_buf).ok().map(|packet| packet.compute_hash());
         let result = self
             .transport
             .ingest_on_at(pkt_buf, now, link_now, iface, rng, &self.identity);
-        self.dispatch_ingest_result(result, now, link_now, rng)
+        self.dispatch_ingest_result(result, inbound_packet_hash, now, link_now, rng)
     }
 
     fn link_closed_outcome(
@@ -194,6 +204,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
     fn dispatch_ingest_result<R: RngCore + CryptoRng>(
         &mut self,
         result: IngestResult<'_>,
+        inbound_packet_hash: Option<[u8; 32]>,
         now: u64,
         link_now: rete_core::MonotonicInstant,
         rng: &mut R,
@@ -445,7 +456,19 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         data,
                         context,
                     }],
-                    packets: Vec::new(),
+                    // Python-compatible ordinary Link DATA is proven with an
+                    // explicit Link-destination proof. Other Link contexts
+                    // retain their existing protocol-specific behavior.
+                    packets: if context == rete_core::CONTEXT_NONE {
+                        inbound_packet_hash
+                            .and_then(|packet_hash| {
+                                self.link_proof_outbound(&packet_hash, &link_id)
+                            })
+                            .into_iter()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     rejection: None,
                 }
             }
@@ -1157,11 +1180,11 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         packets
     }
 
-    /// Periodic maintenance with allocation-atomic DATA receipt failures.
+    /// Periodic maintenance with allocation-atomic receipt failures.
     ///
-    /// DATA receipt failure terminals are committed to `sink`; they are not
+    /// DATA and Link DATA failure terminals are committed to `sink`; they are not
     /// also duplicated as [`NodeEvent::ReceiptFailed`] values. If the sink is
-    /// full, affected DATA receipts remain outstanding and
+    /// full, affected receipts remain outstanding and
     /// [`ReceiptSinkTickOutcome::receipt_notifications_deferred`] is set.
     /// Channel receipt expiry remains internal and emits no failure terminal.
     pub fn handle_tick_with_receipt_sink<R, T>(
@@ -1211,6 +1234,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 rejection: None,
             },
             failed_receipts: result.failed_receipts,
+            failed_link_data_receipts: result.failed_link_data_receipts,
             receipt_notifications_deferred: result.receipt_notifications_deferred,
         }
     }
@@ -1236,6 +1260,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let mut events = self.check_request_timeouts(now);
 
         for packet_hash in result.failed_receipts {
+            events.push(NodeEvent::ReceiptFailed { packet_hash });
+        }
+        for packet_hash in result.failed_link_data_receipts {
             events.push(NodeEvent::ReceiptFailed { packet_hash });
         }
 

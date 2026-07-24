@@ -6,10 +6,10 @@ use crate::storage::StorageMap;
 use rand_core::{CryptoRng, RngCore};
 use rete_core::{
     DestHash, DestType, Identity, LinkId, MonotonicInstant, PacketBuilder, PacketType, CONTEXT_CHANNEL,
-    CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_REQUEST,
-    CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_HMU, CONTEXT_RESOURCE_ICL,
-    CONTEXT_RESOURCE_PRF, CONTEXT_RESOURCE_RCL, CONTEXT_RESOURCE_REQ, CONTEXT_RESPONSE, Packet,
-    TRUNCATED_HASH_LEN,
+    CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_NONE,
+    CONTEXT_REQUEST, CONTEXT_RESOURCE, CONTEXT_RESOURCE_ADV, CONTEXT_RESOURCE_HMU,
+    CONTEXT_RESOURCE_ICL, CONTEXT_RESOURCE_PRF, CONTEXT_RESOURCE_RCL, CONTEXT_RESOURCE_REQ,
+    CONTEXT_RESPONSE, Packet, TRUNCATED_HASH_LEN,
 };
 
 use super::{
@@ -153,7 +153,10 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         self.channel_receipts.len()
     }
 
-    /// Remove a locally owned Link and every proof receipt tied to it.
+    /// Remove a locally owned Link and its internal channel proof receipts.
+    ///
+    /// Application-visible ordinary Link DATA receipts remain until receipt
+    /// maintenance can reserve and commit their deterministic failure events.
     fn remove_owned_link(&mut self, link_id: &LinkId) -> Option<Link> {
         let removed = self.links.remove(link_id);
         if removed.is_some() {
@@ -295,6 +298,73 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             return Err(SendError::LinkNotActive);
         }
         Self::build_link_packet(link, link_id, plaintext, context, rng)
+    }
+
+    /// Prepare ordinary context-NONE Link DATA into caller-owned storage and
+    /// transactionally register its explicit delivery-proof receipt.
+    ///
+    /// Output size, Link state and binding, negotiated MDU, and bounded receipt
+    /// capacity are all checked before encryption consumes entropy. On success,
+    /// the returned complete packet hash identifies the registered receipt.
+    /// A registration collision can only be known after encryption; it leaves
+    /// all transport tables unchanged and the caller must discard the output.
+    pub fn prepare_link_data_packet_into<R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        plaintext: &[u8],
+        rng: &mut R,
+        now: u64,
+        timeout: u64,
+        output: &mut [u8],
+    ) -> Result<(usize, [u8; 32]), SendError> {
+        if output.len() < rete_core::MTU {
+            return Err(SendError::PacketBuild(
+                rete_core::Error::BufferTooSmall,
+            ));
+        }
+        let link = self.links.get(link_id).ok_or(SendError::LinkNotFound)?;
+        if !link.is_active() {
+            return Err(SendError::LinkNotActive);
+        }
+        if link.bound_interface().is_none() {
+            return Err(SendError::LinkInterfaceUnknown);
+        }
+        if plaintext.len() > link.mdu() {
+            return Err(SendError::PacketBuild(
+                rete_core::Error::PayloadTooLarge,
+            ));
+        }
+        if self.link_data_receipts.is_full() {
+            return Err(SendError::ReceiptTableFull);
+        }
+        let peer_ed25519_pub = link.peer_ed25519_pub;
+        let packet_len = Self::build_link_packet_into(
+            link,
+            link_id,
+            plaintext,
+            CONTEXT_NONE,
+            rng,
+            output,
+        )?;
+        let packet_hash = Packet::parse(&output[..packet_len])
+            .map_err(SendError::PacketBuild)?
+            .compute_hash();
+        self.register_link_data_receipt(
+            packet_hash,
+            *link_id,
+            peer_ed25519_pub,
+            now,
+            timeout,
+        )
+        .map_err(|error| match error {
+            crate::receipt::ReceiptRegistrationError::TableFull => {
+                SendError::ReceiptTableFull
+            }
+            crate::receipt::ReceiptRegistrationError::HashAlreadyTracked => {
+                SendError::ReceiptHashAlreadyTracked
+            }
+        })?;
+        Ok((packet_len, packet_hash))
     }
 
     /// Build an LRRTT packet from an already encoded payload.

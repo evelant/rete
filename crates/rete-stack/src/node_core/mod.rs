@@ -256,6 +256,39 @@ pub struct PreparedDataPacketRef<'a> {
     pub receipt: ReceiptToken,
 }
 
+/// Stable correlation token for an ordinary Link DATA delivery receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LinkDataReceiptToken {
+    packet_hash: [u8; 32],
+}
+
+impl LinkDataReceiptToken {
+    /// Complete packet hash covered by the expected explicit Link proof.
+    pub const fn packet_hash(&self) -> &[u8; 32] {
+        &self.packet_hash
+    }
+}
+
+/// Owned ordinary Link DATA packet and its registered receipt token.
+#[derive(Debug, Clone)]
+pub struct PreparedLinkDataPacket {
+    /// Packet bytes and authoritative bound-interface routing.
+    pub outbound: OutboundPacket,
+    /// Token used to correlate proof delivery, cancellation, or failure.
+    pub receipt: LinkDataReceiptToken,
+}
+
+/// Caller-owned ordinary Link DATA packet and registered receipt token.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreparedLinkDataPacketRef<'a> {
+    /// Complete Reticulum packet bytes in caller-owned storage.
+    pub data: &'a [u8],
+    /// Authoritative route captured before receipt registration.
+    pub routing: PacketRouting,
+    /// Token used to correlate proof delivery, cancellation, or failure.
+    pub receipt: LinkDataReceiptToken,
+}
+
 // ---------------------------------------------------------------------------
 // IngestOutcome
 // ---------------------------------------------------------------------------
@@ -310,8 +343,8 @@ pub struct IngestOutcome {
     pub rejection: Option<IngestRejection>,
 }
 
-/// Result of periodic maintenance when DATA receipt terminals are written to
-/// a caller-reserved sink.
+/// Result of periodic maintenance when receipt terminals are written to a
+/// caller-reserved sink.
 #[derive(Debug)]
 #[must_use = "receipt failure notifications may have been deferred"]
 pub struct ReceiptSinkTickOutcome {
@@ -319,7 +352,9 @@ pub struct ReceiptSinkTickOutcome {
     pub outcome: IngestOutcome,
     /// Number of DATA receipt-failure terminals committed to the sink.
     pub failed_receipts: usize,
-    /// At least one expired DATA receipt remains because the sink was full.
+    /// Number of Link DATA receipt-failure terminals committed to the sink.
+    pub failed_link_data_receipts: usize,
+    /// At least one failed DATA or Link DATA receipt remains because the sink was full.
     pub receipt_notifications_deferred: bool,
 }
 
@@ -834,6 +869,89 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             self.transport
                 .build_link_data_packet(link_id, data, rete_core::CONTEXT_NONE, rng)?;
         Ok(OutboundPacket::new(pkt, routing))
+    }
+
+    /// Prepare ordinary context-NONE Link DATA into caller-owned storage and
+    /// transactionally register its delivery receipt.
+    ///
+    /// This is the reliable counterpart to [`Self::send_link_data`]. Output,
+    /// bound routing, active Link state, negotiated MDU, and receipt capacity
+    /// are preflighted before encryption. On success the packet and receipt are
+    /// committed together; the caller can dispatch `data` using `routing`.
+    pub fn prepare_link_data_packet_into<'packet, R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        data: &[u8],
+        rng: &mut R,
+        now: u64,
+        output: &'packet mut [u8],
+    ) -> Result<PreparedLinkDataPacketRef<'packet>, SendError> {
+        if output.len() < MTU {
+            return Err(SendError::PacketBuild(
+                rete_core::Error::BufferTooSmall,
+            ));
+        }
+        let routing = self.owned_link_routing(link_id)?;
+        let (packet_len, packet_hash) = self.transport.prepare_link_data_packet_into(
+            link_id,
+            data,
+            rng,
+            now,
+            RECEIPT_TIMEOUT,
+            output,
+        )?;
+        Ok(PreparedLinkDataPacketRef {
+            data: &output[..packet_len],
+            routing,
+            receipt: LinkDataReceiptToken { packet_hash },
+        })
+    }
+
+    /// Prepare owned ordinary context-NONE Link DATA and register its receipt.
+    ///
+    /// The complete packet allocation is reserved before protocol state is
+    /// touched. Embedded runtimes with a pre-reserved outbox should prefer
+    /// [`Self::prepare_link_data_packet_into`].
+    pub fn prepare_link_data_packet<R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        data: &[u8],
+        rng: &mut R,
+        now: u64,
+    ) -> Result<PreparedLinkDataPacket, SendError> {
+        let mut packet = Vec::new();
+        packet
+            .try_reserve_exact(MTU)
+            .map_err(|_| SendError::OutputAllocationFailed)?;
+        packet.resize(MTU, 0);
+        let prepared =
+            self.prepare_link_data_packet_into(link_id, data, rng, now, &mut packet)?;
+        let packet_len = prepared.data.len();
+        let routing = prepared.routing;
+        let receipt = prepared.receipt;
+        packet.truncate(packet_len);
+        Ok(PreparedLinkDataPacket {
+            outbound: OutboundPacket::new(packet, routing),
+            receipt,
+        })
+    }
+
+    /// Cancel an outstanding ordinary Link DATA receipt.
+    pub fn cancel_link_data_receipt(&mut self, receipt: LinkDataReceiptToken) -> bool {
+        self.transport
+            .cancel_link_data_receipt(receipt.packet_hash())
+    }
+
+    /// Current status of an outstanding ordinary Link DATA receipt.
+    ///
+    /// Delivered, canceled, timed-out, and Link-closed receipts have already
+    /// been reclaimed and return `None`.
+    pub fn link_data_receipt_status(
+        &self,
+        receipt: LinkDataReceiptToken,
+    ) -> Option<rete_transport::ReceiptStatus> {
+        self.transport
+            .link_data_receipt_status(receipt.packet_hash())
     }
 
     /// Send a link.request() on an established link.
@@ -2787,6 +2905,348 @@ mod tests {
         let (close, event) = initiator.close_link(&link_id, &mut rng);
         assert_eq!(close.unwrap().routing, bound);
         assert!(matches!(event, Some(NodeEvent::LinkClosed { .. })));
+    }
+
+    #[test]
+    fn ordinary_link_data_receipt_round_trip_is_canonical_and_bound() {
+        let (mut initiator, mut responder, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let prepared = initiator
+            .prepare_link_data_packet(&link_id, b"direct payload", &mut rng, 200)
+            .unwrap();
+        let packet_hash = *prepared.receipt.packet_hash();
+
+        assert_eq!(
+            prepared.outbound.routing,
+            PacketRouting::BoundInterface(0)
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 1);
+        assert_eq!(
+            initiator.link_data_receipt_status(prepared.receipt),
+            Some(rete_transport::ReceiptStatus::Sent)
+        );
+
+        let received =
+            responder.handle_ingest(&prepared.outbound.data, 200, 0, &mut rng);
+        assert!(matches!(
+            received.events.first(),
+            Some(NodeEvent::LinkData {
+                link_id: received_link,
+                data,
+                context: rete_core::CONTEXT_NONE,
+            }) if *received_link == link_id && data == b"direct payload"
+        ));
+        let proof = received
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+            })
+            .expect("ordinary Link DATA must produce an explicit proof");
+        assert_eq!(proof.routing, PacketRouting::SourceInterface);
+        let parsed_proof = Packet::parse(&proof.data).unwrap();
+        assert_eq!(parsed_proof.dest_type, DestType::Link);
+        assert_eq!(parsed_proof.destination_hash, link_id.as_ref());
+        assert_eq!(parsed_proof.context, rete_core::CONTEXT_NONE);
+        assert_eq!(parsed_proof.payload.len(), 96);
+        assert_eq!(&parsed_proof.payload[..32], &packet_hash);
+
+        let mut sink = RecordingReceiptSink::default();
+        let delivered = initiator
+            .handle_ingest_with_receipt_sink(
+                &proof.data,
+                201,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+        assert!(delivered.events.is_empty());
+        assert!(delivered.packets.is_empty());
+        assert_eq!(
+            sink.candidates,
+            vec![rete_transport::ReceiptCandidate::link_data(packet_hash)]
+        );
+        assert_eq!(
+            sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Delivered(packet_hash)]
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+        assert_eq!(initiator.link_data_receipt_status(prepared.receipt), None);
+    }
+
+    #[test]
+    fn ordinary_link_data_wrong_link_hash_and_signature_are_ignored() {
+        let (mut initiator, _responder, link_id) = two_core_handshake();
+        let responder_identity = Identity::from_seed(b"resp-core").unwrap();
+        let wrong_identity = Identity::from_seed(b"wrong-link-proof-signer").unwrap();
+        let wrong_link = LinkId::from([0x5a; TRUNCATED_HASH_LEN]);
+        let wrong_hash = [0x7b; 32];
+        let mut rng = rand::thread_rng();
+        let prepared = initiator
+            .prepare_link_data_packet(&link_id, b"strict proof", &mut rng, 200)
+            .unwrap();
+        let packet_hash = *prepared.receipt.packet_hash();
+        let mut sink = RecordingReceiptSink::default();
+
+        let wrong_link_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(&responder_identity, &packet_hash, &wrong_link)
+        .unwrap();
+        initiator
+            .handle_ingest_with_receipt_sink(
+                &wrong_link_proof,
+                201,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+
+        let wrong_hash_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(&responder_identity, &wrong_hash, &link_id)
+        .unwrap();
+        initiator
+            .handle_ingest_with_receipt_sink(
+                &wrong_hash_proof,
+                202,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+
+        let wrong_signature_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(&wrong_identity, &packet_hash, &link_id)
+        .unwrap();
+        initiator
+            .handle_ingest_with_receipt_sink(
+                &wrong_signature_proof,
+                203,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+
+        assert_eq!(initiator.transport.link_data_receipt_count(), 1);
+        assert_eq!(
+            sink.candidates,
+            vec![rete_transport::ReceiptCandidate::link_data(packet_hash)]
+        );
+        assert!(sink.terminals.is_empty());
+
+        let valid_proof = rete_transport::Transport::<
+            rete_transport::HeaplessStorage<64, 16, 128, 4>,
+        >::build_link_proof_packet(&responder_identity, &packet_hash, &link_id)
+        .unwrap();
+        initiator
+            .handle_ingest_with_receipt_sink(
+                &valid_proof,
+                204,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.candidates,
+            vec![
+                rete_transport::ReceiptCandidate::link_data(packet_hash),
+                rete_transport::ReceiptCandidate::link_data(packet_hash),
+            ]
+        );
+        assert_eq!(
+            sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Delivered(packet_hash)]
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_link_data_proof_waits_for_terminal_sink_capacity() {
+        let (mut initiator, mut responder, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let prepared = initiator
+            .prepare_link_data_packet(&link_id, b"retry proof", &mut rng, 200)
+            .unwrap();
+        let packet_hash = *prepared.receipt.packet_hash();
+        let received =
+            responder.handle_ingest(&prepared.outbound.data, 200, 0, &mut rng);
+        let proof = received
+            .packets
+            .iter()
+            .find(|packet| {
+                Packet::parse(&packet.data)
+                    .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
+            })
+            .unwrap();
+
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::new();
+        assert!(matches!(
+            initiator.handle_ingest_with_receipt_sink(
+                &proof.data,
+                201,
+                0,
+                &mut rng,
+                &mut full_sink,
+            ),
+            Err(rete_transport::ReceiptSinkFull)
+        ));
+        assert_eq!(initiator.transport.link_data_receipt_count(), 1);
+
+        let mut sink = RecordingReceiptSink::default();
+        initiator
+            .handle_ingest_with_receipt_sink(
+                &proof.data,
+                202,
+                0,
+                &mut rng,
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(
+            sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Delivered(packet_hash)]
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_link_data_timeout_cancel_and_close_are_terminal() {
+        let (mut initiator, _responder, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let canceled = initiator
+            .prepare_link_data_packet(&link_id, b"cancel", &mut rng, 200)
+            .unwrap();
+        assert!(initiator.cancel_link_data_receipt(canceled.receipt));
+        assert!(!initiator.cancel_link_data_receipt(canceled.receipt));
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+
+        let timed_out = initiator
+            .prepare_link_data_packet(&link_id, b"timeout", &mut rng, 300)
+            .unwrap();
+        let timed_out_hash = *timed_out.receipt.packet_hash();
+        let mut sink = RecordingReceiptSink::default();
+        let before =
+            initiator.handle_tick_with_receipt_sink(330, &mut rng, &mut sink);
+        assert_eq!(before.failed_link_data_receipts, 0);
+        assert_eq!(initiator.transport.link_data_receipt_count(), 1);
+        let expired =
+            initiator.handle_tick_with_receipt_sink(331, &mut rng, &mut sink);
+        assert_eq!(expired.failed_link_data_receipts, 1);
+        assert_eq!(
+            sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Failed(timed_out_hash)]
+        );
+
+        let link_closed = initiator
+            .prepare_link_data_packet(&link_id, b"close", &mut rng, 400)
+            .unwrap();
+        let link_closed_hash = *link_closed.receipt.packet_hash();
+        assert!(initiator.close_link(&link_id, &mut rng).0.is_some());
+        let mut full_sink = rete_transport::FixedReceiptTerminalSink::<0>::new();
+        let deferred =
+            initiator.handle_tick_with_receipt_sink(400, &mut rng, &mut full_sink);
+        assert_eq!(deferred.failed_link_data_receipts, 0);
+        assert!(deferred.receipt_notifications_deferred);
+        assert_eq!(initiator.transport.link_data_receipt_count(), 1);
+
+        let mut close_sink = RecordingReceiptSink::default();
+        let failed =
+            initiator.handle_tick_with_receipt_sink(400, &mut rng, &mut close_sink);
+        assert_eq!(failed.failed_link_data_receipts, 1);
+        assert_eq!(
+            close_sink.candidates,
+            vec![rete_transport::ReceiptCandidate::link_data(
+                link_closed_hash
+            )]
+        );
+        assert_eq!(
+            close_sink.terminals,
+            vec![rete_transport::ReceiptTerminal::Failed(link_closed_hash)]
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+    }
+
+    #[test]
+    fn ordinary_link_data_preflight_is_mutation_atomic() {
+        let (mut initiator, _responder, link_id) = two_core_handshake();
+        let mut short_output = [0u8; MTU - 1];
+        assert_eq!(
+            initiator.prepare_link_data_packet_into(
+                &link_id,
+                b"short output",
+                &mut PanicRng,
+                200,
+                &mut short_output,
+            ),
+            Err(SendError::PacketBuild(rete_core::Error::BufferTooSmall))
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+
+        let oversized = [0u8; rete_transport::LINK_MDU + 1];
+        let mut output = [0u8; MTU];
+        assert_eq!(
+            initiator.prepare_link_data_packet_into(
+                &link_id,
+                &oversized,
+                &mut PanicRng,
+                200,
+                &mut output,
+            ),
+            Err(SendError::PacketBuild(rete_core::Error::PayloadTooLarge))
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 0);
+
+        let mut pending = make_core(b"pending-link-data");
+        let responder_identity = Identity::from_seed(b"pending-link-peer").unwrap();
+        let pending_peer = make_core(b"pending-link-peer");
+        pending
+            .register_peer(
+                &responder_identity,
+                "testapp",
+                &["aspect1"],
+                200,
+            )
+            .unwrap();
+        let (_, pending_link) = pending
+            .initiate_link(*pending_peer.dest_hash(), 200, &mut rand::thread_rng())
+            .unwrap();
+        assert_eq!(
+            pending.prepare_link_data_packet_into(
+                &pending_link,
+                b"unbound",
+                &mut PanicRng,
+                200,
+                &mut output,
+            ),
+            Err(SendError::LinkInterfaceUnknown)
+        );
+        assert_eq!(pending.transport.link_data_receipt_count(), 0);
+
+        let mut rng = rand::thread_rng();
+        for index in 0..64u8 {
+            initiator
+                .prepare_link_data_packet(&link_id, &[index], &mut rng, 300)
+                .unwrap();
+        }
+        assert_eq!(initiator.transport.link_data_receipt_count(), 64);
+        assert_eq!(
+            initiator.prepare_link_data_packet_into(
+                &link_id,
+                b"table full",
+                &mut PanicRng,
+                300,
+                &mut output,
+            ),
+            Err(SendError::ReceiptTableFull)
+        );
+        assert_eq!(initiator.transport.link_data_receipt_count(), 64);
     }
 
     // -----------------------------------------------------------------------

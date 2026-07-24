@@ -32,8 +32,8 @@ pub(self) fn hex_short(h: &[u8]) -> alloc::string::String {
 use crate::dedup::DedupWindow;
 use crate::link::{compute_link_id, is_valid_link_request_payload_len};
 use crate::receipt::{
-    ReceiptCandidate, ReceiptSinkFull, ReceiptTable, ReceiptTerminal, ReceiptTerminalReservation,
-    ReceiptTerminalSink,
+    LinkDataReceiptTable, ReceiptCandidate, ReceiptSinkFull, ReceiptTable, ReceiptTerminal,
+    ReceiptTerminalReservation, ReceiptTerminalSink,
 };
 use crate::resource::Resource;
 use crate::storage::{StorageMap, TransportStorage};
@@ -125,7 +125,7 @@ pub enum SendError {
     LinkInterfaceUnknown,
     /// Channel send window is full (back-pressure).
     WindowFull,
-    /// The bounded DATA or channel receipt table has no free entry.
+    /// A bounded DATA, Link DATA, or channel receipt table has no free entry.
     ReceiptTableFull,
     /// Another outstanding receipt already uses this packet's truncated hash.
     ReceiptHashAlreadyTracked,
@@ -578,12 +578,14 @@ pub struct TickResult {
     pub closed_links: usize,
     /// Full hashes of receipts that newly timed out during this tick.
     pub failed_receipts: Vec<[u8; 32]>,
+    /// Full hashes of Link DATA receipts that timed out or lost their Link.
+    pub failed_link_data_receipts: Vec<[u8; 32]>,
 }
 
 /// Allocation-free result of periodic transport maintenance.
 ///
-/// DATA receipt failures are committed to the caller's reserved sink before
-/// their receipt-table entries are removed. Channel-receipt expiry remains
+/// DATA and Link DATA receipt failures are committed to the caller's reserved
+/// sink before their receipt-table entries are removed. Channel-receipt expiry remains
 /// internal and does not emit a [`ReceiptTerminal::Failed`] notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "timed-out receipt notifications may have been deferred"]
@@ -594,7 +596,9 @@ pub struct TickSummary {
     pub closed_links: usize,
     /// Number of DATA receipt-failure notifications committed to the sink.
     pub failed_receipts: usize,
-    /// At least one expired DATA receipt remains because the sink was full.
+    /// Number of Link DATA receipt-failure notifications committed to the sink.
+    pub failed_link_data_receipts: usize,
+    /// At least one failed DATA or Link DATA receipt remains because the sink was full.
     pub receipt_notifications_deferred: bool,
 }
 
@@ -673,6 +677,8 @@ pub struct Transport<S: TransportStorage> {
     pub(super) links: S::LinkMap,
     /// Receipts for sent packets, awaiting delivery proofs.
     pub(super) receipts: ReceiptTable<S::ReceiptMap>,
+    /// Receipts for ordinary context-NONE DATA sent on owned Links.
+    pub(super) link_data_receipts: LinkDataReceiptTable<S::LinkDataReceiptMap>,
     /// Receipts for channel messages: truncated packet hash → ChannelReceipt.
     /// Used to match incoming PROOFs to channel sequences and call mark_delivered().
     pub(super) channel_receipts: S::ChannelReceiptMap,
@@ -743,6 +749,7 @@ impl<S: TransportStorage> Transport<S> {
             local_destinations: Default::default(),
             links: Default::default(),
             receipts: Default::default(),
+            link_data_receipts: Default::default(),
             channel_receipts: Default::default(),
             resources: alloc::vec::Vec::new(),
             resource_outbound: alloc::vec::Vec::new(),
@@ -947,6 +954,23 @@ impl<S: TransportStorage> Transport<S> {
                 if receipt.link_id == link_id && receipt.packet_hash == packet_hash {
                     return Some(ReceiptCandidate::channel(receipt.packet_hash));
                 }
+            }
+        }
+
+        // Ordinary Link DATA receipts also use explicit Link-destination
+        // proofs, but are independent of channel sequencing and retry state.
+        // Match the exact Link ID and complete covered hash retained at send
+        // time. A removed Link is terminally failed by maintenance instead of
+        // accepting a proof after closure.
+        if packet.dest_type == DestType::Link
+            && packet.context == CONTEXT_NONE
+            && self.links.contains_key(&link_id)
+        {
+            if let Some(receipt) = self
+                .link_data_receipts
+                .proof_candidate(&link_id, packet.payload)
+            {
+                return Some(ReceiptCandidate::link_data(receipt.packet_hash));
             }
         }
 
@@ -1579,6 +1603,23 @@ impl<S: TransportStorage> Transport<S> {
                     }
                 }
 
+                // Validate ordinary context-NONE Link DATA proofs against the
+                // peer signing key captured with the receipt at send time.
+                // The canonical proof is explicit and addressed to its Link.
+                if pkt.dest_type == DestType::Link
+                    && pkt.context == CONTEXT_NONE
+                    && self.links.contains_key(&lid)
+                {
+                    if let Some(packet_hash) =
+                        self.link_data_receipts.validate_proof(&lid, pkt.payload)
+                    {
+                        if let Some(link) = self.links.get_mut(&lid) {
+                            link.touch_inbound_at(link_now);
+                        }
+                        return IngestResult::ProofReceived { packet_hash };
+                    }
+                }
+
                 // Check receipt table for ordinary DATA delivery proofs after
                 // Link-typed channel proofs have been disambiguated.
                 if let Some(packet_hash) = self.receipts.validate_proof(&raw_dh, pkt.payload) {
@@ -1873,8 +1914,8 @@ impl<S: TransportStorage> Transport<S> {
         (expired_count, closed_count)
     }
 
-    /// Expire old paths, reverse entries, stale links, and DATA receipts into
-    /// a caller-reserved terminal sink.
+    /// Expire old paths, reverse entries, stale links, and delivery receipts
+    /// into a caller-reserved terminal sink.
     ///
     /// A DATA receipt remains tracked when the sink cannot reserve its
     /// notification slot. The caller can drain the sink and retry a later tick
@@ -1895,14 +1936,25 @@ impl<S: TransportStorage> Transport<S> {
         link_now: MonotonicInstant,
         sink: &mut T,
     ) -> TickSummary {
-        let receipts = self.receipts.tick_into(now, sink);
         let (expired_paths, closed_links) = self.tick_non_receipts(now, link_now);
+        let receipts = self.receipts.tick_into(now, sink);
+        let link_data_receipts = if receipts.deferred {
+            crate::receipt::ReceiptTickSummary {
+                emitted: 0,
+                deferred: true,
+            }
+        } else {
+            let links = &self.links;
+            self.link_data_receipts
+                .tick_into(now, sink, |link_id| links.contains_key(link_id))
+        };
 
         TickSummary {
             expired_paths,
             closed_links,
             failed_receipts: receipts.emitted,
-            receipt_notifications_deferred: receipts.deferred,
+            failed_link_data_receipts: link_data_receipts.emitted,
+            receipt_notifications_deferred: receipts.deferred || link_data_receipts.deferred,
         }
     }
 
@@ -1918,13 +1970,18 @@ impl<S: TransportStorage> Transport<S> {
 
     /// Precise Link-clock variant of [`Self::tick`].
     pub fn tick_at(&mut self, now: u64, link_now: MonotonicInstant) -> TickResult {
-        let failed_receipts = self.receipts.tick(now);
         let (expired_paths, closed_links) = self.tick_non_receipts(now, link_now);
+        let failed_receipts = self.receipts.tick(now);
+        let links = &self.links;
+        let failed_link_data_receipts = self
+            .link_data_receipts
+            .tick(now, |link_id| links.contains_key(link_id));
 
         TickResult {
             expired_paths,
             closed_links,
             failed_receipts,
+            failed_link_data_receipts,
         }
     }
 }

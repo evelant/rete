@@ -11,9 +11,9 @@ extern crate alloc;
 
 use crate::storage::StorageMap;
 use alloc::vec::Vec;
-use rete_core::{Identity, TRUNCATED_HASH_LEN};
+use rete_core::{Identity, LinkId, TRUNCATED_HASH_LEN};
 
-/// Terminal state for a DATA delivery receipt or a proven channel delivery.
+/// Terminal state for a DATA, Link DATA, or proven channel delivery.
 ///
 /// Channel proof success produces [`Self::Delivered`]. Channel receipt timeout
 /// is currently maintained separately and does not produce [`Self::Failed`].
@@ -42,6 +42,8 @@ impl ReceiptTerminal {
 pub enum ReceiptKind {
     /// A receipt registered for an outbound Reticulum DATA packet.
     Data,
+    /// A receipt registered for ordinary context-NONE DATA on an owned Link.
+    LinkData,
     /// A receipt registered for an outbound channel message.
     Channel,
 }
@@ -73,6 +75,14 @@ impl ReceiptCandidate {
     pub const fn channel(packet_hash: [u8; 32]) -> Self {
         Self {
             kind: ReceiptKind::Channel,
+            packet_hash,
+        }
+    }
+
+    /// Construct a candidate for an outbound ordinary Link DATA receipt.
+    pub const fn link_data(packet_hash: [u8; 32]) -> Self {
+        Self {
+            kind: ReceiptKind::LinkData,
             packet_hash,
         }
     }
@@ -206,12 +216,12 @@ impl<const N: usize> ReceiptTerminalReservation for FixedReceiptTerminalReservat
     }
 }
 
-/// Allocation-free outcome of one DATA-receipt timeout scan.
+/// Allocation-free outcome of one receipt-failure scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptTickSummary {
-    /// DATA terminal failures committed to the supplied sink.
+    /// Terminal failures committed to the supplied sink.
     pub emitted: usize,
-    /// At least one expired DATA receipt remains because the sink was full.
+    /// At least one failed receipt remains because the sink was full.
     pub deferred: bool,
 }
 
@@ -249,6 +259,267 @@ pub struct PacketReceipt {
     pub sent_at: u64,
     /// Timeout in seconds (0 = no timeout).
     pub timeout: u64,
+}
+
+/// A receipt for ordinary context-NONE DATA sent on an established Link.
+///
+/// Link proofs address the Link ID, not the truncated packet hash used by
+/// ordinary DATA receipts. The explicit proof payload carries the complete
+/// packet hash and is signed by the peer's Link signing key, so all three
+/// values are retained until the receipt reaches a terminal state.
+#[derive(Debug, Clone)]
+pub struct LinkDataReceipt {
+    /// Full 32-byte packet hash covered by the expected explicit proof.
+    pub packet_hash: [u8; 32],
+    /// Link ID required in the proof packet destination field.
+    pub link_id: LinkId,
+    /// Peer's Ed25519 Link signing key captured from the authenticated handshake.
+    pub peer_ed25519_pub: [u8; 32],
+    /// Current receipt status.
+    pub status: ReceiptStatus,
+    /// Monotonic timestamp when the packet was sent.
+    pub sent_at: u64,
+    /// Timeout in seconds (0 = no timeout).
+    pub timeout: u64,
+}
+
+/// Outstanding ordinary Link DATA receipts keyed by truncated packet hash.
+///
+/// The truncated key only selects a candidate. Every proof and cancellation
+/// also has to match the complete hash retained in [`LinkDataReceipt`].
+pub struct LinkDataReceiptTable<
+    M: StorageMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt>,
+> {
+    entries: M,
+}
+
+impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt>> Default
+    for LinkDataReceiptTable<M>
+{
+    fn default() -> Self {
+        Self {
+            entries: M::default(),
+        }
+    }
+}
+
+impl<M: StorageMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt>> LinkDataReceiptTable<M> {
+    fn key(packet_hash: &[u8; 32]) -> [u8; TRUNCATED_HASH_LEN] {
+        packet_hash[..TRUNCATED_HASH_LEN]
+            .try_into()
+            .expect("truncated packet hash length is fixed")
+    }
+
+    /// Whether the backing map cannot admit another receipt.
+    pub fn is_full(&self) -> bool {
+        self.entries.is_full()
+    }
+
+    /// Register one ordinary Link DATA receipt without replacing a collision.
+    pub fn register(
+        &mut self,
+        packet_hash: [u8; 32],
+        link_id: LinkId,
+        peer_ed25519_pub: [u8; 32],
+        now: u64,
+        timeout: u64,
+    ) -> Result<(), ReceiptRegistrationError> {
+        let key = Self::key(&packet_hash);
+        if self.entries.contains_key(&key) {
+            return Err(ReceiptRegistrationError::HashAlreadyTracked);
+        }
+        if self.entries.is_full() {
+            return Err(ReceiptRegistrationError::TableFull);
+        }
+
+        let receipt = LinkDataReceipt {
+            packet_hash,
+            link_id,
+            peer_ed25519_pub,
+            status: ReceiptStatus::Sent,
+            sent_at: now,
+            timeout,
+        };
+        self.entries
+            .insert(key, receipt)
+            .map(|_| ())
+            .map_err(|_| ReceiptRegistrationError::TableFull)
+    }
+
+    /// Number of tracked Link DATA receipts.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no Link DATA receipts are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Current status for an outstanding receipt with this complete hash.
+    pub fn status(&self, packet_hash: &[u8; 32]) -> Option<ReceiptStatus> {
+        let receipt = self.entries.get(&Self::key(packet_hash))?;
+        (receipt.packet_hash == *packet_hash).then_some(receipt.status)
+    }
+
+    /// Look up the exact candidate selected by a canonical explicit Link proof.
+    ///
+    /// Canonical proofs are exactly `packet_hash[32] || signature[64]`.
+    pub fn proof_candidate(
+        &self,
+        link_id: &LinkId,
+        proof_payload: &[u8],
+    ) -> Option<&LinkDataReceipt> {
+        if proof_payload.len() != 96 {
+            return None;
+        }
+        let packet_hash: [u8; 32] = proof_payload[..32].try_into().ok()?;
+        self.entries
+            .get(&Self::key(&packet_hash))
+            .filter(|receipt| {
+                receipt.status == ReceiptStatus::Sent
+                    && receipt.link_id == *link_id
+                    && receipt.packet_hash == packet_hash
+            })
+    }
+
+    /// Validate and atomically reclaim a canonical explicit Link proof.
+    pub fn validate_proof(
+        &mut self,
+        link_id: &LinkId,
+        proof_payload: &[u8],
+    ) -> Option<[u8; 32]> {
+        let receipt = self.proof_candidate(link_id, proof_payload)?;
+        let packet_hash = receipt.packet_hash;
+        Identity::verify_raw_ed25519(
+            &receipt.peer_ed25519_pub,
+            &packet_hash,
+            &proof_payload[32..],
+        )
+        .ok()?;
+
+        let key = Self::key(&packet_hash);
+        let removed = self.entries.remove(&key);
+        debug_assert!(matches!(
+            removed,
+            Some(receipt)
+                if receipt.packet_hash == packet_hash && receipt.link_id == *link_id
+        ));
+        Some(packet_hash)
+    }
+
+    /// Cancel an outstanding Link DATA receipt by its complete packet hash.
+    pub fn remove_full(&mut self, packet_hash: &[u8; 32]) -> bool {
+        let key = Self::key(packet_hash);
+        if !matches!(
+            self.entries.get(&key),
+            Some(receipt) if receipt.packet_hash == *packet_hash
+        ) {
+            return false;
+        }
+        self.entries.remove(&key).is_some()
+    }
+
+    /// Fail receipts whose timeout elapsed or whose owned Link no longer exists.
+    ///
+    /// Each sink slot is reserved before the corresponding receipt is removed.
+    /// A full sink leaves that receipt intact for a later retry.
+    pub fn tick_into<T, F>(
+        &mut self,
+        now: u64,
+        sink: &mut T,
+        mut link_exists: F,
+    ) -> ReceiptTickSummary
+    where
+        T: ReceiptTerminalSink,
+        F: FnMut(&LinkId) -> bool,
+    {
+        let mut emitted = 0;
+        loop {
+            let failed = self.entries.iter().find_map(|(key, receipt)| {
+                (receipt.status == ReceiptStatus::Sent
+                    && (!link_exists(&receipt.link_id)
+                        || (receipt.timeout > 0
+                            && now.saturating_sub(receipt.sent_at) > receipt.timeout)))
+                .then_some((*key, receipt.packet_hash))
+            });
+            let Some((key, packet_hash)) = failed else {
+                return ReceiptTickSummary {
+                    emitted,
+                    deferred: false,
+                };
+            };
+            let reservation = match sink.try_reserve(ReceiptCandidate::link_data(packet_hash)) {
+                Ok(reservation) => reservation,
+                Err(ReceiptSinkFull) => {
+                    return ReceiptTickSummary {
+                        emitted,
+                        deferred: true,
+                    };
+                }
+            };
+            let removed = self.entries.remove(&key);
+            debug_assert!(matches!(
+                removed,
+                Some(receipt) if receipt.packet_hash == packet_hash
+            ));
+            reservation.commit(ReceiptTerminal::Failed(packet_hash));
+            emitted += 1;
+        }
+    }
+
+    /// Expire Link DATA receipts into an owned list of complete packet hashes.
+    pub fn tick<F>(&mut self, now: u64, link_exists: F) -> Vec<[u8; 32]>
+    where
+        F: FnMut(&LinkId) -> bool,
+    {
+        let mut failed = Vec::new();
+        failed.reserve_exact(self.entries.len());
+        let mut sink = LinkDataFailedHashVecSink {
+            hashes: &mut failed,
+        };
+        let summary = self.tick_into(now, &mut sink, link_exists);
+        debug_assert!(!summary.deferred);
+        failed
+    }
+}
+
+struct LinkDataFailedHashVecSink<'a> {
+    hashes: &'a mut Vec<[u8; 32]>,
+}
+
+struct LinkDataFailedHashVecReservation<'a> {
+    hashes: &'a mut Vec<[u8; 32]>,
+    candidate: ReceiptCandidate,
+}
+
+impl ReceiptTerminalSink for LinkDataFailedHashVecSink<'_> {
+    type Reservation<'a>
+        = LinkDataFailedHashVecReservation<'a>
+    where
+        Self: 'a;
+
+    fn try_reserve(
+        &mut self,
+        candidate: ReceiptCandidate,
+    ) -> Result<Self::Reservation<'_>, ReceiptSinkFull> {
+        debug_assert!(self.hashes.len() < self.hashes.capacity());
+        debug_assert_eq!(candidate.kind, ReceiptKind::LinkData);
+        Ok(LinkDataFailedHashVecReservation {
+            hashes: self.hashes,
+            candidate,
+        })
+    }
+}
+
+impl ReceiptTerminalReservation for LinkDataFailedHashVecReservation<'_> {
+    fn commit(self, terminal: ReceiptTerminal) {
+        let ReceiptTerminal::Failed(packet_hash) = terminal else {
+            unreachable!("Link DATA timeout scan cannot deliver a receipt")
+        };
+        assert_eq!(packet_hash, self.candidate.packet_hash);
+        self.hashes.push(packet_hash);
+    }
 }
 
 /// Table of outstanding packet receipts.
@@ -508,6 +779,8 @@ mod tests {
 
     type TestTable = ReceiptTable<FnvIndexMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt, 16>>;
     type SmallTable = ReceiptTable<FnvIndexMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt, 4>>;
+    type LinkDataTestTable =
+        LinkDataReceiptTable<FnvIndexMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt, 4>>;
 
     fn make_test_identity() -> Identity {
         Identity::from_seed(b"receipt-test-identity").unwrap()
@@ -809,6 +1082,46 @@ mod tests {
             .unwrap();
         assert_eq!(table.tick(131), vec![timed_out_hash]);
         assert_eq!(table.status(&timed_out_hash), None);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn link_data_receipt_requires_canonical_explicit_proof() {
+        let mut table = LinkDataTestTable::default();
+        let signer = make_test_identity();
+        let wrong_signer = Identity::from_seed(b"wrong-link-data-proof").unwrap();
+        let link_id = LinkId::from([0x21; TRUNCATED_HASH_LEN]);
+        let wrong_link = LinkId::from([0x22; TRUNCATED_HASH_LEN]);
+        let packet_hash = [0x31; 32];
+        table
+            .register(
+                packet_hash,
+                link_id,
+                *signer.ed25519_pub(),
+                100,
+                30,
+            )
+            .unwrap();
+
+        let mut proof = [0u8; 96];
+        proof[..32].copy_from_slice(&packet_hash);
+        proof[32..].copy_from_slice(&wrong_signer.sign(&packet_hash).unwrap());
+        assert!(table.proof_candidate(&link_id, &proof).is_some());
+        assert_eq!(table.validate_proof(&link_id, &proof), None);
+        assert_eq!(table.status(&packet_hash), Some(ReceiptStatus::Sent));
+
+        proof[32..].copy_from_slice(&signer.sign(&packet_hash).unwrap());
+        assert!(table.proof_candidate(&wrong_link, &proof).is_none());
+        let mut wrong_hash = proof;
+        wrong_hash[0] ^= 0xff;
+        assert!(table.proof_candidate(&link_id, &wrong_hash).is_none());
+        let mut noncanonical = proof.to_vec();
+        noncanonical.push(0);
+        assert!(table.proof_candidate(&link_id, &noncanonical).is_none());
+        assert_eq!(
+            table.validate_proof(&link_id, &proof),
+            Some(packet_hash)
+        );
         assert!(table.is_empty());
     }
 }

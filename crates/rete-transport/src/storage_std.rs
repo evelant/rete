@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use crate::announce::PendingAnnounce;
 use crate::link::Link;
 use crate::path::Path;
-use crate::receipt::PacketReceipt;
+use crate::receipt::{LinkDataReceipt, PacketReceipt};
 use crate::storage::{
     StorageDeque, StorageMap, TransportStorage,
 };
@@ -92,6 +92,7 @@ impl TransportStorage for StdStorage {
 
     type ReverseMap = HashMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry>;
     type ReceiptMap = HashMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>;
+    type LinkDataReceiptMap = HashMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt>;
 
     type LinkMap = HashMap<LinkId, Link>;
     type ChannelReceiptMap = HashMap<[u8; TRUNCATED_HASH_LEN], ChannelReceipt>;

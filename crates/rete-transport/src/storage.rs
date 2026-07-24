@@ -8,7 +8,7 @@
 
 use crate::announce::PendingAnnounce;
 use crate::link::Link;
-use crate::receipt::PacketReceipt;
+use crate::receipt::{LinkDataReceipt, PacketReceipt};
 use crate::transport::{AnnounceRateEntry, ChannelReceipt, LinkTableEntry, ReverseEntry};
 use crate::path::Path;
 use rete_core::{DestHash, LinkId, TRUNCATED_HASH_LEN};
@@ -91,6 +91,7 @@ pub trait TransportStorage: Default {
     // --- PATH-capacity maps (keyed by truncated packet hash) ---
     type ReverseMap: StorageMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry>;
     type ReceiptMap: StorageMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>;
+    type LinkDataReceiptMap: StorageMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt>;
 
     // --- LINK-capacity maps ---
     type LinkMap: StorageMap<LinkId, Link>;
@@ -141,6 +142,8 @@ impl<const P: usize, const A: usize, const D: usize, const L: usize> TransportSt
 
     type ReverseMap = FnvIndexMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry, P>;
     type ReceiptMap = FnvIndexMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt, P>;
+    type LinkDataReceiptMap =
+        FnvIndexMap<[u8; TRUNCATED_HASH_LEN], LinkDataReceipt, P>;
 
     type LinkMap = FnvIndexMap<LinkId, Link, L>;
     type ChannelReceiptMap = FnvIndexMap<[u8; TRUNCATED_HASH_LEN], ChannelReceipt, L>;

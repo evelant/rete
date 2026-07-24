@@ -317,9 +317,10 @@ pub use node_core::request_receipt::{PendingRequest, RequestStatus};
 #[cfg(feature = "alloc")]
 pub use node_core::{
     EmbeddedNodeCore, IngestOutcome, IngestRejection, NodeCore, NodeHooks, NodeStats,
-    OutboundPacket, PacketRouting, PreparedDataPacket, PreparedDataPacketRef,
-    ReceiptSinkTickOutcome, ReceiptToken, RequestCallback, RequestContext, RequestHandler,
-    RequestPolicy, ResponseCompressionPolicy, handler_fn,
+    LinkDataReceiptToken, OutboundPacket, PacketRouting, PreparedDataPacket,
+    PreparedDataPacketRef, PreparedLinkDataPacket, PreparedLinkDataPacketRef,
+    ReceiptSinkTickOutcome, ReceiptToken, RequestCallback, RequestContext,
+    RequestHandler, RequestPolicy, ResponseCompressionPolicy, handler_fn,
 };
 
 #[cfg(feature = "alloc")]

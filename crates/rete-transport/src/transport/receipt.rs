@@ -45,6 +45,47 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         self.receipts.remove_full(packet_hash)
     }
 
+    /// Register a receipt for ordinary context-NONE DATA sent on an owned Link.
+    pub(crate) fn register_link_data_receipt(
+        &mut self,
+        packet_hash: [u8; 32],
+        link_id: LinkId,
+        peer_ed25519_pub: [u8; 32],
+        now: u64,
+        timeout: u64,
+    ) -> Result<(), ReceiptRegistrationError> {
+        self.link_data_receipts.register(
+            packet_hash,
+            link_id,
+            peer_ed25519_pub,
+            now,
+            timeout,
+        )
+    }
+
+    /// Whether the Link DATA receipt table cannot admit another packet.
+    pub fn link_data_receipt_table_is_full(&self) -> bool {
+        self.link_data_receipts.is_full()
+    }
+
+    /// Number of tracked ordinary Link DATA receipts.
+    pub fn link_data_receipt_count(&self) -> usize {
+        self.link_data_receipts.len()
+    }
+
+    /// Current status for an outstanding ordinary Link DATA receipt.
+    pub fn link_data_receipt_status(
+        &self,
+        packet_hash: &[u8; 32],
+    ) -> Option<ReceiptStatus> {
+        self.link_data_receipts.status(packet_hash)
+    }
+
+    /// Cancel an outstanding ordinary Link DATA receipt by complete hash.
+    pub fn cancel_link_data_receipt(&mut self, packet_hash: &[u8; 32]) -> bool {
+        self.link_data_receipts.remove_full(packet_hash)
+    }
+
     // -----------------------------------------------------------------------
     // Proof packet construction
     // -----------------------------------------------------------------------
