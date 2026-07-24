@@ -450,16 +450,33 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                         }
                     }
                 }
-                IngestOutcome {
-                    events: vec![NodeEvent::LinkData {
-                        link_id,
-                        data,
-                        context,
-                    }],
-                    // Python-compatible ordinary Link DATA is proven with an
-                    // explicit Link-destination proof. Other Link contexts
-                    // retain their existing protocol-specific behavior.
-                    packets: if context == rete_core::CONTEXT_NONE {
+                // Python applies the receiving destination's proof policy to
+                // ordinary Link DATA. Receipt registration is local sender
+                // state and is deliberately not visible on wire.
+                let packets = if context == rete_core::CONTEXT_NONE {
+                    let should_prove = self
+                        .transport
+                        .get_link(&link_id)
+                        .and_then(|link| {
+                            self.get_destination(&link.destination_hash)
+                                .map(|destination| {
+                                    (link.destination_hash, destination.proof_strategy)
+                                })
+                        })
+                        .is_some_and(|(destination_hash, proof_strategy)| {
+                            match proof_strategy {
+                                ProofStrategy::ProveAll => true,
+                                ProofStrategy::ProveApp => {
+                                    self.hooks.as_ref().is_some_and(|hooks| {
+                                        inbound_packet_hash.is_some_and(|packet_hash| {
+                                            hooks.prove_app(&destination_hash, &packet_hash, &data)
+                                        })
+                                    })
+                                }
+                                ProofStrategy::ProveNone => false,
+                            }
+                        });
+                    if should_prove {
                         inbound_packet_hash
                             .and_then(|packet_hash| {
                                 self.link_proof_outbound(&packet_hash, &link_id)
@@ -468,7 +485,17 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                             .collect()
                     } else {
                         Vec::new()
-                    },
+                    }
+                } else {
+                    Vec::new()
+                };
+                IngestOutcome {
+                    events: vec![NodeEvent::LinkData {
+                        link_id,
+                        data,
+                        context,
+                    }],
+                    packets,
                     rejection: None,
                 }
             }

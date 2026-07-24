@@ -2908,8 +2908,33 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_link_data_respects_default_prove_none_policy() {
+        let (initiator, mut responder, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let outbound = initiator
+            .send_link_data(&link_id, b"best effort", &mut rng)
+            .unwrap();
+
+        let received = responder.handle_ingest(&outbound.data, 200, 0, &mut rng);
+
+        assert!(matches!(
+            received.events.as_slice(),
+            [NodeEvent::LinkData {
+                link_id: received_link,
+                data,
+                context: rete_core::CONTEXT_NONE,
+            }] if *received_link == link_id && data == b"best effort"
+        ));
+        assert!(
+            received.packets.is_empty(),
+            "default ProveNone must not emit a Link DATA proof"
+        );
+    }
+
+    #[test]
     fn ordinary_link_data_receipt_round_trip_is_canonical_and_bound() {
         let (mut initiator, mut responder, link_id) = two_core_handshake();
+        responder.set_proof_strategy(ProofStrategy::ProveAll);
         let mut rng = rand::thread_rng();
         let prepared = initiator
             .prepare_link_data_packet(&link_id, b"direct payload", &mut rng, 200)
@@ -2943,7 +2968,7 @@ mod tests {
                 Packet::parse(&packet.data)
                     .is_ok_and(|packet| packet.packet_type == PacketType::Proof)
             })
-            .expect("ordinary Link DATA must produce an explicit proof");
+            .expect("ProveAll ordinary Link DATA must produce an explicit proof");
         assert_eq!(proof.routing, PacketRouting::SourceInterface);
         let parsed_proof = Packet::parse(&proof.data).unwrap();
         assert_eq!(parsed_proof.dest_type, DestType::Link);
@@ -3069,6 +3094,7 @@ mod tests {
     #[test]
     fn ordinary_link_data_proof_waits_for_terminal_sink_capacity() {
         let (mut initiator, mut responder, link_id) = two_core_handshake();
+        responder.set_proof_strategy(ProofStrategy::ProveAll);
         let mut rng = rand::thread_rng();
         let prepared = initiator
             .prepare_link_data_packet(&link_id, b"retry proof", &mut rng, 200)
