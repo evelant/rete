@@ -282,7 +282,7 @@ pub enum NodeEvent {
     Tick {
         /// Number of paths expired.
         expired_paths: usize,
-        /// Number of links closed due to staleness.
+        /// Number of links closed by establishment or stale-session maintenance.
         closed_links: usize,
     },
 }

@@ -7,8 +7,9 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use core::num::NonZeroU64;
 use rete_core::{
     DestHash, DestType, HeaderType, Identity, IdentityHash, LinkId, MonotonicDuration,
-    Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE, CONTEXT_LRPROOF,
-    CONTEXT_LRRTT, CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
+    MonotonicInstant, Packet, PacketBuilder, PacketType, CONTEXT_KEEPALIVE, CONTEXT_LINKCLOSE,
+    CONTEXT_LRPROOF, CONTEXT_LRRTT, CONTEXT_NONE, MTU, TRANSPORT_TYPE_TRANSPORT,
+    TRUNCATED_HASH_LEN,
 };
 use rete_transport::{
     compute_link_id, HeaplessStorage, IngestResult, Link, LinkRole, LinkState, LinkTableKind,
@@ -466,6 +467,98 @@ fn precise_lrrtt_lifecycle_uses_confirmed_edges_and_updates_once() {
 }
 
 #[test]
+fn responder_handshake_timeout_uses_post_ingress_hops_and_confirmed_proof_completion() {
+    let mut rng = rand::thread_rng();
+    let (mut responder, responder_id, responder_dest) =
+        make_responder(b"responder-timeout-confirmed-origin");
+    let initiator_id = Identity::from_seed(b"responder-timeout-confirmed-initiator").unwrap();
+    let origin = MonotonicInstant::from_micros(100_250_000);
+    let mut request = build_link_request(&responder_dest, &initiator_id, &mut rng);
+    request[1] = 2;
+
+    let link_id = match responder.ingest_on_at(
+        &mut request,
+        origin.as_secs(),
+        origin,
+        7,
+        &mut rng,
+        &responder_id,
+    ) {
+        IngestResult::LinkRequestReceived { link_id, .. } => link_id,
+        other => panic!("expected responder request admission, got {other:?}"),
+    };
+    let timeout = MonotonicDuration::from_secs(378);
+    let pending = responder.get_link(&link_id).unwrap();
+    assert_eq!(pending.request_started_at(), origin);
+    assert!(!pending.request_time_confirmed());
+
+    let token = NonZeroU64::new(0x51).unwrap();
+    assert!(responder.assign_link_protocol_token(
+        &link_id,
+        LinkRole::Responder,
+        token,
+    ));
+    let proof_started = origin + MonotonicDuration::from_secs(9);
+    let proof_completed = origin + MonotonicDuration::from_secs(10);
+    assert!(responder.confirm_link_protocol_dispatch(
+        token,
+        7,
+        proof_started,
+        proof_completed,
+    ));
+    assert_eq!(
+        responder.get_link(&link_id).unwrap().request_started_at(),
+        proof_completed
+    );
+
+    // Confirmation moves the origin: the old provisional deadline must not
+    // reclaim a Link whose LRPROOF actually completed later.
+    let provisional_deadline = origin + timeout;
+    assert_eq!(
+        responder
+            .tick_at(provisional_deadline.as_secs(), provisional_deadline)
+            .closed_links,
+        0
+    );
+    assert!(responder.get_link(&link_id).is_some());
+
+    let confirmed_deadline = proof_completed + timeout;
+    assert_eq!(
+        responder
+            .tick_at(
+                confirmed_deadline.as_secs(),
+                confirmed_deadline - MonotonicDuration::from_micros(1),
+            )
+            .closed_links,
+        0
+    );
+    let failed_before = responder.stats().links_failed;
+    let closed_before = responder.stats().links_closed;
+    assert_eq!(
+        responder
+            .tick_at(confirmed_deadline.as_secs(), confirmed_deadline)
+            .closed_links,
+        1
+    );
+    assert!(responder.get_link(&link_id).is_none());
+    assert_eq!(responder.stats().links_failed, failed_before);
+    assert_eq!(responder.stats().links_closed, closed_before + 1);
+
+    // Removal is atomic and cannot be counted twice on later maintenance.
+    assert_eq!(
+        responder
+            .tick_at(
+                confirmed_deadline.as_secs() + 1,
+                confirmed_deadline + MonotonicDuration::from_secs(1),
+            )
+            .closed_links,
+        0
+    );
+    assert_eq!(responder.stats().links_failed, failed_before);
+    assert_eq!(responder.stats().links_closed, closed_before + 1);
+}
+
+#[test]
 fn unconfirmed_protocol_edges_use_provisional_time_and_cannot_confirm_after_activation() {
     let mut rng = rand::thread_rng();
     let (mut responder, responder_id, responder_dest) =
@@ -850,6 +943,41 @@ fn lrrtt_activates_responder_link() {
     let resp_link = resp_t.get_link(&link_id).unwrap();
     assert_eq!(resp_link.state, LinkState::Active);
     assert_eq!(resp_link.expected_hops(), Some(1));
+}
+
+#[test]
+fn authenticated_lrrtt_hands_lifecycle_to_the_active_stale_watchdog() {
+    let (init_t, _init_id, mut resp_t, resp_id, link_id) = full_handshake();
+    let mut rng = rand::thread_rng();
+
+    // A large authenticated RTT reaches Python's 360-second keepalive ceiling,
+    // making the active stale window longer than the old handshake deadline.
+    let mut lrrtt = init_t
+        .build_lrrtt_packet_for_rtt(&link_id, 400.0, &mut rng)
+        .unwrap();
+    assert!(matches!(
+        resp_t.ingest(&mut lrrtt, 102, &mut rng, &resp_id),
+        IngestResult::LinkEstablished { link_id: observed } if observed == link_id
+    ));
+    let active = resp_t.get_link(&link_id).unwrap();
+    assert_eq!(active.state, LinkState::Active);
+    assert_eq!(active.stale_time, MonotonicDuration::from_secs(720));
+
+    let failed_before = resp_t.stats().links_failed;
+    let closed_before = resp_t.stats().links_closed;
+    let former_handshake_deadline = MonotonicInstant::from_secs(466);
+    assert_eq!(
+        resp_t
+            .tick_at(
+                former_handshake_deadline.as_secs(),
+                former_handshake_deadline,
+            )
+            .closed_links,
+        0
+    );
+    assert_eq!(resp_t.get_link(&link_id).unwrap().state, LinkState::Active);
+    assert_eq!(resp_t.stats().links_failed, failed_before);
+    assert_eq!(resp_t.stats().links_closed, closed_before);
 }
 
 #[test]
@@ -1765,6 +1893,94 @@ fn inbound_link_table_full_emits_no_proof() {
     assert_eq!(transport.stats().packets_dropped_dedup, 0);
     assert_eq!(transport.stats().links_failed, 0);
     assert_eq!(transport.stats().crypto_failures, 0);
+}
+
+#[test]
+fn timed_out_responder_handshakes_recover_bounded_link_capacity() {
+    let (mut transport, responder, destination) =
+        make_bounded_responder::<4>(b"inbound-timeout-capacity");
+    let mut rng = StdRng::seed_from_u64(0xBAD5_EED);
+    let origin = MonotonicInstant::from_micros(200_500_000);
+    let timeout = MonotonicDuration::from_secs(366);
+    let mut retained_ids = Vec::new();
+
+    for index in 0u8..4 {
+        let initiator = Identity::from_seed(&[index + 1; 32]).unwrap();
+        let mut request = build_link_request(&destination, &initiator, &mut rng);
+        match transport.ingest_on_at(
+            &mut request,
+            origin.as_secs(),
+            origin,
+            3,
+            &mut rng,
+            &responder,
+        ) {
+            IngestResult::LinkRequestReceived { link_id, proof_raw } => {
+                assert!(!proof_raw.is_empty());
+                retained_ids.push(link_id);
+            }
+            other => panic!("expected retained LINKREQUEST, got {other:?}"),
+        }
+    }
+
+    let candidate = Identity::from_seed(b"inbound-timeout-capacity-candidate").unwrap();
+    let mut rejected = build_link_request(&destination, &candidate, &mut rng);
+    assert!(matches!(
+        transport.ingest_on_at(
+            &mut rejected,
+            origin.as_secs(),
+            origin,
+            3,
+            &mut rng,
+            &responder,
+        ),
+        IngestResult::LinkTableFull {
+            table: LinkTableKind::Owned,
+            ..
+        }
+    ));
+    assert_eq!(transport.link_count(), 4);
+    assert!(retained_ids
+        .iter()
+        .all(|link_id| transport.get_link(link_id).is_some()));
+
+    let deadline = origin + timeout;
+    assert_eq!(
+        transport
+            .tick_at(
+                deadline.as_secs(),
+                deadline - MonotonicDuration::from_micros(1),
+            )
+            .closed_links,
+        0
+    );
+    assert_eq!(transport.link_count(), 4);
+
+    let failed_before = transport.stats().links_failed;
+    let closed_before = transport.stats().links_closed;
+    assert_eq!(
+        transport.tick_at(deadline.as_secs(), deadline).closed_links,
+        4
+    );
+    assert_eq!(transport.link_count(), 0);
+    assert_eq!(transport.stats().links_failed, failed_before);
+    assert_eq!(transport.stats().links_closed, closed_before + 4);
+
+    // A real retry has fresh ephemeral material and can immediately consume
+    // one of the slots reclaimed by responder lifecycle maintenance.
+    let mut retry = build_link_request(&destination, &candidate, &mut rng);
+    assert!(matches!(
+        transport.ingest_on_at(
+            &mut retry,
+            deadline.as_secs(),
+            deadline,
+            3,
+            &mut rng,
+            &responder,
+        ),
+        IngestResult::LinkRequestReceived { proof_raw, .. } if !proof_raw.is_empty()
+    ));
+    assert_eq!(transport.link_count(), 1);
 }
 
 #[test]

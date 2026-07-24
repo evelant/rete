@@ -574,7 +574,7 @@ pub enum IngestResult<'a> {
 pub struct TickResult {
     /// Number of paths that were expired and removed.
     pub expired_paths: usize,
-    /// Number of links that were closed due to staleness.
+    /// Number of links closed by establishment or stale-session maintenance.
     pub closed_links: usize,
     /// Full hashes of receipts that newly timed out during this tick.
     pub failed_receipts: Vec<[u8; 32]>,
@@ -592,7 +592,7 @@ pub struct TickResult {
 pub struct TickSummary {
     /// Number of paths that were expired and removed.
     pub expired_paths: usize,
-    /// Number of links that were closed due to staleness.
+    /// Number of links closed by establishment or stale-session maintenance.
     pub closed_links: usize,
     /// Number of DATA receipt-failure notifications committed to the sink.
     pub failed_receipts: usize,
@@ -633,8 +633,8 @@ pub struct TransportStats {
     pub announces_rate_limited: u64,
     /// Links that reached Active state (LRRTT or LRPROOF exchange completed).
     pub links_established: u64,
-    /// Links closed (LINKCLOSE received, local protocol-error teardown, or
-    /// keepalive timeout).
+    /// Links closed (LINKCLOSE received, local protocol-error teardown,
+    /// establishment timeout, or keepalive timeout).
     pub links_closed: u64,
     /// Link handshake failures (cryptographic errors or malformed authenticated
     /// negotiation payloads during establishment).
@@ -1779,8 +1779,11 @@ impl<S: TransportStorage> Transport<S> {
                         raw,
                         &dh,
                         pkt.payload,
-                        link_now,
-                        iface,
+                        link::LinkRequestIngress {
+                            now: link_now,
+                            hops: pkt.hops,
+                            interface: iface,
+                        },
                         rng,
                         identity,
                     )
@@ -1894,14 +1897,21 @@ impl<S: TransportStorage> Transport<S> {
             now.saturating_sub(entry.timestamp) <= crate::link::STALE_TIMEOUT_SECS
         });
 
-        // Check for stale links
+        // Reclaim responders that never completed LRRTT, then check established
+        // Links for staleness. Both paths close and release one owned Link
+        // slot; establishment timeouts are lifecycle closures rather than
+        // malformed or cryptographic handshake failures.
         let prev_links = self.links.len();
-        self.links
-            .retain(|_, link| !link.check_stale_at(link_now));
+        self.links.retain(|_, link| {
+            if link.check_responder_establishment_timeout_at(link_now) {
+                return false;
+            }
+            !link.check_stale_at(link_now)
+        });
         let closed_count = prev_links - self.links.len();
 
         // Expire stale channel receipts and reclaim receipts whose owned Link
-        // was removed by the stale-link pass above.
+        // was removed by timed-out Link maintenance above.
         let links = &self.links;
         self.channel_receipts.retain(|_, receipt| {
             links.contains_key(&receipt.link_id)
@@ -1914,7 +1924,7 @@ impl<S: TransportStorage> Transport<S> {
         (expired_count, closed_count)
     }
 
-    /// Expire old paths, reverse entries, stale links, and delivery receipts
+    /// Expire old paths, reverse entries, timed-out links, and delivery receipts
     /// into a caller-reserved terminal sink.
     ///
     /// A DATA receipt remains tracked when the sink cannot reserve its
@@ -1958,7 +1968,7 @@ impl<S: TransportStorage> Transport<S> {
         }
     }
 
-    /// Expire old paths, reverse entries, stale links, and receipts.
+    /// Expire old paths, reverse entries, timed-out links, and receipts.
     ///
     /// Timed-out receipts are removed atomically and reported in
     /// [`TickResult::failed_receipts`]; callers should consume those hashes as

@@ -22,6 +22,12 @@ enum OwnedLinkAdmission {
     Full,
 }
 
+pub(super) struct LinkRequestIngress {
+    pub(super) now: MonotonicInstant,
+    pub(super) hops: u8,
+    pub(super) interface: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LinkSessionFingerprint {
     local_ephemeral: [u8; 32],
@@ -529,8 +535,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         raw: &'a [u8],
         dest_hash: &DestHash,
         payload: &[u8],
-        link_now: MonotonicInstant,
-        iface: u8,
+        ingress: LinkRequestIngress,
         rng: &mut R,
         identity: &Identity,
     ) -> IngestResult<'a> {
@@ -544,7 +549,13 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             return IngestResult::Duplicate;
         }
 
-        let mut link = match Link::from_request_at(link_id, payload, rng, link_now) {
+        let mut link = match Link::from_request_at_with_hops(
+            link_id,
+            payload,
+            rng,
+            ingress.now,
+            ingress.hops,
+        ) {
             Ok(l) => l,
             Err(_) => {
                 self.stats.links_failed += 1;
@@ -553,7 +564,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             }
         };
         link.destination_hash = *dest_hash;
-        link.bound_interface = Some(iface);
+        link.bound_interface = Some(ingress.interface);
 
         match self.admit_owned_link(link_id, link) {
             OwnedLinkAdmission::Inserted => {}

@@ -133,6 +133,12 @@ pub struct Link {
     /// legacy callers remain functional. A runtime may replace it exactly once
     /// with a dispatch-edge confirmation before the Link activates.
     request_started_at: MonotonicInstant,
+    /// Post-ingress hop count from the LINKREQUEST that created a responder.
+    ///
+    /// This is distinct from `expected_hops`: the latter is authenticated Link
+    /// routing state learned from LRRTT, while this value only fixes the
+    /// responder's bounded establishment timeout.
+    responder_inbound_hops: Option<u8>,
     request_time_confirmed: bool,
     outbound_protocol_token: Option<NonZeroU64>,
     request_dispatch_interface: Option<u8>,
@@ -257,6 +263,17 @@ impl Link {
         rng: &mut R,
         now: MonotonicInstant,
     ) -> Result<Self, rete_core::Error> {
+        Self::from_request_at_with_hops(link_id, request_payload, rng, now, 0)
+    }
+
+    /// Construct a responder Link while retaining its post-ingress hop count.
+    pub(crate) fn from_request_at_with_hops<R: RngCore + CryptoRng>(
+        link_id: LinkId,
+        request_payload: &[u8],
+        rng: &mut R,
+        now: MonotonicInstant,
+        inbound_hops: u8,
+    ) -> Result<Self, rete_core::Error> {
         if request_payload.len() < LINK_REQUEST_KEY_SIZE {
             return Err(rete_core::Error::PacketTooShort);
         }
@@ -317,6 +334,7 @@ impl Link {
             last_outbound: now,
             last_keepalive: MonotonicInstant::default(),
             request_started_at: now,
+            responder_inbound_hops: Some(inbound_hops),
             request_time_confirmed: false,
             outbound_protocol_token: None,
             request_dispatch_interface: None,
@@ -461,6 +479,7 @@ impl Link {
             last_outbound: now,
             last_keepalive: MonotonicInstant::default(),
             request_started_at: now,
+            responder_inbound_hops: None,
             request_time_confirmed: false,
             outbound_protocol_token: None,
             request_dispatch_interface: None,
@@ -586,6 +605,20 @@ impl Link {
     /// Immutable request timing origin, provisional or confirmed.
     pub const fn request_started_at(&self) -> MonotonicInstant {
         self.request_started_at
+    }
+
+    /// Python-compatible responder establishment budget.
+    ///
+    /// Reticulum keeps a responder Link in Handshake for one keepalive period
+    /// plus six seconds per inbound hop, with a minimum of one hop.
+    fn responder_establishment_timeout(&self) -> Option<MonotonicDuration> {
+        self.responder_inbound_hops.map(|hops| {
+            MonotonicDuration::from_secs(
+                KEEPALIVE_INTERVAL_SECS.saturating_add(compute_establishment_timeout(u64::from(
+                    hops.max(1),
+                ))),
+            )
+        })
     }
 
     /// Whether a runtime dispatch edge replaced the provisional request time.
@@ -853,6 +886,28 @@ impl Link {
             }
         }
         false
+    }
+
+    /// Close a responder that never completed its LRRTT handshake.
+    ///
+    /// No LINKCLOSE is emitted for this maintenance timeout, matching Python
+    /// Reticulum. The transport removes the closed Link from owned capacity.
+    pub(crate) fn check_responder_establishment_timeout_at(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> bool {
+        if self.role != LinkRole::Responder || self.state != LinkState::Handshake {
+            return false;
+        }
+        let Some(timeout) = self.responder_establishment_timeout() else {
+            return false;
+        };
+        if now.saturating_duration_since(self.request_started_at) < timeout {
+            return false;
+        }
+        self.state = LinkState::Closed;
+        self.stale_since = None;
+        true
     }
 }
 
@@ -1271,6 +1326,72 @@ mod tests {
         );
         assert_eq!(payload.len(), 67); // 64 keys + 3 signalling
         assert_eq!(&payload[..32], &link.our_x25519_pub);
+    }
+
+    #[test]
+    fn responder_handshake_timeout_matches_python_boundary_and_hop_scaling() {
+        let payload = [0xBBu8; 64];
+        let origin = MonotonicInstant::from_micros(100_250_000);
+
+        for (request_hops, expected_seconds) in [(0, 366), (1, 366), (3, 378)] {
+            let mut rng = rand_core::OsRng;
+            let link_id = LinkId::from([request_hops; TRUNCATED_HASH_LEN]);
+            let mut link = Link::from_request_at_with_hops(
+                link_id,
+                &payload,
+                &mut rng,
+                origin,
+                request_hops,
+            )
+            .unwrap();
+            let timeout = MonotonicDuration::from_secs(expected_seconds);
+
+            assert_eq!(link.responder_inbound_hops, Some(request_hops));
+            assert_eq!(link.responder_establishment_timeout(), Some(timeout));
+            assert!(!link.check_responder_establishment_timeout_at(
+                origin + timeout - MonotonicDuration::from_micros(1)
+            ));
+            assert_eq!(link.state, LinkState::Handshake);
+            assert!(link.check_responder_establishment_timeout_at(origin + timeout));
+            assert_eq!(link.state, LinkState::Closed);
+            assert!(!link.check_responder_establishment_timeout_at(
+                origin + timeout + MonotonicDuration::from_secs(1)
+            ));
+        }
+    }
+
+    #[test]
+    fn responder_handshake_timeout_does_not_own_initiator_or_active_lifecycle() {
+        let mut rng = rand_core::OsRng;
+        let identity = Identity::from_seed(b"establishment-timeout-scope").unwrap();
+        let origin = MonotonicInstant::from_secs(100);
+        let deadline = origin + MonotonicDuration::from_secs(10_000);
+
+        let (mut initiator, _) = Link::new_initiator_at(
+            DestHash::from([0xA1; TRUNCATED_HASH_LEN]),
+            identity.ed25519_pub(),
+            &mut rng,
+            origin,
+        );
+        initiator.set_link_id(LinkId::from([0xA2; TRUNCATED_HASH_LEN]));
+        assert_eq!(initiator.state, LinkState::Handshake);
+        assert_eq!(initiator.responder_inbound_hops, None);
+        assert_eq!(initiator.responder_establishment_timeout(), None);
+        assert!(!initiator.check_responder_establishment_timeout_at(deadline));
+        assert_eq!(initiator.state, LinkState::Handshake);
+
+        let payload = [0xBBu8; 64];
+        let mut responder = Link::from_request_at_with_hops(
+            LinkId::from([0xA3; TRUNCATED_HASH_LEN]),
+            &payload,
+            &mut rng,
+            origin,
+            1,
+        )
+        .unwrap();
+        responder.activate_at(origin);
+        assert!(!responder.check_responder_establishment_timeout_at(deadline));
+        assert_eq!(responder.state, LinkState::Active);
     }
 
     #[test]
