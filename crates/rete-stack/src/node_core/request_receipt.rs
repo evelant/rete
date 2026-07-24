@@ -8,6 +8,8 @@ use rete_core::{LinkId, RequestId, TRUNCATED_HASH_LEN};
 /// the pending list rather than transitioning to a terminal variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestStatus {
+    /// Request packet is constructed but has not reached an interface.
+    Prepared,
     /// Request packet sent, awaiting response.
     Sent,
     /// Response arriving as resource (multi-packet transfer).

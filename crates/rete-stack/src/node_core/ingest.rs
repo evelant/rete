@@ -183,11 +183,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         let mut events: Vec<NodeEvent> = Vec::new();
         self.pending_requests.retain(|r| {
             if r.link_id == link_id {
-                events.push(NodeEvent::RequestFailed {
-                    link_id,
-                    request_id: r.request_id,
-                    reason: RequestFailReason::LinkClosed,
-                });
+                if r.status != super::request_receipt::RequestStatus::Prepared {
+                    events.push(NodeEvent::RequestFailed {
+                        link_id,
+                        request_id: r.request_id,
+                        reason: RequestFailReason::LinkClosed,
+                    });
+                }
                 false
             } else {
                 true
@@ -549,8 +551,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                 request_id,
                 data,
             } => {
-                // Clear matching pending request
-                self.pending_requests.retain(|r| r.request_id != request_id);
+                // Clear only a dispatched matching request. A response cannot
+                // consume a packet that is still waiting for interface handoff.
+                self.pending_requests.retain(|request| {
+                    request.link_id != link_id
+                        || request.request_id != request_id
+                        || request.status == super::request_receipt::RequestStatus::Prepared
+                });
                 IngestOutcome {
                     events: vec![NodeEvent::ResponseReceived {
                         link_id,
@@ -615,7 +622,15 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     let matched = if let Some(rid) = request_id {
                         self.pending_requests
                             .iter_mut()
-                            .find(|r| r.link_id == link_id && r.request_id == rid)
+                            .find(|r| {
+                                r.link_id == link_id
+                                    && r.request_id == rid
+                                    && matches!(
+                                        r.status,
+                                        super::request_receipt::RequestStatus::Sent
+                                            | super::request_receipt::RequestStatus::Receiving
+                                    )
+                            })
                     } else {
                         // FIFO fallback: first Sent request without a resource yet
                         self.pending_requests.iter_mut().find(|r| {
@@ -850,7 +865,12 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     if is_response {
                         if let Ok((req_id, resp_data)) = rete_transport::parse_response(&plaintext)
                         {
-                            self.pending_requests.retain(|r| r.request_id != req_id);
+                            self.pending_requests.retain(|request| {
+                                request.link_id != link_id
+                                    || request.request_id != req_id
+                                    || request.status
+                                        == super::request_receipt::RequestStatus::Prepared
+                            });
                             return IngestOutcome {
                                 events: vec![NodeEvent::ResponseReceived {
                                     link_id,

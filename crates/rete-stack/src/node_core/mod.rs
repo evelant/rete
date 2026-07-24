@@ -221,6 +221,111 @@ impl OutboundPacket {
     }
 }
 
+/// One direct Link request prepared without starting its response timeout.
+///
+/// The packet and confirmation token remain inseparable until
+/// [`Self::into_parts`]. Callers should confirm the token immediately before
+/// handing the packet to an interface, then cancel the pending request if that
+/// handoff fails.
+#[must_use = "a prepared request must be confirmed and dispatched or canceled"]
+pub struct PreparedRequest {
+    outbound: OutboundPacket,
+    confirmation: PreparedRequestConfirmation,
+}
+
+impl PreparedRequest {
+    /// Request identifier derived from the prepared packet hash.
+    pub const fn request_id(&self) -> RequestId {
+        self.confirmation.request_id
+    }
+
+    /// Link on which the prepared request must be dispatched.
+    pub const fn link_id(&self) -> LinkId {
+        self.confirmation.link_id
+    }
+
+    /// Borrow the complete packet and its authoritative routing decision.
+    pub const fn outbound(&self) -> &OutboundPacket {
+        &self.outbound
+    }
+
+    /// Separate the packet from its single-use confirmation token.
+    pub fn into_parts(self) -> (OutboundPacket, PreparedRequestConfirmation) {
+        (self.outbound, self.confirmation)
+    }
+}
+
+/// Single-use authority to start timeout tracking for one prepared request.
+///
+/// Fields are private so callers cannot forge a request/Link association.
+#[must_use = "a request confirmation must be confirmed or canceled"]
+pub struct PreparedRequestConfirmation {
+    request_id: RequestId,
+    link_id: LinkId,
+}
+
+impl PreparedRequestConfirmation {
+    /// Request identifier derived from the prepared packet hash.
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Link on which the request packet was prepared.
+    pub const fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+}
+
+/// Failure to confirm one exact prepared request at its dispatch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDispatchError {
+    /// The Link was removed after packet preparation.
+    LinkNotFound,
+    /// The Link is no longer active.
+    LinkNotActive,
+    /// The exact request is absent or no longer awaiting dispatch.
+    NotPrepared,
+}
+
+impl core::fmt::Display for RequestDispatchError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::LinkNotFound => "prepared request Link was removed",
+            Self::LinkNotActive => "prepared request Link is not active",
+            Self::NotPrepared => "request is not awaiting dispatch",
+        })
+    }
+}
+
+/// One confirmed request whose packet still awaits interface handoff.
+///
+/// A successful handoff consumes this value through [`Self::dispatched`].
+/// A failed handoff returns it to
+/// [`NodeCore::cancel_confirmed_request`], which removes the exact pending
+/// request before it can time out.
+#[must_use = "a confirmed request must be marked dispatched or canceled"]
+pub struct ConfirmedRequestDispatch {
+    request_id: RequestId,
+    link_id: LinkId,
+}
+
+impl ConfirmedRequestDispatch {
+    /// Request identifier used for response correlation.
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    /// Link on which the confirmed request must be dispatched.
+    pub const fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+
+    /// Complete a successful interface handoff and retain timeout tracking.
+    pub const fn dispatched(self) -> RequestId {
+        self.request_id
+    }
+}
+
 /// Stable correlation token for an outbound DATA delivery receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReceiptToken {
@@ -994,6 +1099,140 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.send_packed_request(link_id, &packed, now, rng)
     }
 
+    /// Prepare one direct, single-packet request without starting its timeout.
+    ///
+    /// `requested_at_secs` is the wall-clock timestamp encoded on the wire and
+    /// is deliberately separate from the monotonic `sent_at` supplied to
+    /// [`Self::confirm_prepared_request`]. `None` emits the canonical
+    /// MessagePack `nil` used by anonymous NomadNet page requests. `Some` must
+    /// contain exactly one complete MessagePack value.
+    ///
+    /// Requests that exceed the negotiated Link MDU fail with
+    /// [`rete_core::Error::PayloadTooLarge`]; this direct-only API never starts
+    /// a Resource transfer.
+    pub fn prepare_single_packet_request_value<R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        path: &str,
+        data: Option<&[u8]>,
+        requested_at_secs: f64,
+        rng: &mut R,
+    ) -> Result<PreparedRequest, SendError> {
+        let packed = rete_transport::build_request_value(path, data, requested_at_secs)
+            .map_err(|_| SendError::InvalidRequestValue)?;
+        if packed.len() > self.get_link_mdu(link_id) {
+            return Err(SendError::PacketBuild(rete_core::Error::PayloadTooLarge));
+        }
+        self.pending_requests
+            .try_reserve_exact(1)
+            .map_err(|_| SendError::OutputAllocationFailed)?;
+
+        let routing = self.owned_link_routing(link_id)?;
+        let packet = self.transport.build_link_data_packet(
+            link_id,
+            &packed,
+            rete_core::CONTEXT_REQUEST,
+            rng,
+        )?;
+        let parsed = rete_core::Packet::parse(&packet).map_err(SendError::PacketBuild)?;
+        let packet_hash = parsed.compute_hash();
+        let request_id = RequestId::from_slice(&packet_hash[..TRUNCATED_HASH_LEN]);
+        if self
+            .pending_requests
+            .iter()
+            .any(|pending| pending.request_id == request_id)
+        {
+            return Err(SendError::ReceiptHashAlreadyTracked);
+        }
+        self.register_request(
+            request_id,
+            *link_id,
+            request_receipt::RequestStatus::Prepared,
+            0,
+            None,
+        );
+
+        Ok(PreparedRequest {
+            outbound: OutboundPacket::new(packet, routing),
+            confirmation: PreparedRequestConfirmation {
+                request_id,
+                link_id: *link_id,
+            },
+        })
+    }
+
+    /// Start timeout tracking immediately before dispatching a prepared packet.
+    ///
+    /// Confirmation consumes its unforgeable token, rechecks Link state and
+    /// verifies the exact prepared state before committing the dispatch time.
+    /// If the subsequent interface handoff fails, pass the returned authority
+    /// to [`Self::cancel_confirmed_request`].
+    pub fn confirm_prepared_request(
+        &mut self,
+        confirmation: PreparedRequestConfirmation,
+        sent_at: u64,
+    ) -> Result<ConfirmedRequestDispatch, RequestDispatchError> {
+        let link_state = self
+            .transport
+            .get_link(&confirmation.link_id)
+            .map(|link| link.state);
+        let link_error = match link_state {
+            None => Some(RequestDispatchError::LinkNotFound),
+            Some(rete_transport::LinkState::Active) => None,
+            Some(_) => Some(RequestDispatchError::LinkNotActive),
+        };
+        if let Some(error) = link_error {
+            self.remove_request(
+                confirmation.request_id,
+                Some(confirmation.link_id),
+                Some(request_receipt::RequestStatus::Prepared),
+            );
+            return Err(error);
+        }
+        let pending = self
+            .pending_requests
+            .iter_mut()
+            .find(|pending| {
+                pending.request_id == confirmation.request_id
+                    && pending.link_id == confirmation.link_id
+            })
+            .ok_or(RequestDispatchError::NotPrepared)?;
+        if pending.status != request_receipt::RequestStatus::Prepared {
+            return Err(RequestDispatchError::NotPrepared);
+        }
+        pending.status = request_receipt::RequestStatus::Sent;
+        pending.sent_at = sent_at;
+        Ok(ConfirmedRequestDispatch {
+            request_id: confirmation.request_id,
+            link_id: confirmation.link_id,
+        })
+    }
+
+    /// Cancel a request token that was prepared but never confirmed.
+    ///
+    /// Returns `true` only when the exact request was still prepared.
+    pub fn cancel_prepared_request(
+        &mut self,
+        confirmation: PreparedRequestConfirmation,
+    ) -> bool {
+        self.remove_request(
+            confirmation.request_id,
+            Some(confirmation.link_id),
+            Some(request_receipt::RequestStatus::Prepared),
+        )
+    }
+
+    /// Cancel one confirmed, single-packet request after interface handoff fails.
+    ///
+    /// Returns `true` only when an exact pending request was removed.
+    pub fn cancel_confirmed_request(&mut self, confirmed: ConfirmedRequestDispatch) -> bool {
+        self.remove_request(
+            confirmed.request_id,
+            Some(confirmed.link_id),
+            Some(request_receipt::RequestStatus::Sent),
+        )
+    }
+
     fn send_packed_request<R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
@@ -1063,6 +1302,23 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         now: u64,
         request_resource_hash: Option<[u8; TRUNCATED_HASH_LEN]>,
     ) {
+        self.register_request(
+            request_id,
+            link_id,
+            request_receipt::RequestStatus::Sent,
+            now,
+            request_resource_hash,
+        );
+    }
+
+    fn register_request(
+        &mut self,
+        request_id: RequestId,
+        link_id: LinkId,
+        status: request_receipt::RequestStatus,
+        sent_at: u64,
+        request_resource_hash: Option<[u8; TRUNCATED_HASH_LEN]>,
+    ) {
         let timeout = self
             .transport
             .get_link(&link_id)
@@ -1071,12 +1327,29 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.pending_requests.push(request_receipt::PendingRequest {
             request_id,
             link_id,
-            status: request_receipt::RequestStatus::Sent,
-            sent_at: now,
+            status,
+            sent_at,
             timeout_secs: timeout,
             response_resource_hash: None,
             request_resource_hash,
         });
+    }
+
+    fn remove_request(
+        &mut self,
+        request_id: RequestId,
+        link_id: Option<LinkId>,
+        status: Option<request_receipt::RequestStatus>,
+    ) -> bool {
+        let Some(index) = self.pending_requests.iter().position(|pending| {
+            pending.request_id == request_id
+                && link_id.is_none_or(|link| pending.link_id == link)
+                && status.is_none_or(|expected| pending.status == expected)
+        }) else {
+            return false;
+        };
+        self.pending_requests.remove(index);
+        true
     }
 
     /// Query the status of a pending request by its request_id.
@@ -5862,6 +6135,193 @@ mod tests {
             Err(SendError::InvalidRequestValue)
         ));
         assert!(init.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn prepared_request_starts_timeout_only_after_dispatch_confirmation() {
+        let (mut init, resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_000.5,
+                &mut rng,
+            )
+            .unwrap();
+        let request_id = prepared.request_id();
+        assert_eq!(
+            init.get_request_status(&request_id),
+            Some(request_receipt::RequestStatus::Prepared)
+        );
+        let prepared_tick = init.handle_tick(200, &mut rng);
+        assert!(!prepared_tick
+            .events
+            .iter()
+            .any(|event| matches!(event, NodeEvent::RequestFailed { .. })));
+        assert_eq!(
+            init.get_request_status(&request_id),
+            Some(request_receipt::RequestStatus::Prepared)
+        );
+
+        let (outbound, confirmation) = prepared.into_parts();
+        let packet = rete_core::Packet::parse(&outbound.data).unwrap();
+        let mut plaintext = vec![0_u8; packet.payload.len()];
+        let plaintext_len = resp
+            .transport
+            .get_link(&link_id)
+            .unwrap()
+            .decrypt(packet.payload, &mut plaintext)
+            .unwrap();
+        let (requested_at, _, value) =
+            rete_transport::parse_request_value(&plaintext[..plaintext_len]).unwrap();
+        assert_eq!(requested_at, 1_700_000_000.5);
+        assert_eq!(value, [0xc0]);
+
+        let confirmed = init.confirm_prepared_request(confirmation, 210).unwrap();
+        assert_eq!(confirmed.request_id(), request_id);
+        assert_eq!(confirmed.link_id(), link_id);
+        assert_eq!(
+            init.get_request_status(&request_id),
+            Some(request_receipt::RequestStatus::Sent)
+        );
+        assert_eq!(init.pending_requests[0].sent_at, 210);
+        let timeout = init.pending_requests[0].timeout_secs;
+        let before_timeout = init.handle_tick(210 + timeout, &mut rng);
+        assert!(!before_timeout
+            .events
+            .iter()
+            .any(|event| matches!(event, NodeEvent::RequestFailed { .. })));
+        let timeout_events = init.handle_tick(211 + timeout, &mut rng).events;
+        assert!(matches!(
+            timeout_events.as_slice(),
+            [NodeEvent::RequestFailed {
+                link_id: failed_link,
+                request_id: failed_request,
+                reason: crate::RequestFailReason::Timeout,
+            }, ..] if *failed_link == link_id && *failed_request == request_id
+        ));
+        let _ = confirmed.dispatched();
+    }
+
+    #[test]
+    fn prepared_and_confirmed_requests_have_exact_cancel_paths() {
+        let (mut init, _resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_000.0,
+                &mut rng,
+            )
+            .unwrap();
+        let first_id = prepared.request_id();
+        let (_, confirmation) = prepared.into_parts();
+        assert!(init.cancel_prepared_request(confirmation));
+        assert_eq!(init.get_request_status(&first_id), None);
+
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_001.0,
+                &mut rng,
+            )
+            .unwrap();
+        let second_id = prepared.request_id();
+        let (_, confirmation) = prepared.into_parts();
+        let confirmed = init.confirm_prepared_request(confirmation, 900).unwrap();
+        assert!(init.cancel_confirmed_request(confirmed));
+        assert_eq!(init.get_request_status(&second_id), None);
+    }
+
+    #[test]
+    fn response_cannot_consume_an_undispatched_prepared_request() {
+        let (mut init, resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_000.0,
+                &mut rng,
+            )
+            .unwrap();
+        let request_id = prepared.request_id();
+        let response = resp
+            .send_response(&link_id, &request_id, b"early", &mut rng)
+            .unwrap();
+
+        let outcome = init.handle_ingest(&response.data, 1_000, 0, &mut rng);
+        assert!(matches!(
+            outcome.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                link_id: response_link,
+                request_id: response_request,
+                data,
+            }] if *response_link == link_id
+                && *response_request == request_id
+                && data == b"early"
+        ));
+        assert_eq!(
+            init.get_request_status(&request_id),
+            Some(request_receipt::RequestStatus::Prepared)
+        );
+
+        let (_, confirmation) = prepared.into_parts();
+        assert!(init.cancel_prepared_request(confirmation));
+    }
+
+    #[test]
+    fn direct_request_preparation_fails_closed_without_resource_or_pending_state() {
+        let (mut init, _resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let mut oversized_value = vec![0xc5, 0x02, 0x00];
+        oversized_value.resize(3 + 512, 0);
+
+        assert!(matches!(
+            init.prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                Some(&oversized_value),
+                1_700_000_000.0,
+                &mut rng,
+            ),
+            Err(SendError::PacketBuild(rete_core::Error::PayloadTooLarge))
+        ));
+        assert!(init.pending_requests.is_empty());
+        assert!(init.transport.drain_resource_outbound().is_empty());
+    }
+
+    #[test]
+    fn confirmation_failure_reclaims_prepared_request() {
+        let (mut init, _resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_000.0,
+                &mut rng,
+            )
+            .unwrap();
+        let request_id = prepared.request_id();
+        let (_, confirmation) = prepared.into_parts();
+        assert!(init.close_link(&link_id, &mut rng).0.is_some());
+
+        assert!(matches!(
+            init.confirm_prepared_request(confirmation, 1_000),
+            Err(RequestDispatchError::LinkNotFound)
+        ));
+        assert_eq!(init.get_request_status(&request_id), None);
     }
 
     #[test]

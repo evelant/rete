@@ -201,6 +201,9 @@ pub fn parse_response(packed: &[u8]) -> Result<(RequestId, Vec<u8>), RequestErro
 
     // Read data (bin)
     let data = msgpack::read_bin_or_str(packed, &mut pos)?.to_vec();
+    if pos != packed.len() {
+        return Err(RequestError::TrailingData);
+    }
 
     Ok((RequestId::from(rid), data))
 }
@@ -337,6 +340,14 @@ mod tests {
         assert!(parse_response(&[]).is_err());
         // Wrong array length
         assert!(parse_response(&[0x93]).is_err()); // fixarray(3) instead of 2
+    }
+
+    #[test]
+    fn test_parse_response_rejects_trailing_data() {
+        let request_id = RequestId::from([0x42; REQUEST_ID_LEN]);
+        let mut packed = build_response(&request_id, b"page");
+        packed.push(0xc0);
+        assert_eq!(parse_response(&packed), Err(RequestError::TrailingData));
     }
 
     #[test]

@@ -316,11 +316,12 @@ pub use node_core::ratchet::{InMemoryRatchetStore, RatchetStore};
 pub use node_core::request_receipt::{PendingRequest, RequestStatus};
 #[cfg(feature = "alloc")]
 pub use node_core::{
-    EmbeddedNodeCore, IngestOutcome, IngestRejection, NodeCore, NodeHooks, NodeStats,
-    LinkDataReceiptToken, OutboundPacket, PacketRouting, PreparedDataPacket,
-    PreparedDataPacketRef, PreparedLinkDataPacket, PreparedLinkDataPacketRef,
-    ReceiptSinkTickOutcome, ReceiptToken, RequestCallback, RequestContext,
-    RequestHandler, RequestPolicy, ResponseCompressionPolicy, handler_fn,
+    ConfirmedRequestDispatch, EmbeddedNodeCore, IngestOutcome, IngestRejection,
+    LinkDataReceiptToken, NodeCore, NodeHooks, NodeStats, OutboundPacket, PacketRouting,
+    PreparedDataPacket, PreparedDataPacketRef, PreparedLinkDataPacket,
+    PreparedLinkDataPacketRef, PreparedRequest, PreparedRequestConfirmation,
+    ReceiptSinkTickOutcome, ReceiptToken, RequestCallback, RequestContext, RequestHandler,
+    RequestDispatchError, RequestPolicy, ResponseCompressionPolicy, handler_fn,
 };
 
 #[cfg(feature = "alloc")]
