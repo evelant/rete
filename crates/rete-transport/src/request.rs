@@ -7,7 +7,7 @@
 //! fixarray(3) = 0x93
 //! float64     = 0xcb + 8 bytes BE (timestamp)
 //! bin8/bin16  = path_hash (16 bytes, SHA-256(path.encode("utf-8"))[0:16])
-//! bin8/bin16/bin32 = data (arbitrary bytes)
+//! any msgpack value = data (`nil` for no request data)
 //! ```
 //!
 //! # Response wire format (msgpack)
@@ -44,6 +44,8 @@ pub enum RequestError {
     BadPathHashLen,
     /// Request ID has wrong length (expected 16 bytes).
     BadRequestIdLen,
+    /// Bytes remained after the one expected MessagePack value.
+    TrailingData,
 }
 
 impl From<MsgpackError> for RequestError {
@@ -71,42 +73,71 @@ pub fn request_id(packed_request: &[u8]) -> RequestId {
     RequestId::from(out)
 }
 
-/// Build a packed request: `msgpack([timestamp_f64, path_hash_bytes, data_bytes])`.
-pub fn build_request(path: &str, data: &[u8], now_secs_f64: f64) -> Vec<u8> {
+fn build_request_prefix(path: &str, now_secs_f64: f64, value_len: usize) -> Vec<u8> {
     let ph = path_hash(path);
-
-    // Estimate capacity: 1 (array) + 9 (float64) + 2+16 (bin8 + path_hash) + 3+ (bin header + data)
-    let mut buf = Vec::with_capacity(1 + 9 + (2 + PATH_HASH_LEN) + 3 + data.len());
-
-    // fixarray(3)
+    let mut buf = Vec::with_capacity(1 + 9 + (2 + PATH_HASH_LEN) + value_len);
     buf.push(0x93);
-
-    // float64
     msgpack::write_float64(&mut buf, now_secs_f64);
-
-    // path_hash as bin8 (always 16 bytes)
     msgpack::write_bin(&mut buf, ph.as_ref());
-
-    // data as bin
-    msgpack::write_bin(&mut buf, data);
-
     buf
 }
 
-/// Parse a packed request, returning `(timestamp_f64, path_hash, data)`.
-pub fn parse_request(packed: &[u8]) -> Result<(f64, PathHash, Vec<u8>), RequestError> {
+fn validate_packed_value(value: &[u8]) -> Result<(), RequestError> {
     let mut pos = 0;
+    msgpack::skip_value(value, &mut pos)?;
+    if pos != value.len() {
+        return Err(RequestError::TrailingData);
+    }
+    Ok(())
+}
 
-    // Read fixarray(3) header
+/// Build a Python-compatible packed request whose data is one already-encoded
+/// MessagePack value.
+///
+/// `None` writes MessagePack `nil`, matching `Link.request(path, data=None)`.
+/// `Some` is accepted only when the supplied bytes contain exactly one complete
+/// MessagePack value. The value is embedded without decoding or re-encoding,
+/// so map, array, scalar, binary and extension values retain their exact wire
+/// representation.
+pub fn build_request_value(
+    path: &str,
+    data: Option<&[u8]>,
+    now_secs_f64: f64,
+) -> Result<Vec<u8>, RequestError> {
+    if let Some(value) = data {
+        validate_packed_value(value)?;
+    }
+    let value_len = data.map_or(1, <[u8]>::len);
+    let mut buf = build_request_prefix(path, now_secs_f64, value_len);
+    match data {
+        Some(value) => buf.extend_from_slice(value),
+        None => msgpack::write_nil(&mut buf),
+    }
+    Ok(buf)
+}
+
+/// Build a packed request with a binary data value.
+///
+/// This preserves the original byte-oriented convenience API. Call
+/// [`build_request_value`] for canonical `nil`, maps, arrays or other
+/// pre-encoded MessagePack request values.
+pub fn build_request(path: &str, data: &[u8], now_secs_f64: f64) -> Vec<u8> {
+    let mut buf = build_request_prefix(path, now_secs_f64, 3 + data.len());
+    msgpack::write_bin(&mut buf, data);
+    buf
+}
+
+/// Parse a request while preserving its one encoded MessagePack data value.
+///
+/// The returned slice borrows the exact value bytes from `packed`, including
+/// the `0xc0` marker for `nil`.
+pub fn parse_request_value(packed: &[u8]) -> Result<(f64, PathHash, &[u8]), RequestError> {
+    let mut pos = 0;
     let arr_len = msgpack::read_array_len(packed, &mut pos)?;
     if arr_len != 3 {
         return Err(RequestError::InvalidArrayLen);
     }
-
-    // Read float64 timestamp
     let timestamp = msgpack::read_float64(packed, &mut pos)?;
-
-    // Read path_hash (bin, expect 16 bytes)
     let ph_bytes = msgpack::read_bin_or_str(packed, &mut pos)?;
     if ph_bytes.len() != PATH_HASH_LEN {
         return Err(RequestError::BadPathHashLen);
@@ -114,10 +145,24 @@ pub fn parse_request(packed: &[u8]) -> Result<(f64, PathHash, Vec<u8>), RequestE
     let mut ph = [0u8; PATH_HASH_LEN];
     ph.copy_from_slice(ph_bytes);
 
-    // Read data (bin)
-    let data = msgpack::read_bin_or_str(packed, &mut pos)?.to_vec();
+    let value_start = pos;
+    msgpack::skip_value(packed, &mut pos)?;
+    if pos != packed.len() {
+        return Err(RequestError::TrailingData);
+    }
+    Ok((timestamp, PathHash::from(ph), &packed[value_start..pos]))
+}
 
-    Ok((timestamp, PathHash::from(ph), data))
+/// Parse a packed request, returning `(timestamp_f64, path_hash, data)`.
+///
+/// This is the byte-oriented convenience counterpart to
+/// [`parse_request_value`] and accepts only binary or string request data.
+pub fn parse_request(packed: &[u8]) -> Result<(f64, PathHash, Vec<u8>), RequestError> {
+    let (timestamp, path_hash, value) = parse_request_value(packed)?;
+    let mut pos = 0;
+    let data = msgpack::read_bin_or_str(value, &mut pos)?.to_vec();
+    debug_assert_eq!(pos, value.len());
+    Ok((timestamp, path_hash, data))
 }
 
 /// Build a packed response: `msgpack([request_id_bytes, response_data_bytes])`.
@@ -196,6 +241,43 @@ mod tests {
         assert!((parsed_ts - ts).abs() < 1e-10);
         assert_eq!(parsed_ph, path_hash(path));
         assert_eq!(parsed_data, data);
+    }
+
+    #[test]
+    fn anonymous_request_matches_python_messagepack_wire() {
+        let packed = build_request_value("/page/index.mu", None, 1_700_000_000.0).unwrap();
+        let expected = [
+            0x93, 0xcb, 0x41, 0xd9, 0x54, 0xfc, 0x40, 0x00, 0x00, 0x00, 0xc4, 0x10, 0xfb, 0x40,
+            0xab, 0xf3, 0x59, 0xb3, 0xf2, 0x5f, 0xa0, 0x08, 0x61, 0x07, 0xc5, 0xee, 0xe5, 0x16,
+            0xc0,
+        ];
+        assert_eq!(packed, expected);
+
+        let (timestamp, parsed_path, value) = parse_request_value(&packed).unwrap();
+        assert_eq!(timestamp, 1_700_000_000.0);
+        assert_eq!(parsed_path, path_hash("/page/index.mu"));
+        assert_eq!(value, [0xc0]);
+    }
+
+    #[test]
+    fn packed_request_value_is_preserved_and_must_be_exactly_one_value() {
+        let value = [
+            0x81, 0xa8, b'v', b'a', b'r', b'_', b'n', b'a', b'm', b'e', 0xa4, b'R', b'u', b's',
+            b't',
+        ];
+        let packed = build_request_value("/page/form.mu", Some(&value), 42.0).unwrap();
+        let (_, parsed_path, parsed_value) = parse_request_value(&packed).unwrap();
+        assert_eq!(parsed_path, path_hash("/page/form.mu"));
+        assert_eq!(parsed_value, value);
+
+        assert_eq!(
+            build_request_value("/page/form.mu", Some(&[]), 42.0),
+            Err(RequestError::Msgpack(MsgpackError::Truncated))
+        );
+        assert_eq!(
+            build_request_value("/page/form.mu", Some(&[0xc0, 0xc0]), 42.0),
+            Err(RequestError::TrailingData)
+        );
     }
 
     #[test]

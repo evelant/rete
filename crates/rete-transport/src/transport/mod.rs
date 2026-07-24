@@ -132,6 +132,8 @@ pub enum SendError {
     /// A compatibility API could not reserve owned packet output before
     /// mutating protocol state.
     OutputAllocationFailed,
+    /// Request data was not exactly one complete encoded MessagePack value.
+    InvalidRequestValue,
     /// The non-repeating outbound protocol-token namespace is exhausted.
     ProtocolTokenExhausted,
     /// Internal Link state rejected assignment of a freshly allocated token.
@@ -163,6 +165,9 @@ impl core::fmt::Display for SendError {
             }
             SendError::OutputAllocationFailed => {
                 write!(f, "could not reserve outbound packet storage")
+            }
+            SendError::InvalidRequestValue => {
+                write!(f, "request data is not exactly one MessagePack value")
             }
             SendError::ProtocolTokenExhausted => {
                 write!(f, "outbound protocol token namespace exhausted")

@@ -968,17 +968,49 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         rng: &mut R,
     ) -> Result<(OutboundPacket, RequestId), SendError> {
         let packed = rete_transport::build_request(path, data, now as f64);
+        self.send_packed_request(link_id, &packed, now, rng)
+    }
 
+    /// Send a Python-compatible `link.request()` whose data is one encoded
+    /// MessagePack value.
+    ///
+    /// `None` sends MessagePack `nil`, which is the canonical anonymous
+    /// NomadNet request. `Some` must contain exactly one complete MessagePack
+    /// value and is embedded unchanged. Use [`Self::send_request`] when an
+    /// ordinary byte slice should be encoded as a MessagePack binary value.
+    ///
+    /// This is currently an outbound API. Incoming request-handler dispatch
+    /// remains byte-oriented and accepts binary or string request data.
+    pub fn send_request_value<R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        path: &str,
+        data: Option<&[u8]>,
+        now: u64,
+        rng: &mut R,
+    ) -> Result<(OutboundPacket, RequestId), SendError> {
+        let packed = rete_transport::build_request_value(path, data, now as f64)
+            .map_err(|_| SendError::InvalidRequestValue)?;
+        self.send_packed_request(link_id, &packed, now, rng)
+    }
+
+    fn send_packed_request<R: RngCore + CryptoRng>(
+        &mut self,
+        link_id: &LinkId,
+        packed: &[u8],
+        now: u64,
+        rng: &mut R,
+    ) -> Result<(OutboundPacket, RequestId), SendError> {
         // Check if the packed request fits in a single link packet
         let link_mdu = self.get_link_mdu(link_id);
         if packed.len() > link_mdu {
-            return self.send_request_as_resource(link_id, &packed, now, rng);
+            return self.send_request_as_resource(link_id, packed, now, rng);
         }
 
         let routing = self.owned_link_routing(link_id)?;
         let pkt = self.transport.build_link_data_packet(
             link_id,
-            &packed,
+            packed,
             rete_core::CONTEXT_REQUEST,
             rng,
         )?;
@@ -5781,6 +5813,55 @@ mod tests {
             request_receipt::RequestStatus::Sent
         );
         assert_eq!(init.pending_requests[0].sent_at, 100);
+    }
+
+    #[test]
+    fn canonical_request_value_preserves_nil_and_single_packet_request_id() {
+        let (mut init, resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let (outbound, request_id) = init
+            .send_request_value(&link_id, "/page/index.mu", None, 1_700_000_000, &mut rng)
+            .unwrap();
+        let packet = rete_core::Packet::parse(&outbound.data).unwrap();
+        assert_eq!(packet.context, rete_core::CONTEXT_REQUEST);
+        assert_eq!(
+            request_id.as_ref(),
+            &packet.compute_hash()[..rete_core::TRUNCATED_HASH_LEN]
+        );
+
+        let mut plaintext = vec![0_u8; packet.payload.len()];
+        let plaintext_len = resp
+            .transport
+            .get_link(&link_id)
+            .unwrap()
+            .decrypt(packet.payload, &mut plaintext)
+            .unwrap();
+        let (timestamp, path_hash, value) =
+            rete_transport::parse_request_value(&plaintext[..plaintext_len]).unwrap();
+        assert_eq!(timestamp, 1_700_000_000.0);
+        assert_eq!(path_hash, rete_transport::path_hash("/page/index.mu"));
+        assert_eq!(value, [0xc0]);
+        assert_eq!(init.pending_requests.len(), 1);
+        assert_eq!(init.pending_requests[0].request_id, request_id);
+    }
+
+    #[test]
+    fn invalid_canonical_request_value_does_not_register_pending_state() {
+        let (mut init, _resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        assert!(matches!(
+            init.send_request_value(
+                &link_id,
+                "/page/index.mu",
+                Some(&[0xc0, 0xc0]),
+                100,
+                &mut rng,
+            ),
+            Err(SendError::InvalidRequestValue)
+        ));
+        assert!(init.pending_requests.is_empty());
     }
 
     #[test]

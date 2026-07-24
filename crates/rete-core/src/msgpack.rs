@@ -147,11 +147,12 @@ pub fn read_bin<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Msgpack
         }
         _ => return Err(MsgpackError::ExpectedBin),
     };
-    if *pos + len > data.len() {
+    let end = pos.checked_add(len).ok_or(MsgpackError::Truncated)?;
+    if end > data.len() {
         return Err(MsgpackError::Truncated);
     }
-    let result = &data[*pos..*pos + len];
-    *pos += len;
+    let result = &data[*pos..end];
+    *pos = end;
     Ok(result)
 }
 
@@ -197,11 +198,12 @@ pub fn read_str<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8], Msgpack
     } else {
         return Err(MsgpackError::ExpectedStr);
     };
-    if *pos + len > data.len() {
+    let end = pos.checked_add(len).ok_or(MsgpackError::Truncated)?;
+    if end > data.len() {
         return Err(MsgpackError::Truncated);
     }
-    let result = &data[*pos..*pos + len];
-    *pos += len;
+    let result = &data[*pos..end];
+    *pos = end;
     Ok(result)
 }
 
@@ -524,8 +526,35 @@ pub fn read_bin_or_nil<'a>(
     }
 }
 
-/// Skip a single msgpack value at `pos`. Advances `pos` past it.
+/// Maximum container nesting accepted by [`skip_value`].
+///
+/// Reticulum protocol values are shallow. Keeping an explicit limit prevents
+/// untrusted, deeply nested arrays or maps from exhausting a small embedded
+/// stack while still leaving ample room for application values.
+const MAX_SKIP_DEPTH: usize = 64;
+
+fn advance_checked(data: &[u8], pos: &mut usize, len: usize) -> Result<(), MsgpackError> {
+    let end = pos.checked_add(len).ok_or(MsgpackError::Truncated)?;
+    if end > data.len() {
+        return Err(MsgpackError::Truncated);
+    }
+    *pos = end;
+    Ok(())
+}
+
+/// Skip a single complete msgpack value at `pos`. Advances `pos` past it.
+///
+/// All standard MessagePack value families are accepted, including extension
+/// values. Container recursion is bounded to 64 levels.
 pub fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), MsgpackError> {
+    skip_value_with_depth(data, pos, MAX_SKIP_DEPTH)
+}
+
+fn skip_value_with_depth(
+    data: &[u8],
+    pos: &mut usize,
+    remaining_depth: usize,
+) -> Result<(), MsgpackError> {
     if *pos >= data.len() {
         return Err(MsgpackError::Truncated);
     }
@@ -533,15 +562,15 @@ pub fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), MsgpackError> {
     match b {
         // nil, false, true
         0xc0 | 0xc2 | 0xc3 => {
-            *pos += 1;
+            advance_checked(data, pos, 1)?;
         }
         // positive fixint
         0x00..=0x7f => {
-            *pos += 1;
+            advance_checked(data, pos, 1)?;
         }
         // negative fixint
         0xe0..=0xff => {
-            *pos += 1;
+            advance_checked(data, pos, 1)?;
         }
         // fixstr
         b if b & 0xe0 == 0xa0 => {
@@ -550,18 +579,24 @@ pub fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), MsgpackError> {
         // fixmap
         b if b & 0xf0 == 0x80 => {
             let n = (b & 0x0f) as usize;
-            *pos += 1;
+            let inner_depth = remaining_depth
+                .checked_sub(1)
+                .ok_or(MsgpackError::UnsupportedType)?;
+            advance_checked(data, pos, 1)?;
             for _ in 0..n {
-                skip_value(data, pos)?;
-                skip_value(data, pos)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
             }
         }
         // fixarray
         b if b & 0xf0 == 0x90 => {
             let n = (b & 0x0f) as usize;
-            *pos += 1;
+            let inner_depth = remaining_depth
+                .checked_sub(1)
+                .ok_or(MsgpackError::UnsupportedType)?;
+            advance_checked(data, pos, 1)?;
             for _ in 0..n {
-                skip_value(data, pos)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
             }
         }
         // bin8, bin16, bin32
@@ -570,43 +605,76 @@ pub fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), MsgpackError> {
         }
         // float32
         0xca => {
-            *pos += 5;
+            advance_checked(data, pos, 5)?;
         }
         // float64
         0xcb => {
-            *pos += 9;
+            advance_checked(data, pos, 9)?;
         }
         // uint8
         0xcc => {
-            *pos += 2;
+            advance_checked(data, pos, 2)?;
         }
         // uint16
         0xcd => {
-            *pos += 3;
+            advance_checked(data, pos, 3)?;
         }
         // uint32
         0xce => {
-            *pos += 5;
+            advance_checked(data, pos, 5)?;
         }
         // uint64
         0xcf => {
-            *pos += 9;
+            advance_checked(data, pos, 9)?;
         }
         // int8
         0xd0 => {
-            *pos += 2;
+            advance_checked(data, pos, 2)?;
         }
         // int16
         0xd1 => {
-            *pos += 3;
+            advance_checked(data, pos, 3)?;
         }
         // int32
         0xd2 => {
-            *pos += 5;
+            advance_checked(data, pos, 5)?;
         }
         // int64
         0xd3 => {
-            *pos += 9;
+            advance_checked(data, pos, 9)?;
+        }
+        // fixext1, fixext2, fixext4, fixext8, fixext16
+        0xd4..=0xd8 => {
+            let payload_len = 1usize << (b - 0xd4);
+            advance_checked(data, pos, 2 + payload_len)?;
+        }
+        // ext8, ext16, ext32
+        0xc7..=0xc9 => {
+            let length_width = 1usize << (b - 0xc7);
+            let length_start = pos.checked_add(1).ok_or(MsgpackError::Truncated)?;
+            let length_end = length_start
+                .checked_add(length_width)
+                .ok_or(MsgpackError::Truncated)?;
+            if length_end > data.len() {
+                return Err(MsgpackError::Truncated);
+            }
+            let payload_len = match length_width {
+                1 => data[length_start] as usize,
+                2 => u16::from_be_bytes([data[length_start], data[length_start + 1]]) as usize,
+                4 => u32::from_be_bytes([
+                    data[length_start],
+                    data[length_start + 1],
+                    data[length_start + 2],
+                    data[length_start + 3],
+                ]) as usize,
+                _ => unreachable!(),
+            };
+            let total_len = 1usize
+                .checked_add(length_width)
+                .and_then(|len| len.checked_add(1))
+                .and_then(|len| len.checked_add(payload_len))
+                .ok_or(MsgpackError::Truncated)?;
+            advance_checked(data, pos, total_len)?;
         }
         // str8, str16, str32
         0xd9 | 0xda | 0xdb => {
@@ -614,17 +682,23 @@ pub fn skip_value(data: &[u8], pos: &mut usize) -> Result<(), MsgpackError> {
         }
         // array16, array32
         0xdc | 0xdd => {
+            let inner_depth = remaining_depth
+                .checked_sub(1)
+                .ok_or(MsgpackError::UnsupportedType)?;
             let n = read_array_len(data, pos)?;
             for _ in 0..n {
-                skip_value(data, pos)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
             }
         }
         // map16, map32
         0xde | 0xdf => {
+            let inner_depth = remaining_depth
+                .checked_sub(1)
+                .ok_or(MsgpackError::UnsupportedType)?;
             let n = read_map_len(data, pos)?;
             for _ in 0..n {
-                skip_value(data, pos)?;
-                skip_value(data, pos)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
+                skip_value_with_depth(data, pos, inner_depth)?;
             }
         }
         _ => return Err(MsgpackError::UnsupportedType),
@@ -824,6 +898,13 @@ mod tests {
         assert_eq!(read_bin(&data, &mut pos), Err(MsgpackError::ExpectedBin));
     }
 
+    #[test]
+    fn test_read_bin32_rejects_oversized_payload_length() {
+        let data = [0xc6, 0xff, 0xff, 0xff, 0xff];
+        let mut pos = 0;
+        assert_eq!(read_bin(&data, &mut pos), Err(MsgpackError::Truncated));
+    }
+
     // --- read_str ---
 
     #[test]
@@ -839,6 +920,13 @@ mod tests {
         let data = [0xc4, 0x01, 0x41]; // bin8
         let mut pos = 0;
         assert_eq!(read_str(&data, &mut pos), Err(MsgpackError::ExpectedStr));
+    }
+
+    #[test]
+    fn test_read_str32_rejects_oversized_payload_length() {
+        let data = [0xdb, 0xff, 0xff, 0xff, 0xff];
+        let mut pos = 0;
+        assert_eq!(read_str(&data, &mut pos), Err(MsgpackError::Truncated));
     }
 
     // --- read_bin_or_str ---
@@ -1102,6 +1190,46 @@ mod tests {
         let mut pos = 0;
         skip_value(&data, &mut pos).unwrap();
         assert_eq!(pos, 9);
+    }
+
+    #[test]
+    fn test_skip_rejects_truncated_fixed_width_value() {
+        let mut pos = 0;
+        assert_eq!(
+            skip_value(&[0xcb], &mut pos),
+            Err(MsgpackError::Truncated)
+        );
+    }
+
+    #[test]
+    fn test_skip_extension_values() {
+        let data = [
+            0xd4, 0x01, 0xaa, // fixext1: type 1, one payload byte
+            0xc7, 0x02, 0x02, 0xbb, 0xcc, // ext8: two payload bytes
+            0x42,
+        ];
+        let mut pos = 0;
+        skip_value(&data, &mut pos).unwrap();
+        assert_eq!(pos, 3);
+        skip_value(&data, &mut pos).unwrap();
+        assert_eq!(pos, 8);
+    }
+
+    #[test]
+    fn test_skip_bounds_container_nesting() {
+        let mut accepted = vec![0x91; MAX_SKIP_DEPTH];
+        accepted.push(0xc0);
+        let mut pos = 0;
+        skip_value(&accepted, &mut pos).unwrap();
+        assert_eq!(pos, accepted.len());
+
+        let mut rejected = vec![0x91; MAX_SKIP_DEPTH + 1];
+        rejected.push(0xc0);
+        let mut pos = 0;
+        assert_eq!(
+            skip_value(&rejected, &mut pos),
+            Err(MsgpackError::UnsupportedType)
+        );
     }
 
     // --- write_bin ---
