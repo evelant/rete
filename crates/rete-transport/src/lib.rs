@@ -48,8 +48,9 @@ pub use receipt::{
     ReceiptTerminalReservation, ReceiptTerminalSink, ReceiptTickSummary,
 };
 pub use request::{
-    build_request, build_request_value, build_response, parse_request, parse_request_value,
-    parse_response, path_hash, request_id, RequestError, PATH_HASH_LEN, REQUEST_ID_LEN,
+    build_request, build_request_value, build_response, parse_request, parse_request_data,
+    parse_request_value, parse_response, path_hash, request_id, RequestData, RequestError,
+    PATH_HASH_LEN, REQUEST_ID_LEN,
 };
 pub use resource::{
     hashmap_max_len, AdvertisementField, Resource, ResourceError, ResourceFlags, ResourceState,

@@ -543,6 +543,20 @@ pub enum IngestResult<'a> {
         /// Timestamp from the wire format (seconds since epoch).
         requested_at: f64,
     },
+    /// A link.request() carrying an encoded non-binary/string MessagePack
+    /// value was received on a link.
+    RequestValueReceived {
+        /// The link_id.
+        link_id: LinkId,
+        /// The request_id (truncated packet hash for single-packet requests).
+        request_id: rete_core::RequestId,
+        /// The path_hash (SHA-256(path)[..16]).
+        path_hash: rete_core::PathHash,
+        /// Exact encoded bytes of the validated MessagePack request value.
+        value: alloc::vec::Vec<u8>,
+        /// Timestamp from the wire format (seconds since epoch).
+        requested_at: f64,
+    },
     /// A link.response() was received on a link.
     ResponseReceived {
         /// The link_id.

@@ -119,8 +119,8 @@ pub fn build_request_value(
 /// Build a packed request with a binary data value.
 ///
 /// This preserves the original byte-oriented convenience API. Call
-/// [`build_request_value`] for canonical `nil`, maps, arrays or other
-/// pre-encoded MessagePack request values.
+/// [`build_request_value`] for `nil`, maps, arrays or other pre-encoded
+/// MessagePack request values.
 pub fn build_request(path: &str, data: &[u8], now_secs_f64: f64) -> Vec<u8> {
     let mut buf = build_request_prefix(path, now_secs_f64, 3 + data.len());
     msgpack::write_bin(&mut buf, data);
@@ -151,6 +151,42 @@ pub fn parse_request_value(packed: &[u8]) -> Result<(f64, PathHash, &[u8]), Requ
         return Err(RequestError::TrailingData);
     }
     Ok((timestamp, PathHash::from(ph), &packed[value_start..pos]))
+}
+
+/// Validated inbound request data without changing the legacy byte-oriented
+/// interpretation of MessagePack binary and string values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestData<'a> {
+    /// Decoded contents of one MessagePack binary or string value.
+    Bytes(&'a [u8]),
+    /// Exact encoded bytes of any other complete MessagePack value.
+    ///
+    /// Canonical anonymous requests are represented by `EncodedValue(&[0xc0])`.
+    /// This is deliberately distinct from `Bytes(&[])`, which represents an
+    /// empty MessagePack binary or string value.
+    EncodedValue(&'a [u8]),
+}
+
+/// Parse one request and classify its validated data value without losing its
+/// encoded MessagePack representation.
+///
+/// Binary and string values retain the historical decoded-byte behavior.
+/// Every other MessagePack family is returned unchanged as
+/// [`RequestData::EncodedValue`].
+pub fn parse_request_data(packed: &[u8]) -> Result<(f64, PathHash, RequestData<'_>), RequestError> {
+    let (timestamp, path_hash, value) = parse_request_value(packed)?;
+    let marker = value[0];
+    let is_bytes =
+        marker & 0xe0 == 0xa0 || matches!(marker, 0xc4 | 0xc5 | 0xc6 | 0xd9 | 0xda | 0xdb);
+    let data = if is_bytes {
+        let mut pos = 0;
+        let bytes = msgpack::read_bin_or_str(value, &mut pos)?;
+        debug_assert_eq!(pos, value.len());
+        RequestData::Bytes(bytes)
+    } else {
+        RequestData::EncodedValue(value)
+    };
+    Ok((timestamp, path_hash, data))
 }
 
 /// Parse a packed request, returning `(timestamp_f64, path_hash, data)`.
@@ -260,6 +296,51 @@ mod tests {
         assert_eq!(timestamp, 1_700_000_000.0);
         assert_eq!(parsed_path, path_hash("/page/index.mu"));
         assert_eq!(value, [0xc0]);
+    }
+
+    #[test]
+    fn request_data_distinguishes_nil_and_raw_values_from_legacy_bytes() {
+        let nil = build_request_value("/page/index.mu", None, 42.0).unwrap();
+        assert_eq!(
+            parse_request_data(&nil).unwrap().2,
+            RequestData::EncodedValue(&[0xc0])
+        );
+
+        let empty_binary = build_request("/page/index.mu", &[], 42.0);
+        assert_eq!(
+            parse_request_data(&empty_binary).unwrap().2,
+            RequestData::Bytes(&[])
+        );
+
+        let string = build_request_value("/page/string", Some(&[0xa2, b'o', b'k']), 42.0).unwrap();
+        assert_eq!(
+            parse_request_data(&string).unwrap().2,
+            RequestData::Bytes(b"ok")
+        );
+
+        let map = [0x81, 0xa1, b'k', 0x01];
+        let mapped = build_request_value("/page/form.mu", Some(&map), 42.0).unwrap();
+        assert_eq!(
+            parse_request_data(&mapped).unwrap().2,
+            RequestData::EncodedValue(&map)
+        );
+    }
+
+    #[test]
+    fn request_data_rejects_malformed_or_trailing_values() {
+        let mut missing_value = build_request_value("/page/index.mu", None, 42.0).unwrap();
+        missing_value.pop();
+        assert_eq!(
+            parse_request_data(&missing_value),
+            Err(RequestError::Msgpack(MsgpackError::Truncated))
+        );
+
+        let mut trailing = build_request_value("/page/index.mu", None, 42.0).unwrap();
+        trailing.push(0xc0);
+        assert_eq!(
+            parse_request_data(&trailing),
+            Err(RequestError::TrailingData)
+        );
     }
 
     #[test]

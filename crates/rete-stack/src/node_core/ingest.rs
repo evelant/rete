@@ -546,6 +546,23 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     rejection: None,
                 }
             }
+            IngestResult::RequestValueReceived {
+                link_id,
+                request_id,
+                path_hash,
+                value,
+                requested_at,
+            } => IngestOutcome {
+                events: vec![NodeEvent::RequestValueReceived {
+                    link_id,
+                    request_id,
+                    path_hash,
+                    requested_at,
+                    value,
+                }],
+                packets: Vec::new(),
+                rejection: None,
+            },
             IngestResult::ResponseReceived {
                 link_id,
                 request_id,
@@ -884,26 +901,54 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     }
                     // If this is a request-as-resource, parse and dispatch
                     if is_request {
-                        if let Ok((requested_at, path_hash, req_data)) =
-                            rete_transport::parse_request(&plaintext)
+                        if let Ok((requested_at, path_hash, request_data)) =
+                            rete_transport::parse_request_data(&plaintext)
                         {
                             let request_id = rete_transport::request_id(&plaintext);
-                            let mut handler_packets = self.dispatch_request_handler(
-                                &link_id,
-                                &request_id,
-                                &path_hash,
-                                &req_data,
-                                requested_at,
-                                rng,
-                            );
-                            packets.append(&mut handler_packets);
+                            return match request_data {
+                                rete_transport::RequestData::Bytes(req_data) => {
+                                    let req_data = req_data.to_vec();
+                                    let mut handler_packets = self.dispatch_request_handler(
+                                        &link_id,
+                                        &request_id,
+                                        &path_hash,
+                                        &req_data,
+                                        requested_at,
+                                        rng,
+                                    );
+                                    packets.append(&mut handler_packets);
+                                    IngestOutcome {
+                                        events: vec![NodeEvent::RequestReceived {
+                                            link_id,
+                                            request_id,
+                                            path_hash,
+                                            data: req_data,
+                                        }],
+                                        packets,
+                                        rejection: None,
+                                    }
+                                }
+                                rete_transport::RequestData::EncodedValue(value) => IngestOutcome {
+                                    // TODO: let the parser return a validated range so this
+                                    // can reuse the owned plaintext buffer without a copy.
+                                    events: vec![NodeEvent::RequestValueReceived {
+                                        link_id,
+                                        request_id,
+                                        path_hash,
+                                        requested_at,
+                                        value: value.to_vec(),
+                                    }],
+                                    packets,
+                                    rejection: None,
+                                },
+                            };
+                        } else {
+                            // The advertisement identified this payload as a
+                            // request. Malformed request data is terminal here
+                            // and must not leak into generic resource consumers.
+                            // Keep any proof/resource packets already produced.
                             return IngestOutcome {
-                                events: vec![NodeEvent::RequestReceived {
-                                    link_id,
-                                    request_id,
-                                    path_hash,
-                                    data: req_data,
-                                }],
+                                events: Vec::new(),
                                 packets,
                                 rejection: None,
                             };

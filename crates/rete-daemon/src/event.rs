@@ -393,6 +393,21 @@ pub fn on_node_event(event: NodeEvent) {
                 data_len: data.len(),
             }.emit();
         }
+        NodeEvent::RequestValueReceived {
+            link_id,
+            request_id,
+            path_hash,
+            requested_at,
+            value,
+        } => {
+            ReteEvent::RequestValueReceived {
+                link: hex::encode(link_id),
+                request_id: hex::encode(request_id),
+                path_hash: hex::encode(path_hash),
+                requested_at,
+                value_len: value.len(),
+            }.emit();
+        }
         NodeEvent::ResponseReceived { link_id, request_id, data } => {
             ReteEvent::ResponseReceived {
                 link: hex::encode(link_id),

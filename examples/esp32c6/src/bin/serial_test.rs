@@ -215,6 +215,15 @@ fn handle_event(
             }
         }
 
+        NodeEvent::LinkRttUpdated { link_id, rtt } => {
+            let lh = hex4(&link_id);
+            println!(
+                "[serial-test] LINK_RTT_UPDATED link={} rtt={}",
+                core::str::from_utf8(&lh).unwrap_or("????"),
+                rtt,
+            );
+        }
+
         NodeEvent::ChannelMessages { link_id, messages } => {
             for (msg_type, payload) in &messages {
                 if let Ok(text) = core::str::from_utf8(payload) {
@@ -284,6 +293,31 @@ fn handle_event(
             }
 
             let _ = data; // used for logging
+        }
+
+        NodeEvent::RequestValueReceived {
+            link_id,
+            request_id,
+            path_hash,
+            requested_at,
+            value,
+        } => {
+            let ph = hex4(&path_hash);
+            println!(
+                "[serial-test] REQUEST_VALUE path={} requested_at={} value_len={}",
+                core::str::from_utf8(&ph).unwrap_or("????"),
+                requested_at,
+                value.len(),
+            );
+
+            // The serial test responds explicitly; byte-oriented registered
+            // handlers intentionally do not consume encoded non-byte values.
+            let mut resp = b"esp32-value-response:".to_vec();
+            resp.extend_from_slice(&ph);
+            if let Ok(pkt) = core.send_response(&link_id, &request_id, &resp, rng) {
+                println!("[serial-test] sent value response");
+                out.push(pkt);
+            }
         }
 
         NodeEvent::ResponseReceived {

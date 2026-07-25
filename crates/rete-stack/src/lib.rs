@@ -192,6 +192,26 @@ pub enum NodeEvent {
         /// The request data payload.
         data: alloc::vec::Vec<u8>,
     },
+    /// A link.request() carrying an encoded non-binary/string MessagePack
+    /// value was received on a link.
+    ///
+    /// Existing byte-oriented request handlers are not invoked for this
+    /// variant. Applications can inspect the exact encoded value and respond
+    /// with [`node_core::NodeCore::send_response`].
+    RequestValueReceived {
+        /// The link_id.
+        link_id: LinkId,
+        /// The request_id.
+        request_id: RequestId,
+        /// The path_hash.
+        path_hash: PathHash,
+        /// Timestamp from the request wire format (seconds since epoch).
+        requested_at: f64,
+        /// Exact encoded bytes of the validated MessagePack request value.
+        ///
+        /// A canonical anonymous request contains the single byte `0xc0`.
+        value: alloc::vec::Vec<u8>,
+    },
     /// A link.response() was received on a link.
     ResponseReceived {
         /// The link_id.

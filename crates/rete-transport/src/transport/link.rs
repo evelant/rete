@@ -951,8 +951,8 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                     return IngestResult::Invalid;
                 }
                 link.touch_inbound_at(link_now);
-                match crate::request::parse_request(&dec_buf[..dec_len]) {
-                    Ok((ts, rq_path_hash, data)) => {
+                match crate::request::parse_request_data(&dec_buf[..dec_len]) {
+                    Ok((ts, rq_path_hash, crate::request::RequestData::Bytes(data))) => {
                         // Python RNS uses the packet's truncated hash as request_id
                         // for single-packet requests (Link.py: RequestReceipt uses
                         // packet_receipt.truncated_hash). This is SHA-256(hashable)[..16].
@@ -960,7 +960,16 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                             link_id: *link_id,
                             request_id: rete_core::RequestId::from_slice(&pkt_hash[..TRUNCATED_HASH_LEN]),
                             path_hash: rq_path_hash,
-                            data,
+                            data: data.to_vec(),
+                            requested_at: ts,
+                        }
+                    }
+                    Ok((ts, rq_path_hash, crate::request::RequestData::EncodedValue(value))) => {
+                        IngestResult::RequestValueReceived {
+                            link_id: *link_id,
+                            request_id: rete_core::RequestId::from_slice(&pkt_hash[..TRUNCATED_HASH_LEN]),
+                            path_hash: rq_path_hash,
+                            value: value.to_vec(),
                             requested_at: ts,
                         }
                     }

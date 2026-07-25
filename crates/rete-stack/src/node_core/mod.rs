@@ -1084,8 +1084,10 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
     /// value and is embedded unchanged. Use [`Self::send_request`] when an
     /// ordinary byte slice should be encoded as a MessagePack binary value.
     ///
-    /// This is currently an outbound API. Incoming request-handler dispatch
-    /// remains byte-oriented and accepts binary or string request data.
+    /// Incoming binary and string values retain byte-oriented request-handler
+    /// dispatch. Other validated values are emitted unchanged as
+    /// [`NodeEvent::RequestValueReceived`] so `nil` cannot be confused with an
+    /// empty binary value.
     pub fn send_request_value<R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
@@ -6120,7 +6122,365 @@ mod tests {
     }
 
     #[test]
-    fn invalid_canonical_request_value_does_not_register_pending_state() {
+    fn inbound_nil_request_is_typed_and_manual_response_reclaims_pending_state() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let captured_calls = Arc::clone(&handler_calls);
+        let destination = *resp.dest_hash();
+        resp.register_request_handler(
+            &destination,
+            RequestHandler {
+                path: "/page/index.mu".into(),
+                handler: handler_fn(move |_ctx, _data| {
+                    captured_calls.fetch_add(1, Ordering::SeqCst);
+                    Some(b"legacy handler".to_vec())
+                }),
+                policy: RequestPolicy::AllowAll,
+                compression_policy: ResponseCompressionPolicy::Never,
+            },
+        );
+
+        let (request, request_id) = init
+            .send_request_value(&link_id, "/page/index.mu", None, 1_700_000_000, &mut rng)
+            .unwrap();
+        assert_eq!(init.pending_requests.len(), 1);
+
+        let received = resp.handle_ingest(&request.data, 1_700_000_001, 0, &mut rng);
+        assert!(matches!(
+            received.events.as_slice(),
+            [NodeEvent::RequestValueReceived {
+                link_id: received_link,
+                request_id: received_request,
+                path_hash,
+                requested_at,
+                value,
+            }] if *received_link == link_id
+                && *received_request == request_id
+                && *path_hash == rete_transport::path_hash("/page/index.mu")
+                && *requested_at == 1_700_000_000.0
+                && value == &[0xc0]
+        ));
+        assert!(
+            received.packets.is_empty(),
+            "byte-oriented handlers must not consume canonical nil"
+        );
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+
+        let response = resp
+            .send_response(&link_id, &request_id, b"nomad page", &mut rng)
+            .unwrap();
+        let completed = init.handle_ingest(&response.data, 1_700_000_002, 0, &mut rng);
+        assert!(matches!(
+            completed.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                link_id: response_link,
+                request_id: response_request,
+                data,
+            }] if *response_link == link_id
+                && *response_request == request_id
+                && data == b"nomad page"
+        ));
+        assert!(
+            init.pending_requests.is_empty(),
+            "a correlated response must reclaim the nil request receipt"
+        );
+    }
+
+    #[test]
+    fn inbound_encoded_value_is_preserved_exactly() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let value = [
+            0x81, 0xa8, b'v', b'a', b'r', b'_', b'n', b'a', b'm', b'e', 0xa4, b'R', b'u', b's',
+            b't',
+        ];
+
+        let (request, request_id) = init
+            .send_request_value(
+                &link_id,
+                "/page/form.mu",
+                Some(&value),
+                1_700_000_010,
+                &mut rng,
+            )
+            .unwrap();
+        let received = resp.handle_ingest(&request.data, 1_700_000_011, 0, &mut rng);
+        assert!(matches!(
+            received.events.as_slice(),
+            [NodeEvent::RequestValueReceived {
+                link_id: received_link,
+                request_id: received_request,
+                path_hash,
+                requested_at,
+                value: received_value,
+            }] if *received_link == link_id
+                && *received_request == request_id
+                && *path_hash == rete_transport::path_hash("/page/form.mu")
+                && *requested_at == 1_700_000_010.0
+                && received_value == &value
+        ));
+        assert!(received.packets.is_empty());
+
+        let response = resp
+            .send_response(&link_id, &request_id, b"form accepted", &mut rng)
+            .unwrap();
+        let completed = init.handle_ingest(&response.data, 1_700_000_012, 0, &mut rng);
+        assert!(matches!(
+            completed.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                request_id: response_request,
+                data,
+                ..
+            }] if *response_request == request_id && data == b"form accepted"
+        ));
+        assert!(init.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn inbound_binary_and_string_requests_keep_legacy_handler_semantics() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let destination = *resp.dest_hash();
+        resp.register_request_handler(
+            &destination,
+            RequestHandler {
+                path: "/test/echo".into(),
+                handler: handler_fn(|_ctx, data| Some(data.to_vec())),
+                policy: RequestPolicy::AllowAll,
+                compression_policy: ResponseCompressionPolicy::Never,
+            },
+        );
+
+        let (empty_request, empty_id) = init
+            .send_request(&link_id, "/test/echo", &[], 200, &mut rng)
+            .unwrap();
+        let empty_received = resp.handle_ingest(&empty_request.data, 201, 0, &mut rng);
+        assert!(matches!(
+            empty_received.events.as_slice(),
+            [NodeEvent::RequestReceived {
+                request_id,
+                data,
+                ..
+            }] if *request_id == empty_id && data.is_empty()
+        ));
+        assert_eq!(empty_received.packets.len(), 1);
+        let empty_response = init.handle_ingest(&empty_received.packets[0].data, 202, 0, &mut rng);
+        assert!(matches!(
+            empty_response.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                request_id,
+                data,
+                ..
+            }] if *request_id == empty_id && data.is_empty()
+        ));
+
+        let encoded_string = [0xa2, b'o', b'k'];
+        let (string_request, string_id) = init
+            .send_request_value(&link_id, "/test/echo", Some(&encoded_string), 203, &mut rng)
+            .unwrap();
+        let string_received = resp.handle_ingest(&string_request.data, 204, 0, &mut rng);
+        assert!(matches!(
+            string_received.events.as_slice(),
+            [NodeEvent::RequestReceived {
+                request_id,
+                data,
+                ..
+            }] if *request_id == string_id && data == b"ok"
+        ));
+        assert_eq!(string_received.packets.len(), 1);
+        let string_response =
+            init.handle_ingest(&string_received.packets[0].data, 205, 0, &mut rng);
+        assert!(matches!(
+            string_response.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                request_id,
+                data,
+                ..
+            }] if *request_id == string_id && data == b"ok"
+        ));
+        assert!(init.pending_requests.is_empty());
+    }
+
+    fn pump_resource_exchange<R: RngCore + CryptoRng>(
+        init: &mut TestNodeCore,
+        resp: &mut TestNodeCore,
+        initial_to_init: Vec<OutboundPacket>,
+        now: u64,
+        rng: &mut R,
+    ) -> (Vec<NodeEvent>, Vec<NodeEvent>) {
+        let mut to_init = initial_to_init;
+        let mut to_resp = Vec::new();
+        let mut init_events = Vec::new();
+        let mut resp_events = Vec::new();
+
+        for step in 0..128_u64 {
+            if to_init.is_empty() && to_resp.is_empty() {
+                return (init_events, resp_events);
+            }
+
+            for packet in core::mem::take(&mut to_init) {
+                let outcome = init.handle_ingest(&packet.data, now + step * 2, 0, rng);
+                init_events.extend(outcome.events);
+                to_resp.extend(outcome.packets);
+            }
+
+            for packet in core::mem::take(&mut to_resp) {
+                let outcome = resp.handle_ingest(&packet.data, now + step * 2 + 1, 0, rng);
+                resp_events.extend(outcome.events);
+                to_init.extend(outcome.packets);
+            }
+        }
+
+        panic!(
+            "resource exchange did not settle: {} packets to initiator, {} to responder",
+            to_init.len(),
+            to_resp.len()
+        );
+    }
+
+    fn large_encoded_map() -> Vec<u8> {
+        let payload = vec![0x5a; 1024];
+        let mut value = Vec::with_capacity(1 + 5 + 3 + payload.len());
+        value.extend_from_slice(&[0x81, 0xa4, b'd', b'a', b't', b'a']);
+        value.extend_from_slice(&[0xc5, 0x04, 0x00]);
+        value.extend_from_slice(&payload);
+        value
+    }
+
+    #[test]
+    fn large_encoded_request_resource_delivers_typed_value_and_reclaims_on_response() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let value = large_encoded_map();
+        let requested_at = 1_700_000_020_u64;
+        assert!(value.len() > init.get_link_mdu(&link_id));
+
+        let (advertisement, request_id) = init
+            .send_request_value(
+                &link_id,
+                "/page/large-form.mu",
+                Some(&value),
+                requested_at,
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(
+            Packet::parse(&advertisement.data).unwrap().context,
+            rete_core::CONTEXT_RESOURCE_ADV
+        );
+        assert_eq!(init.pending_requests.len(), 1);
+
+        let offered = resp.handle_ingest(&advertisement.data, requested_at + 1, 0, &mut rng);
+        assert!(matches!(
+            offered.events.as_slice(),
+            [NodeEvent::ResourceOffered { link_id: offered_link, .. }]
+                if *offered_link == link_id
+        ));
+        assert!(!offered.packets.is_empty());
+
+        let (sender_events, receiver_events) = pump_resource_exchange(
+            &mut init,
+            &mut resp,
+            offered.packets,
+            requested_at + 2,
+            &mut rng,
+        );
+        assert!(sender_events
+            .iter()
+            .any(|event| matches!(event, NodeEvent::ResourceComplete { .. })));
+        assert!(receiver_events.iter().any(|event| matches!(
+            event,
+            NodeEvent::RequestValueReceived {
+                link_id: received_link,
+                request_id: received_request,
+                path_hash,
+                requested_at: received_at,
+                value: received_value,
+            } if *received_link == link_id
+                && *received_request == request_id
+                && *path_hash == rete_transport::path_hash("/page/large-form.mu")
+                && *received_at == requested_at as f64
+                && received_value == &value
+        )));
+        assert!(!receiver_events
+            .iter()
+            .any(|event| matches!(event, NodeEvent::ResourceComplete { .. })));
+        assert_eq!(init.pending_requests.len(), 1);
+
+        let response = resp
+            .send_response(&link_id, &request_id, b"large form accepted", &mut rng)
+            .unwrap();
+        let completed =
+            init.handle_ingest(&response.data, requested_at + 300, 0, &mut rng);
+        assert!(matches!(
+            completed.events.as_slice(),
+            [NodeEvent::ResponseReceived {
+                request_id: response_request,
+                data,
+                ..
+            }] if *response_request == request_id && data == b"large form accepted"
+        ));
+        assert!(init.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn malformed_request_resource_is_terminal_after_proof() {
+        let (mut init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let value = large_encoded_map();
+        let mut malformed =
+            rete_transport::build_request_value("/page/broken.mu", Some(&value), 42.0).unwrap();
+        malformed.pop();
+        assert!(malformed.len() > init.get_link_mdu(&link_id));
+
+        let (advertisement, _request_id) = init
+            .send_request_as_resource(&link_id, &malformed, 42, &mut rng)
+            .unwrap();
+        let offered = resp.handle_ingest(&advertisement.data, 43, 0, &mut rng);
+        assert!(matches!(
+            offered.events.as_slice(),
+            [NodeEvent::ResourceOffered { .. }]
+        ));
+
+        let (sender_events, receiver_events) =
+            pump_resource_exchange(&mut init, &mut resp, offered.packets, 44, &mut rng);
+        assert!(
+            sender_events
+                .iter()
+                .any(|event| matches!(event, NodeEvent::ResourceComplete { .. })),
+            "the receiver must preserve and return the resource proof"
+        );
+        assert!(!receiver_events.iter().any(|event| matches!(
+            event,
+            NodeEvent::RequestReceived { .. }
+                | NodeEvent::RequestValueReceived { .. }
+                | NodeEvent::ResourceComplete { .. }
+        )));
+    }
+
+    #[test]
+    fn malformed_encoded_request_emits_no_event_or_response() {
+        let (init, mut resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+        let mut malformed =
+            rete_transport::build_request_value("/page/index.mu", None, 42.0).unwrap();
+        malformed.pop();
+        let packet = init
+            .transport
+            .build_link_data_packet(&link_id, &malformed, rete_core::CONTEXT_REQUEST, &mut rng)
+            .unwrap();
+
+        let received = resp.handle_ingest(&packet, 43, 0, &mut rng);
+        assert!(received.events.is_empty());
+        assert!(received.packets.is_empty());
+    }
+
+    #[test]
+    fn invalid_encoded_request_value_does_not_register_pending_state() {
         let (mut init, _resp, link_id) = two_core_handshake();
         let mut rng = rand::thread_rng();
 

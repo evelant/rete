@@ -35,6 +35,13 @@ pub enum ReteEvent {
 
     // ── Request / Response ──────────────────────────────────────────────
     RequestReceived { link: String, request_id: String, path_hash: String, data_len: usize },
+    RequestValueReceived {
+        link: String,
+        request_id: String,
+        path_hash: String,
+        requested_at: f64,
+        value_len: usize,
+    },
     ResponseReceived { link: String, request_id: String, data_len: usize },
 
     // ── Resource ────────────────────────────────────────────────────────
@@ -87,6 +94,7 @@ impl ReteEvent {
             Self::LinkData { .. } => "LINK_DATA",
             Self::ChannelMsg { .. } => "CHANNEL_MSG",
             Self::RequestReceived { .. } => "REQUEST_RECEIVED",
+            Self::RequestValueReceived { .. } => "REQUEST_VALUE_RECEIVED",
             Self::ResponseReceived { .. } => "RESPONSE_RECEIVED",
             Self::ResourceOffered { .. } => "RESOURCE_OFFERED",
             Self::ResourceComplete { .. } => "RESOURCE_COMPLETE",
@@ -135,6 +143,8 @@ impl ReteEvent {
             Self::ChannelMsg { link, msg_type, payload } => format!("CHANNEL_MSG:{link}:{msg_type}:{payload}"),
             Self::RequestReceived { link, request_id, path_hash, data_len } =>
                 format!("REQUEST_RECEIVED:{link}:{request_id}:{path_hash}:{data_len}"),
+            Self::RequestValueReceived { link, request_id, path_hash, requested_at, value_len } =>
+                format!("REQUEST_VALUE_RECEIVED:{link}:{request_id}:{path_hash}:{requested_at}:{value_len}"),
             Self::ResponseReceived { link, request_id, data_len } =>
                 format!("RESPONSE_RECEIVED:{link}:{request_id}:{data_len}"),
             Self::ResourceOffered { link, resource_hash, total_size } =>
@@ -190,6 +200,8 @@ impl ReteEvent {
                 format!("channel message link={link} type={msg_type}"),
             Self::RequestReceived { link, request_id, path_hash, data_len } =>
                 format!("request received link={link} req={request_id} path={path_hash} len={data_len}"),
+            Self::RequestValueReceived { link, request_id, path_hash, requested_at, value_len } =>
+                format!("request value received link={link} req={request_id} path={path_hash} requested_at={requested_at} len={value_len}"),
             Self::ResponseReceived { link, request_id, data_len } =>
                 format!("response received link={link} req={request_id} len={data_len}"),
             Self::ResourceOffered { link, resource_hash, total_size } =>
