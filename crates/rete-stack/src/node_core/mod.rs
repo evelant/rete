@@ -1235,6 +1235,25 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         )
     }
 
+    /// Reclaim one exact request regardless of its retained dispatch phase.
+    ///
+    /// This is the adapter-reconciliation escape hatch for a disagreement
+    /// between an outer move-only dispatch authority and this scalar request
+    /// table. Normal callers should use [`Self::cancel_prepared_request`] or
+    /// [`Self::cancel_confirmed_request`], which verify the expected phase.
+    /// The complete request and Link identifiers are both required so a stale
+    /// handle cannot remove an unrelated request with the same truncated hash.
+    pub fn reclaim_request_dispatch(
+        &mut self,
+        request_id: &RequestId,
+        link_id: &LinkId,
+    ) -> Option<request_receipt::RequestStatus> {
+        let index = self.pending_requests.iter().position(|pending| {
+            pending.request_id == *request_id && pending.link_id == *link_id
+        })?;
+        Some(self.pending_requests.remove(index).status)
+    }
+
     fn send_packed_request<R: RngCore + CryptoRng>(
         &mut self,
         link_id: &LinkId,
@@ -6682,6 +6701,57 @@ mod tests {
             Err(RequestDispatchError::LinkNotFound)
         ));
         assert_eq!(init.get_request_status(&request_id), None);
+    }
+
+    #[test]
+    fn exact_dispatch_reconciliation_reclaims_either_native_phase() {
+        let (mut init, _resp, link_id) = two_core_handshake();
+        let mut rng = rand::thread_rng();
+
+        let prepared = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/index.mu",
+                None,
+                1_700_000_000.0,
+                &mut rng,
+            )
+            .unwrap();
+        let request_id = prepared.request_id();
+        let other_link = LinkId::from([0x77; TRUNCATED_HASH_LEN]);
+        let other_request = RequestId::from([0x88; TRUNCATED_HASH_LEN]);
+        assert_eq!(
+            init.reclaim_request_dispatch(&request_id, &other_link),
+            None
+        );
+        assert_eq!(
+            init.reclaim_request_dispatch(&other_request, &link_id),
+            None
+        );
+        assert_eq!(
+            init.reclaim_request_dispatch(&request_id, &link_id),
+            Some(request_receipt::RequestStatus::Prepared)
+        );
+        assert_eq!(init.get_request_status(&request_id), None);
+
+        let confirmed = init
+            .prepare_single_packet_request_value(
+                &link_id,
+                "/page/confirmed.mu",
+                None,
+                1_700_000_001.0,
+                &mut rng,
+            )
+            .unwrap();
+        let confirmed_id = confirmed.request_id();
+        let (_, confirmation) = confirmed.into_parts();
+        let confirmed = init.confirm_prepared_request(confirmation, 100).unwrap();
+        assert_eq!(
+            init.reclaim_request_dispatch(&confirmed_id, &link_id),
+            Some(request_receipt::RequestStatus::Sent)
+        );
+        assert_eq!(init.get_request_status(&confirmed_id), None);
+        let _ = confirmed.dispatched();
     }
 
     #[test]
