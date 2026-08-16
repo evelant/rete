@@ -20,23 +20,61 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         }
     }
 
-    /// Store a learned path.  If the table is full, evicts the
-    /// least-recently-used entry first.  Always succeeds.
+    /// Store a learned path. When the table is full, evicts in Python's
+    /// time-expiry cull order first, then falls back to a class-aware
+    /// least-recently-used eviction that reserves shared-medium paths against
+    /// point-to-point announce churn.
+    ///
+    /// Returns `false` only when the table is full, every retained entry is
+    /// shared-medium, and the incoming path is point-to-point.
     pub fn insert_path(&mut self, dest: DestHash, path: Path) -> bool {
         match self.paths.insert(dest, path) {
             Ok(_) => true,
             Err((dest, path)) => {
-                // Table full — evict LRU entry
-                if let Some(lru_key) = self
+                // Table full. `path` is the rejected incoming entry; its
+                // `learned_at` is the current monotonic time used to judge
+                // expiry.
+                let now = path.learned_at;
+                let shared_medium = path.shared_medium;
+
+                // 1. Evict the entry closest to (or already past) its expiry
+                //    boundary, mirroring Python's `prune_paths` cull rather
+                //    than usage-based LRU.
+                let expired_victim = self
                     .paths
                     .iter()
-                    .min_by_key(|(_, p)| p.last_accessed)
-                    .map(|(k, _)| *k)
-                {
-                    self.paths.remove(&lru_key);
-                    self.paths.insert(dest, path).is_ok()
-                } else {
-                    false
+                    .filter(|(_, p)| now >= p.learned_at.saturating_add(p.expiry_time()))
+                    .min_by_key(|(_, p)| p.learned_at.saturating_add(p.expiry_time()))
+                    .map(|(k, _)| *k);
+
+                // 2. Class-aware LRU fallback. A shared-medium entry may
+                //    displace a point-to-point entry first, falling back to any
+                //    entry only when none is point-to-point. A point-to-point
+                //    entry may only displace another point-to-point entry, so
+                //    it cannot evict reserved shared-medium routes.
+                let victim = expired_victim.or_else(|| {
+                    let point_to_point_victim = self
+                        .paths
+                        .iter()
+                        .filter(|(_, p)| !p.shared_medium)
+                        .min_by_key(|(_, p)| p.last_accessed)
+                        .map(|(k, _)| *k);
+                    if shared_medium && point_to_point_victim.is_none() {
+                        self.paths
+                            .iter()
+                            .min_by_key(|(_, p)| p.last_accessed)
+                            .map(|(k, _)| *k)
+                    } else {
+                        point_to_point_victim
+                    }
+                });
+
+                match victim {
+                    Some(victim) => {
+                        self.paths.remove(&victim);
+                        self.paths.insert(dest, path).is_ok()
+                    }
+                    None => false,
                 }
             }
         }
@@ -99,27 +137,43 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         pub_key: [u8; 64],
         now: u64,
     ) {
-        self.insert_identity(dest_hash, pub_key);
+        self.insert_identity(dest_hash, pub_key, true);
         let _ = self.insert_path(dest_hash, Path::direct(now));
     }
 
-    /// Store a known identity.  If the table is full, evicts the entry
-    /// whose matching path has the oldest `last_accessed` (or `0` for
-    /// identities with no corresponding path — evicted first).
-    pub(super) fn insert_identity(&mut self, dest_hash: DestHash, pub_key: [u8; 64]) {
-        match self.known_identities.insert(dest_hash, pub_key) {
-            Ok(_) => {}
-            Err((dest_hash, pub_key)) => {
-                if let Some(lru_key) = self
-                    .known_identities
+    /// Store a known identity. When the table is full, mirrors the class-aware
+    /// path eviction so a retained shared-medium path keeps its recalled
+    /// identity: it prefers to evict a point-to-point identity, and never
+    /// evicts a shared-medium identity for a point-to-point insert. Identities
+    /// without a retained path are treated as point-to-point and evicted first.
+    pub(super) fn insert_identity(
+        &mut self,
+        dest_hash: DestHash,
+        pub_key: [u8; 64],
+        shared_medium: bool,
+    ) {
+        if self.known_identities.insert(dest_hash, pub_key).is_ok() {
+            return;
+        }
+        let point_to_point_victim = self
+            .known_identities
+            .keys()
+            .filter(|k| !self.paths.get(*k).is_some_and(|p| p.shared_medium))
+            .min_by_key(|k| self.paths.get(*k).map(|p| p.last_accessed).unwrap_or(0))
+            .copied();
+        let victim = point_to_point_victim.or_else(|| {
+            if shared_medium {
+                self.known_identities
                     .keys()
                     .min_by_key(|k| self.paths.get(*k).map(|p| p.last_accessed).unwrap_or(0))
                     .copied()
-                {
-                    self.known_identities.remove(&lru_key);
-                    let _ = self.known_identities.insert(dest_hash, pub_key);
-                }
+            } else {
+                None
             }
+        });
+        if let Some(victim) = victim {
+            self.known_identities.remove(&victim);
+            let _ = self.known_identities.insert(dest_hash, pub_key);
         }
     }
 
@@ -183,7 +237,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// overflow the table are silently dropped.
     pub fn load_snapshot(&mut self, snap: &snapshot::Snapshot) {
         for ie in &snap.identities {
-            self.insert_identity(ie.dest_hash, ie.pub_key);
+            self.insert_identity(ie.dest_hash, ie.pub_key, false);
         }
     }
 }

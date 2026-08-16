@@ -733,6 +733,14 @@ pub struct Transport<S: TransportStorage> {
     pub(super) link_table: S::LinkTableMap,
     /// Announce rate limiting: dest_hash → (last_announce_time, violations, blocked_until).
     pub(super) announce_rate: S::AnnounceRateMap,
+    /// Bitmask of interface indices treated as shared-medium.
+    ///
+    /// Shared-medium interfaces (for example LoRa) are reserved against
+    /// eviction by point-to-point announce churn. The product adapter marks
+    /// these once at construction; announce learning then records the class on
+    /// each learned path so a bounded path table cannot let a high-rate TCP
+    /// border interface displace the local shared-medium routes.
+    pub(super) shared_medium_interfaces: u64,
     /// Pending split resource segments waiting to be advertised.
     pub(super) split_send_queue: alloc::vec::Vec<SplitSendEntry>,
     /// Cumulative transport-layer counters.
@@ -796,6 +804,7 @@ impl<S: TransportStorage> Transport<S> {
             resource_outbound: alloc::vec::Vec::new(),
             link_table: Default::default(),
             announce_rate: Default::default(),
+            shared_medium_interfaces: 0,
             split_send_queue: alloc::vec::Vec::new(),
             stats: TransportStats::default(),
         }
@@ -834,6 +843,7 @@ impl<S: TransportStorage> Transport<S> {
             core::ptr::addr_of_mut!((*ptr).resource_outbound).write(Vec::new());
             core::ptr::addr_of_mut!((*ptr).link_table).write(Default::default());
             core::ptr::addr_of_mut!((*ptr).announce_rate).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).shared_medium_interfaces).write(0);
             core::ptr::addr_of_mut!((*ptr).split_send_queue).write(Vec::new());
             core::ptr::addr_of_mut!((*ptr).stats).write(TransportStats::default());
 
@@ -866,6 +876,22 @@ impl<S: TransportStorage> Transport<S> {
     /// Set the local identity hash, enabling HEADER_2 forwarding.
     pub fn set_local_identity(&mut self, hash: IdentityHash) {
         self.local_identity_hash = Some(hash);
+    }
+
+    /// Mark one interface index as shared-medium.
+    ///
+    /// Shared-medium paths are reserved against eviction by point-to-point
+    /// announce churn. Interface indices at or above 64 are outside the
+    /// embedded routing profile and are ignored.
+    pub fn mark_interface_shared_medium(&mut self, iface: u8) {
+        if iface < 64 {
+            self.shared_medium_interfaces |= 1_u64 << iface;
+        }
+    }
+
+    /// Whether one interface index was marked as shared-medium.
+    pub fn interface_is_shared_medium(&self, iface: u8) -> bool {
+        iface < 64 && (self.shared_medium_interfaces & (1_u64 << iface)) != 0
     }
 
     /// Get the local identity hash (transport node ID), if set.
@@ -2167,6 +2193,81 @@ mod tests {
         let result = transport.tick(100 + PATH_EXPIRES + 1);
         assert_eq!(result.expired_paths, 1);
         assert_eq!(transport.path_count(), 0);
+    }
+
+    #[test]
+    fn expired_path_is_evicted_before_lru_on_insert() {
+        let mut transport = TestTransport::new();
+        let stale = DestHash::from([0xEEu8; TRUNCATED_HASH_LEN]);
+
+        // A long-expired entry whose LRU clock was later advanced past the
+        // recent entries' clocks, so only expiry-first eviction can remove it.
+        let mut stale_path = Path::direct(0);
+        stale_path.shared_medium = false;
+        assert!(transport.insert_path(stale, stale_path));
+        transport.touch_path(&stale, 700_000);
+
+        // Recent, unexpired entries fill the remainder of the table.
+        let now = PATH_EXPIRES + 1_000;
+        for i in 0u8..63 {
+            let dest = DestHash::from([i; TRUNCATED_HASH_LEN]);
+            let mut path = Path::direct(now);
+            path.shared_medium = false;
+            assert!(transport.insert_path(dest, path));
+        }
+        assert_eq!(transport.path_count(), 64);
+
+        // One more recent entry: the expired stale entry is removed first even
+        // though it is not the least-recently-used, and a recent entry remains.
+        let extra = DestHash::from([0xDDu8; TRUNCATED_HASH_LEN]);
+        let mut extra_path = Path::direct(now + 1);
+        extra_path.shared_medium = false;
+        assert!(transport.insert_path(extra, extra_path));
+        assert!(transport.get_path(&stale).is_none());
+        assert!(transport.get_path(&DestHash::from([0u8; TRUNCATED_HASH_LEN])).is_some());
+    }
+
+    #[test]
+    fn shared_medium_paths_survive_point_to_point_churn() {
+        let mut transport = TestTransport::new();
+        let shared = DestHash::from([0xEEu8; TRUNCATED_HASH_LEN]);
+
+        let mut shared_path = Path::direct(0);
+        shared_path.shared_medium = true;
+        assert!(transport.insert_path(shared, shared_path));
+
+        // Point-to-point churn beyond capacity must never displace the
+        // shared-medium route.
+        for i in 0u8..128 {
+            let dest = DestHash::from([i; TRUNCATED_HASH_LEN]);
+            let mut path = Path::direct(i as u64);
+            path.shared_medium = false;
+            let _ = transport.insert_path(dest, path);
+        }
+
+        assert!(transport.get_path(&shared).is_some());
+        assert_eq!(transport.path_count(), 64);
+    }
+
+    #[test]
+    fn point_to_point_insert_cannot_displace_shared_medium_only_table() {
+        let mut transport = TestTransport::new();
+        for i in 0u8..64 {
+            let dest = DestHash::from([i; TRUNCATED_HASH_LEN]);
+            let mut path = Path::direct(1_000);
+            path.shared_medium = true;
+            assert!(transport.insert_path(dest, path));
+        }
+        assert_eq!(transport.path_count(), 64);
+
+        let extra = DestHash::from([0xEEu8; TRUNCATED_HASH_LEN]);
+        let mut extra_path = Path::direct(1_001);
+        extra_path.shared_medium = false;
+        assert!(!transport.insert_path(extra, extra_path));
+        assert_eq!(transport.path_count(), 64);
+        for i in 0u8..64 {
+            assert!(transport.get_path(&DestHash::from([i; TRUNCATED_HASH_LEN])).is_some());
+        }
     }
 
     #[test]

@@ -84,6 +84,15 @@ pub struct Path {
     /// Interface index the announce was received on (for relay routing).
     /// Matches Python `IDX_PT_RVCD_IF`.
     pub received_on: Option<u8>,
+    /// Whether this path was learned on a shared-medium interface.
+    ///
+    /// Shared-medium routes are reserved against eviction by point-to-point
+    /// announce churn: a bounded path table cannot let a high-rate TCP border
+    /// interface displace the local LoRa routes an operator relies on. Paths
+    /// created outside announce learning (deterministic seeds) default to
+    /// shared-medium; announce learning overwrites this from the ingress
+    /// interface's configured media class.
+    pub shared_medium: bool,
 }
 
 impl Path {
@@ -98,6 +107,7 @@ impl Path {
             announce_raw: None,
             interface_mode: InterfaceMode::Default,
             received_on: None,
+            shared_medium: true,
         }
     }
 
@@ -112,6 +122,7 @@ impl Path {
             announce_raw: None,
             interface_mode: InterfaceMode::Default,
             received_on: None,
+            shared_medium: true,
         }
     }
 

@@ -190,13 +190,14 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                         retransmit_raw.as_deref().unwrap_or(raw),
                     );
                     path.received_on = Some(iface);
+                    path.shared_medium = self.interface_is_shared_medium(iface);
                     let _ = self.insert_path(dh, path);
                     self.stats.paths_learned += 1;
                 }
 
                 let mut pk = [0u8; 64];
                 pk.copy_from_slice(info.pub_key);
-                self.insert_identity(dh, pk);
+                self.insert_identity(dh, pk, self.interface_is_shared_medium(iface));
 
                 // Released Python Reticulum only schedules received announces
                 // for rebroadcast when transport is enabled (or when bridging
