@@ -107,6 +107,7 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             local_rebroadcasts: 0,
             block_rebroadcasts: false,
             received_hops: 0,
+            attached_interface: None,
         })
     }
 
@@ -118,7 +119,13 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
         self.transport
             .pending_outbound(now, rng)
             .into_iter()
-            .map(OutboundPacket::broadcast)
+            .map(|announce| match announce.attached_interface {
+                Some(interface) => OutboundPacket::new(
+                    announce.raw,
+                    super::PacketRouting::ExactInterface(interface),
+                ),
+                None => OutboundPacket::broadcast(announce.raw),
+            })
             .collect()
     }
 

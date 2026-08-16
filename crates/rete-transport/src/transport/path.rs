@@ -70,8 +70,8 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     pub fn cached_announces(&self) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
         let mut out = alloc::vec::Vec::new();
         for (_dest, path) in self.paths.iter() {
-            if let Some(ref raw) = path.announce_raw {
-                out.push(raw.clone());
+            if let Some(raw) = &path.announce_raw {
+                out.push(raw.to_vec());
             }
         }
         out
@@ -83,7 +83,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     /// that `cached_announces()` includes it for new-interface flush.
     pub fn store_announce_raw(&mut self, dest: &DestHash, raw: &[u8]) {
         if let Some(path) = self.paths.get_mut(dest) {
-            path.announce_raw = Some(raw.to_vec());
+            path.announce_raw = crate::path::AnnounceCache::store(raw);
         }
     }
 
@@ -150,7 +150,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 last_snr: p.last_snr,
                 hops: p.hops,
                 announce_raw: if include_announce {
-                    p.announce_raw.clone()
+                    p.announce_raw.as_ref().map(|raw| raw.to_vec())
                 } else {
                     None
                 },

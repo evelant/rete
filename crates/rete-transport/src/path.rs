@@ -5,6 +5,49 @@ extern crate alloc;
 use alloc::vec::Vec;
 use rete_core::IdentityHash;
 
+/// Maximum retained raw announce bytes cached inline on one path.
+///
+/// One complete Reticulum announce never exceeds the transport MTU, so this
+/// inline capacity retains every announce without a heap allocation.
+pub const ANNOUNCE_CACHE_CAPACITY: usize = rete_core::MTU;
+
+/// Inline, fixed-capacity cache for one raw announce packet.
+///
+/// Retained inline on the owning [`Path`] rather than in a heap `Vec` so a
+/// large path table keeps its announce cache in the caller's backing storage
+/// (PSRAM on embedded products) instead of consuming the strict internal heap
+/// required by a Wi-Fi or BLE controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnnounceCache {
+    bytes: [u8; ANNOUNCE_CACHE_CAPACITY],
+    len: u16,
+}
+
+impl AnnounceCache {
+    /// Retain `raw` when it fits the fixed inline capacity.
+    pub fn store(raw: &[u8]) -> Option<Self> {
+        if raw.len() > ANNOUNCE_CACHE_CAPACITY {
+            return None;
+        }
+        let mut bytes = [0_u8; ANNOUNCE_CACHE_CAPACITY];
+        bytes[..raw.len()].copy_from_slice(raw);
+        Some(Self {
+            bytes,
+            len: raw.len() as u16,
+        })
+    }
+
+    /// Borrow the cached announce bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    /// Copy the cached announce bytes into a transient heap vector.
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+}
+
 /// Interface mode — determines path expiry timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterfaceMode {
@@ -35,7 +78,7 @@ pub struct Path {
     /// Hop count to destination.
     pub hops: u8,
     /// Cached raw announce packet (for path request responses).
-    pub announce_raw: Option<Vec<u8>>,
+    pub announce_raw: Option<AnnounceCache>,
     /// Interface mode this path was learned on.
     pub interface_mode: InterfaceMode,
     /// Interface index the announce was received on (for relay routing).
@@ -111,7 +154,7 @@ mod tests {
         assert!(path.announce_raw.is_none());
 
         let raw_data = alloc::vec![0x01, 0x02, 0x03];
-        path.announce_raw = Some(raw_data.clone());
-        assert_eq!(path.announce_raw.as_ref().unwrap(), &raw_data);
+        path.announce_raw = AnnounceCache::store(&raw_data);
+        assert_eq!(path.announce_raw.as_ref().unwrap().as_slice(), &raw_data[..]);
     }
 }

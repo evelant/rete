@@ -181,6 +181,22 @@ pub struct PendingAnnounce {
     pub block_rebroadcasts: bool,
     /// Hop count at which this announce was received (for rebroadcast detection).
     pub received_hops: u8,
+    /// Exact interface for a cached path response, or `None` for ordinary
+    /// announce propagation.
+    ///
+    /// Reticulum binds a known-path response to the interface that supplied
+    /// the request. Retaining that provenance across the path-response grace
+    /// delay prevents the cached announce from escaping onto unrelated links.
+    pub attached_interface: Option<u8>,
+}
+
+/// One due announce with any delayed exact-interface attachment preserved.
+#[derive(Debug, Clone)]
+pub struct PendingOutboundAnnounce {
+    /// Complete raw packet bytes (header + payload).
+    pub raw: Vec<u8>,
+    /// Exact egress retained for a cached path response.
+    pub attached_interface: Option<u8>,
 }
 
 #[cfg(test)]

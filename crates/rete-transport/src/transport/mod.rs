@@ -9,6 +9,7 @@ pub use link::{ChannelMaintenanceAction, PendingChannelRetry, PendingChannelTear
 pub use resource::ResourceOptions;
 
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 /// Relay debug logging — only available when the `relay-debug` feature is enabled.
 macro_rules! relay_log {
@@ -68,9 +69,20 @@ pub const LOCAL_REBROADCASTS_MAX: u8 = 2;
 /// Python: `PATH_REQUEST_GRACE = 0.4` — we use 1s since we work in integer seconds.
 pub const PATH_REQUEST_GRACE: u64 = 1;
 
-/// Minimum interval (seconds) between path requests for the same destination.
-/// Python: `PATH_REQUEST_MI = 20`
-pub const PATH_REQUEST_MI: u64 = 20;
+/// Whether an incoming physical-interface packet has Python Reticulum's
+/// accepted path-request envelope.
+///
+/// Python increments the ingress hop before packet filtering and accepts PLAIN
+/// non-announce packets only through post-increment hop one, so the wire hop
+/// must be zero. HEADER_2 ownership is validated separately against the local
+/// transport identity. Context is intentionally unrestricted by the reference
+/// handler.
+pub fn is_path_request_ingress(packet: &Packet<'_>) -> bool {
+    packet.packet_type == PacketType::Data
+        && packet.dest_type == DestType::Plain
+        && packet.destination_hash == PATH_REQUEST_DEST.as_ref()
+        && packet.hops == 0
+}
 
 /// Default announce rate target (seconds between announces per destination).
 /// Python: interface-configurable, defaults to None (disabled).
@@ -580,6 +592,11 @@ pub enum IngestResult<'a> {
         /// The raw path request payload to forward.
         payload: alloc::vec::Vec<u8>,
     },
+    /// A known-path response could not be retained in the bounded announce queue.
+    PathResponseQueueFull {
+        /// Destination whose source-bound response was not admitted.
+        dest_hash: DestHash,
+    },
     /// Packet was malformed or invalid.
     Invalid,
 }
@@ -690,6 +707,12 @@ pub struct Transport<S: TransportStorage> {
     pub(super) reverse_table: S::ReverseMap,
     /// Dedup window for announce random_hashes (replay detection).
     pub(super) announce_dedup: DedupWindow<S::DedupDeque>,
+    /// Independent destination-plus-tag deduplication for received path requests.
+    ///
+    /// Python does not apply `PATH_REQUEST_MI` to ingress. Keeping this window
+    /// separate prevents path-request churn from evicting signed announce
+    /// replay state.
+    pub(super) path_request_dedup: DedupWindow<S::DedupDeque>,
     /// Destination hashes registered as local (self-announce filtering, local delivery routing).
     pub(super) local_destinations: alloc::vec::Vec<DestHash>,
     /// Active link sessions, keyed by link_id.
@@ -710,8 +733,6 @@ pub struct Transport<S: TransportStorage> {
     pub(super) link_table: S::LinkTableMap,
     /// Announce rate limiting: dest_hash → (last_announce_time, violations, blocked_until).
     pub(super) announce_rate: S::AnnounceRateMap,
-    /// Path request throttling: dest_hash → last_request_time.
-    pub(super) path_request_times: S::PathRequestTimeMap,
     /// Pending split resource segments waiting to be advertised.
     pub(super) split_send_queue: alloc::vec::Vec<SplitSendEntry>,
     /// Cumulative transport-layer counters.
@@ -765,6 +786,7 @@ impl<S: TransportStorage> Transport<S> {
             local_identity_hash: None,
             reverse_table: Default::default(),
             announce_dedup: Default::default(),
+            path_request_dedup: Default::default(),
             local_destinations: Default::default(),
             links: Default::default(),
             receipts: Default::default(),
@@ -774,9 +796,48 @@ impl<S: TransportStorage> Transport<S> {
             resource_outbound: alloc::vec::Vec::new(),
             link_table: Default::default(),
             announce_rate: Default::default(),
-            path_request_times: Default::default(),
             split_send_queue: alloc::vec::Vec::new(),
             stats: TransportStats::default(),
+        }
+    }
+
+    /// Create a new, empty transport directly in caller-provided storage.
+    ///
+    /// Unlike [`Self::new`], this constructor never materialises the complete
+    /// transport as a temporary value. This is important for large bounded
+    /// storage backends on targets with a small task stack.
+    #[inline(never)]
+    pub fn new_in(destination: &mut MaybeUninit<Self>) -> &mut Self {
+        let ptr = destination.as_mut_ptr();
+
+        // SAFETY: `ptr` is aligned, non-null and uniquely borrowed through the
+        // `MaybeUninit<Self>`. Each field below is written exactly once, no
+        // reference to the enclosing `Self` is created while it is partially
+        // initialised, and the final reference is produced only after every
+        // field has been initialised. If a field initializer panics, no `Self`
+        // reference escapes; already-written fields are leaked, which is safe.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).paths).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).announces).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).dedup).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).known_identities).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).local_identity_hash).write(None);
+            core::ptr::addr_of_mut!((*ptr).reverse_table).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).announce_dedup).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).path_request_dedup).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).local_destinations).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).links).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).receipts).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).link_data_receipts).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).channel_receipts).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).resources).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).resource_outbound).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).link_table).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).announce_rate).write(Default::default());
+            core::ptr::addr_of_mut!((*ptr).split_send_queue).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).stats).write(TransportStats::default());
+
+            &mut *ptr
         }
     }
 
@@ -1191,6 +1252,27 @@ impl<S: TransportStorage> Transport<S> {
             }
         }
 
+        // Python accepts ANNOUNCE only for SINGLE destinations. Destination
+        // type is outside the signed announce payload, so reject this before
+        // replay or path state can be mutated.
+        if pkt.packet_type == PacketType::Announce && pkt.dest_type != DestType::Single {
+            self.stats.packets_dropped_invalid += 1;
+            return IngestResult::Invalid;
+        }
+
+        // Python increments ingress before filtering and rejects non-announce
+        // PLAIN packets above post-increment hop one. Physical wire ingress
+        // must therefore be at hop zero. Apply this before either packet or
+        // path-request dedup state changes.
+        if pkt.dest_type == DestType::Plain
+            && pkt.packet_type != PacketType::Announce
+            && pkt.hops > 0
+        {
+            self.stats.packets_dropped_invalid += 1;
+            return IngestResult::Invalid;
+        }
+        let is_path_request = is_path_request_ingress(&pkt);
+
         // Compute packet hash for dedup
         let pkt_hash = pkt.compute_hash();
 
@@ -1224,7 +1306,13 @@ impl<S: TransportStorage> Transport<S> {
             && !self
                 .links
                 .contains_key(&LinkId::from_slice(pkt.destination_hash));
-        if !is_foreign_link_transit && !is_valid_owned_keepalive && self.is_duplicate(&pkt_hash) {
+        let is_single_announce =
+            pkt.packet_type == PacketType::Announce && pkt.dest_type == DestType::Single;
+        if !is_single_announce
+            && !is_foreign_link_transit
+            && !is_valid_owned_keepalive
+            && self.is_duplicate(&pkt_hash)
+        {
             relay_log!(
                 "[relay] DEDUP pkt_hash={} type={:?} dest_type={:?}",
                 hex_short(&pkt_hash),
@@ -1393,8 +1481,8 @@ impl<S: TransportStorage> Transport<S> {
                 let dh = DestHash::from_slice(pkt.destination_hash);
 
                 // Path request handling
-                if self.local_identity_hash.is_some() && dh == PATH_REQUEST_DEST {
-                    return self.handle_path_request(pkt.payload, now);
+                if self.local_identity_hash.is_some() && is_path_request {
+                    return self.handle_path_request(pkt.payload, now, iface);
                 }
 
                 // Link data handling: dest_type == Link
@@ -2033,6 +2121,34 @@ mod tests {
     type TwoRelayTransport = Transport<crate::HeaplessStorage<8, 4, 16, 2>>;
 
     #[test]
+    fn new_in_initializes_empty_transport_in_place() {
+        let mut destination = MaybeUninit::<TestTransport>::uninit();
+        let local_destination = DestHash::from([0xA5; TRUNCATED_HASH_LEN]);
+
+        {
+            let transport = TestTransport::new_in(&mut destination);
+
+            assert_eq!(transport.path_count(), 0);
+            assert_eq!(transport.announce_count(), 0);
+            assert_eq!(transport.link_count(), 0);
+            assert_eq!(transport.receipt_count(), 0);
+            assert_eq!(transport.link_data_receipt_count(), 0);
+            assert_eq!(transport.channel_receipt_count(), 0);
+            assert_eq!(transport.reverse_count(), 0);
+            assert_eq!(transport.relay_link_count(), 0);
+            assert_eq!(transport.local_identity_hash(), None);
+            assert_eq!(transport.stats().packets_received, 0);
+
+            transport.add_local_destination(local_destination);
+            assert!(transport.is_local_destination(&local_destination));
+        }
+
+        // SAFETY: `new_in` returned successfully, so every field is initialized,
+        // and the mutable reference above no longer borrows `destination`.
+        unsafe { destination.assume_init_drop() };
+    }
+
+    #[test]
     fn test_path_expiry() {
         let mut transport = TestTransport::new();
         let dest = DestHash::from([0xAAu8; TRUNCATED_HASH_LEN]);
@@ -2068,6 +2184,7 @@ mod tests {
                 local_rebroadcasts: 0,
                 block_rebroadcasts: false,
                 received_hops: 0,
+                attached_interface: None,
             };
             assert!(
                 transport.queue_announce(ann),
@@ -2087,6 +2204,7 @@ mod tests {
             local_rebroadcasts: 0,
             block_rebroadcasts: false,
             received_hops: 0,
+            attached_interface: None,
         };
         assert!(
             !transport.queue_announce(overflow),

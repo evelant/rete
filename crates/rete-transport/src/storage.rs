@@ -86,7 +86,6 @@ pub trait TransportStorage: Default {
     type PathMap: StorageMap<DestHash, Path>;
     type IdentityMap: StorageMap<DestHash, [u8; 64]>;
     type AnnounceRateMap: StorageMap<DestHash, AnnounceRateEntry>;
-    type PathRequestTimeMap: StorageMap<DestHash, u64>;
 
     // --- PATH-capacity maps (keyed by truncated packet hash) ---
     type ReverseMap: StorageMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry>;
@@ -138,7 +137,6 @@ impl<const P: usize, const A: usize, const D: usize, const L: usize> TransportSt
     type PathMap = FnvIndexMap<DestHash, Path, P>;
     type IdentityMap = FnvIndexMap<DestHash, [u8; 64], P>;
     type AnnounceRateMap = FnvIndexMap<DestHash, AnnounceRateEntry, P>;
-    type PathRequestTimeMap = FnvIndexMap<DestHash, u64, P>;
 
     type ReverseMap = FnvIndexMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry, P>;
     type ReceiptMap = FnvIndexMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt, P>;

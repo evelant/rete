@@ -1,11 +1,11 @@
 //! Announce queue, handling, rate limiting, path requests.
 
-use crate::announce::{validate_announce, PendingAnnounce};
+use crate::announce::{validate_announce, PendingAnnounce, PendingOutboundAnnounce};
 use crate::path::Path;
 use crate::storage::{StorageDeque, StorageMap};
 use rete_core::{
-    DestHash, DestType, HeaderType, Identity, IdentityHash, Packet, PacketBuilder, PacketType,
-    NAME_HASH_LEN, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
+    CONTEXT_PATH_RESPONSE, DestHash, DestType, HeaderType, Identity, IdentityHash, Packet,
+    PacketBuilder, PacketType, NAME_HASH_LEN, TRANSPORT_TYPE_TRANSPORT, TRUNCATED_HASH_LEN,
 };
 use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -13,8 +13,20 @@ use sha2::{Digest, Sha256};
 use super::{
     AnnounceRateEntry, IngestResult, ANNOUNCE_RATE_GRACE, ANNOUNCE_RATE_PENALTY,
     ANNOUNCE_RATE_TARGET, LOCAL_REBROADCASTS_MAX, PATH_REQUEST_DEST, PATH_REQUEST_GRACE,
-    PATH_REQUEST_MI, PATHFINDER_G, PATHFINDER_M, PATHFINDER_R, PATHFINDER_RW_MS, Transport,
+    PATHFINDER_G, PATHFINDER_M, PATHFINDER_R, PATHFINDER_RW_MS, Transport,
 };
+
+struct ParsedPathRequest<'a> {
+    destination: DestHash,
+    requester_transport_id: Option<IdentityHash>,
+    tag: &'a [u8],
+}
+
+enum PathResponseQueueAdmission {
+    Queued,
+    Replaced,
+    Full,
+}
 
 impl<S: crate::storage::TransportStorage> Transport<S> {
     /// Queue an announce for transmission. Returns `false` if queue is full.
@@ -58,7 +70,10 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 replay_key[TRUNCATED_HASH_LEN..TRUNCATED_HASH_LEN + 10]
                     .copy_from_slice(info.random_hash);
                 let replay_hash: [u8; 32] = Sha256::digest(replay_key).into();
-                if self.announce_dedup.check_and_insert(&replay_hash) {
+                let restores_missing_path = self.paths.get(&dh_check).is_none();
+                if self.announce_dedup.check_and_insert(&replay_hash)
+                    && !restores_missing_path
+                {
                     // Track local rebroadcasts: if we have this announce
                     // pending, note that we heard it echoed back.
                     self.note_local_rebroadcast(&dh_check, pkt.hops);
@@ -171,8 +186,8 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                     // responses identify us as the relay, not the upstream node.
                     // Fall back to the original raw bytes when not in transport
                     // mode or when the rebuild failed.
-                    path.announce_raw = Some(
-                        retransmit_raw.clone().unwrap_or_else(|| raw.to_vec()),
+                    path.announce_raw = crate::path::AnnounceCache::store(
+                        retransmit_raw.as_deref().unwrap_or(raw),
                     );
                     path.received_on = Some(iface);
                     let _ = self.insert_path(dh, path);
@@ -188,7 +203,10 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                 // a local shared-instance client, which this core does not yet
                 // model). Endpoint nodes still learn and cache the path, but
                 // must not become announce relays implicitly.
-                if self.local_identity_hash.is_some() && pkt.hops < PATHFINDER_M {
+                if self.local_identity_hash.is_some()
+                    && pkt.context != CONTEXT_PATH_RESPONSE
+                    && pkt.hops < PATHFINDER_M
+                {
                     let ann_raw = match retransmit_raw {
                         Some(v) => v,
                         None => raw.to_vec(),
@@ -204,6 +222,7 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
                             local_rebroadcasts: 0,
                             block_rebroadcasts: false,
                             received_hops: pkt.hops,
+                            attached_interface: None,
                         };
                         let _ = self.queue_announce(pending);
                     }
@@ -229,67 +248,112 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         }
     }
 
-    pub(super) fn handle_path_request<'a>(&mut self, payload: &[u8], now: u64) -> IngestResult<'a> {
-        if payload.len() < TRUNCATED_HASH_LEN {
-            return IngestResult::Invalid;
-        }
-        let requested = DestHash::from_slice(&payload[..TRUNCATED_HASH_LEN]);
+    pub(super) fn handle_path_request<'a>(
+        &mut self,
+        payload: &[u8],
+        now: u64,
+        received_on: u8,
+    ) -> IngestResult<'a> {
+        let Some(request) = parse_path_request(payload) else {
+            // Python ignores tagless path requests. They are structurally
+            // parseable DATA, but cannot participate in discovery deduplication.
+            return IngestResult::Duplicate;
+        };
+        let requested = request.destination;
 
-        // Path request throttling: minimum interval between requests for same dest
-        if let Some(&last_time) = self.path_request_times.get(&requested) {
-            if now.saturating_sub(last_time) < PATH_REQUEST_MI {
-                return IngestResult::Duplicate;
-            }
+        // Python deduplicates exactly destination+tag before local, cached or
+        // recursive handling. Requester transport identity is deliberately not
+        // part of the key.
+        let mut hasher = Sha256::new();
+        hasher.update(requested.as_ref());
+        hasher.update(request.tag);
+        let request_hash: [u8; 32] = hasher.finalize().into();
+        if self.path_request_dedup.check_and_insert(&request_hash) {
+            self.stats.packets_dropped_dedup += 1;
+            return IngestResult::Duplicate;
         }
-        let _ = self.path_request_times.insert(requested, now);
 
         // Check if we have a local destination for this hash
         if self.is_local_destination(&requested) {
             // Local destination — handled by NodeCore (it will announce in response)
             return IngestResult::PathRequestForward {
-                payload: payload.to_vec(),
+                payload: self.rebuild_recursive_path_request(&request),
             };
         }
 
         // Check if we know a path (have a cached announce)
-        if let Some(path) = self.paths.get(&requested) {
-            if let Some(ref cached) = path.announce_raw {
-                let pending = PendingAnnounce {
-                    dest_hash: requested,
-                    raw: cached.clone(),
-                    tx_count: 0,
-                    retransmit_timeout: now + PATH_REQUEST_GRACE,
-                    local: false,
-                    local_rebroadcasts: 0,
-                    block_rebroadcasts: true,
-                    received_hops: 0,
-                };
-                let _ = self.queue_announce(pending);
-                return IngestResult::Duplicate;
-            }
+        let known_response = self.paths.get(&requested).and_then(|path| {
+            let requester_is_next_hop = request
+                .requester_transport_id
+                .is_some_and(|requester| path.via == Some(requester));
+            (!requester_is_next_hop)
+                .then(|| path.announce_raw.as_ref().map(|raw| raw.to_vec()))
+                .flatten()
+        });
+        if let Some(cached) = known_response {
+            let pending = PendingAnnounce {
+                dest_hash: requested,
+                raw: cached,
+                tx_count: 0,
+                retransmit_timeout: now + PATH_REQUEST_GRACE,
+                local: false,
+                local_rebroadcasts: 0,
+                block_rebroadcasts: true,
+                received_hops: 0,
+                attached_interface: Some(received_on),
+            };
+            return match self.queue_path_response(pending) {
+                PathResponseQueueAdmission::Queued | PathResponseQueueAdmission::Replaced => {
+                    IngestResult::Duplicate
+                }
+                PathResponseQueueAdmission::Full => {
+                    IngestResult::PathResponseQueueFull { dest_hash: requested }
+                }
+            };
+        }
+        // A retained path that cannot answer (requester is our next hop or no
+        // cached signed announce remains) is still known. Python consumes the
+        // request instead of recursively searching behind that path.
+        if self.paths.get(&requested).is_some() {
+            return IngestResult::Duplicate;
         }
 
         // Unknown path — forward to all interfaces if transport is enabled
         if self.local_identity_hash.is_some() {
-            // Dedup: check if we've recently seen this exact path request
-            let mut pr_key = [0u8; 32];
-            pr_key[..TRUNCATED_HASH_LEN].copy_from_slice(requested.as_ref());
-            // Include tag bytes in dedup if present
-            if payload.len() > TRUNCATED_HASH_LEN {
-                let tag_end = core::cmp::min(payload.len(), 32);
-                let tag_start = TRUNCATED_HASH_LEN;
-                pr_key[tag_start..tag_end].copy_from_slice(&payload[tag_start..tag_end]);
-            }
-            let pr_hash: [u8; 32] = Sha256::digest(pr_key).into();
-            if self.announce_dedup.check_and_insert(&pr_hash) {
-                return IngestResult::Duplicate;
-            }
-
             IngestResult::PathRequestForward {
-                payload: payload.to_vec(),
+                payload: self.rebuild_recursive_path_request(&request),
             }
         } else {
             IngestResult::Duplicate
+        }
+    }
+
+    fn rebuild_recursive_path_request(
+        &self,
+        request: &ParsedPathRequest<'_>,
+    ) -> alloc::vec::Vec<u8> {
+        let mut payload = alloc::vec::Vec::with_capacity(TRUNCATED_HASH_LEN * 3);
+        payload.extend_from_slice(request.destination.as_ref());
+        if let Some(local_identity) = self.local_identity_hash {
+            payload.extend_from_slice(local_identity.as_ref());
+        }
+        payload.extend_from_slice(request.tag);
+        payload
+    }
+
+    fn queue_path_response(&mut self, response: PendingAnnounce) -> PathResponseQueueAdmission {
+        if let Some(existing) = self
+            .announces
+            .iter_mut()
+            .find(|pending| pending.dest_hash == response.dest_hash && pending.block_rebroadcasts)
+        {
+            *existing = response;
+            return PathResponseQueueAdmission::Replaced;
+        }
+        if self.announces.push_back(response).is_ok() {
+            PathResponseQueueAdmission::Queued
+        } else {
+            PathResponseQueueAdmission::Full
         }
     }
 
@@ -297,18 +361,33 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
     // Path request origination
     // -----------------------------------------------------------------------
 
-    /// Build a path request packet for a destination.
+    /// Build a tagged path request packet for a destination.
     ///
-    /// Sends a DATA packet addressed to `PATH_REQUEST_DEST` (PLAIN) with
-    /// `dest_hash` as the payload.
-    pub fn build_path_request(dest_hash: &DestHash) -> alloc::vec::Vec<u8> {
+    /// Transport nodes supply their identity so the payload is destination,
+    /// requester transport identity and a fresh 16-byte tag. Endpoints pass
+    /// `None` and emit destination plus tag.
+    pub fn build_path_request<R: RngCore>(
+        dest_hash: &DestHash,
+        requester_transport_id: Option<IdentityHash>,
+        rng: &mut R,
+    ) -> alloc::vec::Vec<u8> {
+        let mut payload = [0_u8; TRUNCATED_HASH_LEN * 3];
+        payload[..TRUNCATED_HASH_LEN].copy_from_slice(dest_hash.as_ref());
+        let tag_start = if let Some(requester) = requester_transport_id {
+            payload[TRUNCATED_HASH_LEN..TRUNCATED_HASH_LEN * 2]
+                .copy_from_slice(requester.as_ref());
+            TRUNCATED_HASH_LEN * 2
+        } else {
+            TRUNCATED_HASH_LEN
+        };
+        rng.fill_bytes(&mut payload[tag_start..tag_start + TRUNCATED_HASH_LEN]);
         let mut buf = [0u8; rete_core::MTU];
         let n = PacketBuilder::new(&mut buf)
             .packet_type(PacketType::Data)
             .dest_type(DestType::Plain)
             .destination_hash(PATH_REQUEST_DEST.as_ref())
             .context(0x00)
-            .payload(dest_hash.as_ref())
+            .payload(&payload[..tag_start + TRUNCATED_HASH_LEN])
             .build()
             .expect("path request packet should always build");
         buf[..n].to_vec()
@@ -409,17 +488,30 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
         &mut self,
         now: u64,
         rng: &mut R,
-    ) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
-        let mut to_send: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    ) -> alloc::vec::Vec<PendingOutboundAnnounce> {
+        let mut to_send: alloc::vec::Vec<PendingOutboundAnnounce> = alloc::vec::Vec::new();
         let mut old = core::mem::take(&mut self.announces);
 
         while let Some(mut ann) = old.pop_front() {
             // Skip if blocked by local rebroadcast detection
-            if ann.block_rebroadcasts && !ann.local {
+            if ann.block_rebroadcasts && !ann.local && ann.tx_count > 0 {
                 continue;
             }
             if ann.local || now >= ann.retransmit_timeout {
-                to_send.push(ann.raw.clone());
+                let raw = if ann.block_rebroadcasts {
+                    let Some(response) = mark_path_response(&ann.raw) else {
+                        // A malformed retained announce must fail closed rather
+                        // than escaping as an ordinary rebroadcast.
+                        continue;
+                    };
+                    response
+                } else {
+                    ann.raw.clone()
+                };
+                to_send.push(PendingOutboundAnnounce {
+                    raw,
+                    attached_interface: ann.attached_interface,
+                });
                 if ann.tx_count == 0 {
                     self.stats.announces_sent += 1;
                 } else {
@@ -464,4 +556,43 @@ impl<S: crate::storage::TransportStorage> Transport<S> {
             }
         }
     }
+}
+
+/// Mark one validated cached announce as a path response without changing its
+/// signed payload, flags, hop count, or HEADER_2 transport identity.
+fn mark_path_response(raw: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let packet = Packet::parse(raw).ok()?;
+    if packet.packet_type != PacketType::Announce || packet.dest_type != DestType::Single {
+        return None;
+    }
+    let context_offset = match packet.header_type {
+        HeaderType::Header1 => 2 + TRUNCATED_HASH_LEN,
+        HeaderType::Header2 => 2 + (2 * TRUNCATED_HASH_LEN),
+    };
+    let mut response = raw.to_vec();
+    response[context_offset] = CONTEXT_PATH_RESPONSE;
+    Some(response)
+}
+
+fn parse_path_request(payload: &[u8]) -> Option<ParsedPathRequest<'_>> {
+    let destination_bytes = payload.get(..TRUNCATED_HASH_LEN)?;
+    let (requester_transport_id, tag_start) = if payload.len() > TRUNCATED_HASH_LEN * 2 {
+        (
+            Some(IdentityHash::from_slice(
+                payload.get(TRUNCATED_HASH_LEN..TRUNCATED_HASH_LEN * 2)?,
+            )),
+            TRUNCATED_HASH_LEN * 2,
+        )
+    } else {
+        (None, TRUNCATED_HASH_LEN)
+    };
+    let tag = payload.get(tag_start..)?;
+    if tag.is_empty() {
+        return None;
+    }
+    Some(ParsedPathRequest {
+        destination: DestHash::from_slice(destination_bytes),
+        requester_transport_id,
+        tag: &tag[..core::cmp::min(tag.len(), TRUNCATED_HASH_LEN)],
+    })
 }

@@ -88,7 +88,6 @@ impl TransportStorage for StdStorage {
     type PathMap = HashMap<DestHash, Path>;
     type IdentityMap = HashMap<DestHash, [u8; 64]>;
     type AnnounceRateMap = HashMap<DestHash, AnnounceRateEntry>;
-    type PathRequestTimeMap = HashMap<DestHash, u64>;
 
     type ReverseMap = HashMap<[u8; TRUNCATED_HASH_LEN], ReverseEntry>;
     type ReceiptMap = HashMap<[u8; TRUNCATED_HASH_LEN], PacketReceipt>;

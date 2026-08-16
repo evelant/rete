@@ -1097,6 +1097,9 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
                     Err(_) => IngestOutcome::empty(),
                 }
             }
+            IngestResult::PathResponseQueueFull { dest_hash } => IngestOutcome::rejected(
+                IngestRejection::PathResponseQueueFull { dest_hash },
+            ),
             IngestResult::ReverseTableFull { truncated_hash } => IngestOutcome::rejected(
                 IngestRejection::ReverseTableFull { truncated_hash },
             ),

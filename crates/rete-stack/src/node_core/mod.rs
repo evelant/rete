@@ -28,6 +28,7 @@ use rete_transport::{
 };
 
 use alloc::boxed::Box;
+use core::mem::MaybeUninit;
 
 use crate::destination::{Destination, DestinationType, Direction};
 use crate::{NodeEvent, ProofStrategy, ResourceStrategy};
@@ -405,6 +406,11 @@ pub struct PreparedLinkDataPacketRef<'a> {
 /// callers retain enough typed detail for diagnostics and capacity handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestRejection {
+    /// A source-bound known-path response could not enter the announce queue.
+    PathResponseQueueFull {
+        /// Destination whose response was rejected.
+        dest_hash: DestHash,
+    },
     /// A valid LINKREQUEST could not be retained in a bounded Link table.
     LinkTableFull {
         /// Link ID whose admission failed.
@@ -601,6 +607,65 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
             pending_requests: Vec::new(),
             next_outbound_protocol_token: core::num::NonZeroU64::new(1),
         })
+    }
+
+    /// Create a new `NodeCore` directly in caller-provided storage.
+    ///
+    /// The name is validated and all fallible address derivation is completed
+    /// before the destination is touched. The large [`Transport`] field is
+    /// then recursively initialised in its final location with
+    /// [`Transport::new_in`], avoiding a complete `NodeCore` or `Transport`
+    /// temporary on the caller's stack.
+    #[inline(never)]
+    pub fn new_in<'a>(
+        destination: &'a mut MaybeUninit<Self>,
+        identity: Identity,
+        app_name: &str,
+        aspects: &[&str],
+    ) -> Result<&'a mut Self, rete_core::Error> {
+        let mut name_buf = [0u8; 128];
+        let expanded = rete_core::expand_name(app_name, aspects, &mut name_buf)?;
+        let id_hash = identity.hash();
+        let (dest_hash, name_hash) = rete_core::destination_hashes(expanded, Some(&id_hash));
+        let primary_dest = Destination::from_hashes(
+            DestinationType::Single,
+            Direction::In,
+            app_name,
+            aspects,
+            dest_hash,
+            name_hash,
+        );
+        let ptr = destination.as_mut_ptr();
+
+        // SAFETY: `ptr` is aligned, non-null and uniquely borrowed through the
+        // `MaybeUninit<Self>`. The transport field is projected as its own
+        // `MaybeUninit` and fully initialised before use. Every remaining field
+        // is then written exactly once, and no reference to the enclosing
+        // `Self` is created until all fields are initialised. If an infallible
+        // initializer panics, no `Self` reference escapes; already-written
+        // fields are leaked, which is safe.
+        unsafe {
+            {
+                let transport_slot = &mut *core::ptr::addr_of_mut!((*ptr).transport)
+                    .cast::<MaybeUninit<Transport<S>>>();
+                Transport::new_in(transport_slot).add_local_destination(dest_hash);
+            }
+
+            core::ptr::addr_of_mut!((*ptr).identity).write(identity);
+            core::ptr::addr_of_mut!((*ptr).primary_dest).write(primary_dest);
+            core::ptr::addr_of_mut!((*ptr).additional_dests).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).auto_reply).write(None);
+            core::ptr::addr_of_mut!((*ptr).hooks).write(None);
+            core::ptr::addr_of_mut!((*ptr).split_recv_buf).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).ratchet_store).write(None);
+            core::ptr::addr_of_mut!((*ptr).resource_strategy)
+                .write(ResourceStrategy::AcceptAll);
+            core::ptr::addr_of_mut!((*ptr).pending_requests).write(Vec::new());
+            core::ptr::addr_of_mut!((*ptr).next_outbound_protocol_token)
+                .write(core::num::NonZeroU64::new(1));
+
+            Ok(&mut *ptr)
+        }
     }
 
     /// Install application hooks (compression, proof policy, diagnostics).
@@ -862,8 +927,16 @@ impl<S: rete_transport::TransportStorage> NodeCore<S> {
     }
 
     /// Build a path request packet for a destination.
-    pub fn request_path(&self, dest_hash: &DestHash) -> OutboundPacket {
-        let raw = Transport::<S>::build_path_request(dest_hash);
+    pub fn request_path<R: RngCore>(
+        &self,
+        dest_hash: &DestHash,
+        rng: &mut R,
+    ) -> OutboundPacket {
+        let raw = Transport::<S>::build_path_request(
+            dest_hash,
+            self.transport.local_identity_hash(),
+            rng,
+        );
         OutboundPacket::broadcast(raw)
     }
 
@@ -1610,6 +1683,39 @@ mod tests {
     fn make_core(seed: &[u8]) -> TestNodeCore {
         let identity = Identity::from_seed(seed).unwrap();
         TestNodeCore::new(identity, "testapp", &["aspect1"]).unwrap()
+    }
+
+    #[test]
+    fn new_in_initializes_node_and_nested_transport_in_place() {
+        let identity = Identity::from_seed(b"node-core-new-in").unwrap();
+        let expected_identity_hash = identity.hash();
+        let mut name_buf = [0u8; 128];
+        let expanded = rete_core::expand_name("testapp", &["aspect1"], &mut name_buf).unwrap();
+        let (expected_dest_hash, _) =
+            rete_core::destination_hashes(expanded, Some(&expected_identity_hash));
+        let mut destination = MaybeUninit::<TestNodeCore>::uninit();
+
+        {
+            let node = TestNodeCore::new_in(
+                &mut destination,
+                identity,
+                "testapp",
+                &["aspect1"],
+            )
+            .unwrap();
+
+            assert_eq!(node.identity().hash(), expected_identity_hash);
+            assert_eq!(*node.dest_hash(), expected_dest_hash);
+            assert!(node.transport.is_local_destination(&expected_dest_hash));
+            assert_eq!(node.path_count(), 0);
+            assert_eq!(node.announce_count(), 0);
+            assert_eq!(node.primary_dest().app_name, "testapp");
+            assert_eq!(node.primary_dest().aspects, ["aspect1"]);
+        }
+
+        // SAFETY: `new_in` returned successfully, so every field is initialized,
+        // and the mutable reference above no longer borrows `destination`.
+        unsafe { destination.assume_init_drop() };
     }
 
     fn make_small_receipt_core(seed: &[u8]) -> SmallReceiptNodeCore {
@@ -3979,14 +4085,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Phase: Path request origination tests
+    // Path request origination tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn path_request_produces_valid_packet() {
-        let core = make_core(b"path-req-test");
+        let mut core = make_core(b"path-req-test");
+        core.enable_transport();
         let dest = DestHash::from([0xBB; rete_core::TRUNCATED_HASH_LEN]);
-        let outbound = core.request_path(&dest);
+        let mut rng = rand::thread_rng();
+        let outbound = core.request_path(&dest, &mut rng);
         let parsed = Packet::parse(&outbound.data).unwrap();
         assert_eq!(parsed.packet_type, PacketType::Data);
         assert_eq!(parsed.dest_type, rete_core::DestType::Plain);
@@ -3994,7 +4102,15 @@ mod tests {
             parsed.destination_hash,
             rete_transport::PATH_REQUEST_DEST.as_ref()
         );
-        assert_eq!(parsed.payload, dest.as_ref());
+        assert_eq!(parsed.payload.len(), rete_core::TRUNCATED_HASH_LEN * 3);
+        assert_eq!(
+            &parsed.payload[..rete_core::TRUNCATED_HASH_LEN],
+            dest.as_ref()
+        );
+        assert_eq!(
+            &parsed.payload[rete_core::TRUNCATED_HASH_LEN..rete_core::TRUNCATED_HASH_LEN * 2],
+            core.identity().hash().as_ref()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4022,7 +4138,7 @@ mod tests {
         // local=true means it's sent immediately
         assert_eq!(pending.len(), 1);
         // The announce should be valid
-        let pkt = Packet::parse(&pending[0]).unwrap();
+        let pkt = Packet::parse(&pending[0].raw).unwrap();
         assert_eq!(pkt.packet_type, PacketType::Announce);
     }
 
@@ -4552,7 +4668,7 @@ mod tests {
         let pending = core.transport.pending_outbound(1000, &mut rng);
         assert_eq!(pending.len(), 1);
 
-        let pkt = Packet::parse(&pending[0]).unwrap();
+        let pkt = Packet::parse(&pending[0].raw).unwrap();
         assert_eq!(pkt.packet_type, PacketType::Announce);
         assert_eq!(pkt.destination_hash, lxmf_hash.as_ref());
     }
